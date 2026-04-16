@@ -422,13 +422,14 @@ def _footer():
 
 
 def _decision_box(title, body_md):
-    """Render a styled 'when to use this' callout."""
-    st.markdown(f"""
-    <div class="decision-box">
-        <strong>📌 {title}</strong><br>
-        {body_md}
-    </div>
-    """, unsafe_allow_html=True)
+    """Render a styled 'when to use this' callout using native Streamlit.
+
+    Uses st.container with a border and markdown inside, which renders reliably
+    regardless of indentation quirks in HTML-in-markdown.
+    """
+    with st.container(border=True):
+        st.markdown(f"**📌 {title}**")
+        st.markdown(body_md)
 
 
 # =====================================================================
@@ -720,14 +721,12 @@ def page_collection_profiler():
     )
     _decision_box(
         "When to use this tool",
-        """
-        <b>Collections:</b> Baseline assessment, accreditation self-studies, weeding prep
-        (find thin/missing areas), justifying budget asks by showing strengths.<br>
-        <b>Instruction:</b> Prepare for a liaison session — see at a glance what you actually
-        have in HQ or PN before walking into the class.<br>
-        <b>Outreach:</b> Quick visuals for faculty meetings and annual reports
-        ("here's what sociology looks like in our collection").
-        """
+        "- **Collections:** Baseline assessment, accreditation self-studies, weeding prep "
+        "(find thin/missing areas), justifying budget asks by showing strengths.\n"
+        "- **Instruction:** Prepare for a liaison session — see at a glance what you "
+        "actually have in HQ or PN before walking into the class.\n"
+        "- **Outreach:** Quick visuals for faculty meetings and annual reports "
+        "(\"here's what sociology looks like in our collection\")."
     )
     st.markdown("---")
 
@@ -1360,16 +1359,14 @@ def page_usage_analyzer():
     )
     _decision_box(
         "When to use this tool",
-        """
-        <b>Collections:</b> Annual database renewals, print weeding by low circulation,
-        identifying single-title-driven subscriptions (candidates for swap to pay-per-view
-        or title-level purchase), publisher package evaluation.<br>
-        <b>Instruction:</b> Rarely — this is primarily a purchasing/weeding tool, not
-        an instructional one.<br>
-        <b>Outreach:</b> Evidence for faculty conversations ("this database gets 12 uses
-        a year across your whole department — can we talk alternatives?"), value reports
-        to administration, package-vs-title comparisons for liaison meetings.
-        """
+        "- **Collections:** Annual database renewals, print weeding by low circulation, "
+        "identifying single-title-driven subscriptions (candidates for swap to pay-per-view "
+        "or title-level purchase), publisher package evaluation.\n"
+        "- **Instruction:** Rarely — this is primarily a purchasing/weeding tool, not "
+        "an instructional one.\n"
+        "- **Outreach:** Evidence for faculty conversations (\"this database gets 12 uses "
+        "a year across your whole department — can we talk alternatives?\"), value reports "
+        "to administration, package-vs-title comparisons for liaison meetings."
     )
     st.markdown("---")
 
@@ -1883,16 +1880,14 @@ def page_recommendation_scorer():
     )
     _decision_box(
         "When to use this tool",
-        """
-        <b>Collections:</b> Evaluating vendor slip lists and GOBI picks, approval-plan
-        exceptions, triaging faculty requests, flipping DDA candidates to purchase,
-        reviewing author/publisher lists for standing orders.<br>
-        <b>Instruction:</b> Occasionally — clusters of high-scoring recommendations in
-        one area can reveal curricular momentum worth a targeted info-lit session.<br>
-        <b>Outreach:</b> Showing faculty <i>why</i> a recommendation scored high (with
-        the faculty-interest score naming their research match) makes this a strong
-        conversation-starter at liaison meetings.
-        """
+        "- **Collections:** Evaluating vendor slip lists and GOBI picks, approval-plan "
+        "exceptions, triaging faculty requests, flipping DDA candidates to purchase, "
+        "reviewing author/publisher lists for standing orders.\n"
+        "- **Instruction:** Occasionally — clusters of high-scoring recommendations in "
+        "one area can reveal curricular momentum worth a targeted info-lit session.\n"
+        "- **Outreach:** Showing faculty *why* a recommendation scored high (with "
+        "the faculty-interest score naming their research match) makes this a strong "
+        "conversation-starter at liaison meetings."
     )
     st.info("💡 For a broader view of your collection's LC distribution and subject "
             "coverage, use the **Collection Profiler** (first tool in the sidebar).")
