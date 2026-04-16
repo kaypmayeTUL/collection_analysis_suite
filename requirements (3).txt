@@ -1,0 +1,17 @@
+# Library Collection Dashboard — Python dependencies
+# Python 3.9+ recommended
+
+# Core framework
+streamlit>=1.31.0
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+plotly>=5.18.0
+matplotlib>=3.7.0
+wordcloud>=1.9.0
+
+# NLP (for Recommendation Scorer)
+nltk>=3.8.1
