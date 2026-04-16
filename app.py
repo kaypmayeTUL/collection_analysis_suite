@@ -472,8 +472,15 @@ def _profiler_process_subjects_chunk(subj_series, weight_series, lc_series,
 
 
 def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
-                           selected_classes, progress_bar):
-    """Single pass that builds everything: LC counts, subject counter, subject-by-LC, gaps."""
+                           selected_classes, progress_bar,
+                           has_usage_col=False):
+    """Single pass that builds everything: LC counts, subject counter, subject-by-LC, gaps.
+
+    When a usage column is present in the dataframe (indicated by `has_usage_col=True`),
+    also computes a second set of LC counts using usage weighting — this is what powers
+    the Coverage-vs-Use view. The weight_col parameter controls the primary analysis;
+    the secondary pass always uses the '_weight' column (which holds usage values).
+    """
     n_total = len(df)
     if selected_classes is not None and lc_col:
         mask = df['_lc_main'].isin(selected_classes) | df['_lc_main'].isna()
@@ -509,10 +516,33 @@ def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
         results['lc_main_counts'] = lc_main_counts
         results['lc_sub_counts'] = lc_sub_counts
         results['sunburst_data'] = sunburst_rows
+
+        # Coverage vs. Use: compute BOTH title-count and usage-weighted distributions
+        # (regardless of primary weight_col) when a usage column is present
+        if has_usage_col:
+            # Title counts (always weight=1)
+            titles_main = pd.Series(1.0, index=lc_main.index).groupby(lc_main).sum().to_dict()
+            titles_sub = pd.Series(1.0, index=lc_sub.index).groupby(lc_sub).sum().to_dict()
+            # Usage counts (always from _weight column, which holds the actual usage values)
+            usage_series = df.loc[idx, '_weight']
+            usage_main_w = usage_series.reindex(lc_main.index)
+            usage_sub_w = usage_series.reindex(lc_sub.index)
+            usage_main = usage_main_w.groupby(lc_main).sum().to_dict()
+            usage_sub = usage_sub_w.groupby(lc_sub).sum().to_dict()
+            results['cvu_available'] = True
+            results['cvu_titles_main'] = titles_main
+            results['cvu_titles_sub'] = titles_sub
+            results['cvu_usage_main'] = usage_main
+            results['cvu_usage_sub'] = usage_sub
+            results['cvu_total_titles'] = sum(titles_main.values())
+            results['cvu_total_usage'] = sum(usage_main.values())
+        else:
+            results['cvu_available'] = False
     else:
         results['lc_main_counts'] = {}
         results['lc_sub_counts'] = {}
         results['sunburst_data'] = []
+        results['cvu_available'] = False
 
     progress_bar.progress(15, "Processing subject terms...")
 
@@ -558,6 +588,219 @@ def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
     progress_bar.progress(100, "Done!")
     gc.collect()
     return results
+
+
+def _classify_signal(ratio, over_thresh, under_thresh, n_titles, min_titles):
+    """Return (label, color_hint) for a coverage-vs-use ratio."""
+    if n_titles < min_titles:
+        return ("—", "gray")
+    if ratio >= over_thresh:
+        return ("🟢 Overperforming", "green")
+    if ratio <= under_thresh:
+        return ("🔴 Underperforming", "red")
+    return ("✅ Proportional", "neutral")
+
+
+def _build_cvu_table(titles_dict, usage_dict, total_titles, total_usage,
+                     over, under, min_titles, label_lookup, level_col_name):
+    """Build the coverage-vs-use dataframe for a given level (main or sub)."""
+    all_keys = sorted(set(titles_dict.keys()) | set(usage_dict.keys()))
+    rows = []
+    for key in all_keys:
+        n_titles = titles_dict.get(key, 0)
+        n_usage = usage_dict.get(key, 0)
+        if n_titles == 0 and n_usage == 0:
+            continue
+        pct_titles = (n_titles / total_titles * 100) if total_titles > 0 else 0
+        pct_usage = (n_usage / total_usage * 100) if total_usage > 0 else 0
+        ratio = (pct_usage / pct_titles) if pct_titles > 0 else float('inf') if pct_usage > 0 else 0
+        use_per_title = (n_usage / n_titles) if n_titles > 0 else 0
+        signal, _ = _classify_signal(ratio, over, under, n_titles, min_titles)
+        rows.append({
+            level_col_name: key,
+            'Description': label_lookup.get(key, '—'),
+            'Titles Held': int(n_titles),
+            '% of Collection': round(pct_titles, 2),
+            'Total Use': int(n_usage),
+            '% of Use': round(pct_usage, 2),
+            'Use/Title Ratio': round(use_per_title, 2),
+            'Use/Holdings Signal': round(ratio, 2) if ratio != float('inf') else None,
+            'Assessment': signal,
+        })
+    return pd.DataFrame(rows)
+
+
+def _render_coverage_vs_use(results, settings):
+    """Render the Coverage vs. Use section — the core 'what we have vs what's used' view."""
+    st.markdown("---")
+    st.subheader("⚖️ Coverage vs. Use")
+    st.markdown(
+        "Compares **% of your collection** in each LC area against **% of use** it drives. "
+        "The *Assessment* column uses ratios you can tune in the sidebar:"
+    )
+    st.markdown(
+        f"- 🟢 **Overperforming** — ratio ≥ **{settings['cvu_over']}** (small areas pulling heavy use; candidates for expansion)\n"
+        f"- 🔴 **Underperforming** — ratio ≤ **{settings['cvu_under']}** (large areas with thin use; candidates for weeding or reassessment)\n"
+        f"- ✅ **Proportional** — use roughly matches holdings\n"
+        f"- — **Insufficient data** — fewer than **{settings['cvu_min_titles']}** titles in that area"
+    )
+
+    usage_label = settings.get('usage_col_label', 'Usage')
+    total_titles = results['cvu_total_titles']
+    total_usage = results['cvu_total_usage']
+
+    over = settings['cvu_over']
+    under = settings['cvu_under']
+    min_titles = settings['cvu_min_titles']
+
+    # KPI summary
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Total Titles", f"{int(total_titles):,}")
+    k2.metric(f"Total {usage_label}", f"{int(total_usage):,}")
+    k3.metric("Overall Use / Title",
+              f"{total_usage / max(1, total_titles):.2f}")
+
+    # ---- LC main class table & chart ----
+    st.markdown("#### LC Main Class")
+    main_df = _build_cvu_table(
+        results['cvu_titles_main'], results['cvu_usage_main'],
+        total_titles, total_usage,
+        over, under, min_titles,
+        LC_CLASSES, 'LC Class'
+    )
+    if main_df.empty:
+        st.info("No LC data to display.")
+        return
+
+    # Sort by signal ratio descending (so overperformers appear first)
+    # But put "—" (insufficient data) at the bottom
+    main_df['_sort_key'] = main_df['Use/Holdings Signal'].fillna(-1)
+    main_df = main_df.sort_values('_sort_key', ascending=False).drop(columns='_sort_key')
+
+    st.dataframe(
+        main_df, use_container_width=True, hide_index=True, height=400,
+        column_config={
+            '% of Collection': st.column_config.NumberColumn(format="%.2f%%"),
+            '% of Use': st.column_config.NumberColumn(format="%.2f%%"),
+            'Use/Holdings Signal': st.column_config.NumberColumn(
+                format="%.2f",
+                help="(% of use) ÷ (% of holdings). 1.0 = proportional."
+            ),
+        }
+    )
+
+    st.download_button("📥 Coverage-vs-Use (Main Class) CSV",
+                       main_df.to_csv(index=False),
+                       "coverage_vs_use_main.csv", "text/csv",
+                       key='prof_dl_cvu_main')
+
+    # Scatter plot: % titles vs % use, with diagonal reference line
+    plot_df = main_df[main_df['Assessment'] != "—"].copy()
+    if not plot_df.empty:
+        fig = px.scatter(
+            plot_df, x='% of Collection', y='% of Use',
+            size='Titles Held', color='Assessment',
+            color_discrete_map={
+                "🟢 Overperforming": "#2ecc71",
+                "🔴 Underperforming": "#e74c3c",
+                "✅ Proportional": "#71C5E8",
+            },
+            hover_data=['LC Class', 'Description', 'Total Use', 'Use/Title Ratio'],
+            text='LC Class',
+            title="Collection Coverage vs. Use (by LC Main Class)",
+        )
+        # Diagonal reference: if use were perfectly proportional to holdings
+        max_val = max(plot_df['% of Collection'].max(), plot_df['% of Use'].max()) * 1.1
+        fig.add_shape(
+            type='line', line=dict(color='gray', dash='dash', width=1),
+            x0=0, y0=0, x1=max_val, y1=max_val,
+        )
+        fig.add_annotation(
+            x=max_val * 0.9, y=max_val * 0.95,
+            text="Proportional line", showarrow=False,
+            font=dict(size=10, color="gray"),
+        )
+        fig.update_traces(textposition='top center')
+        fig.update_layout(height=500, xaxis_title="% of Collection",
+                          yaxis_title=f"% of {usage_label}")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ---- LC subclass table (optional) ----
+    if settings.get('cvu_show_sub') and results.get('cvu_titles_sub'):
+        st.markdown("#### LC Subclass")
+        st.caption("Drill into the same comparison at the subclass level "
+                   "(e.g., HQ1000s vs. HQ750s).")
+
+        # Build a flat subclass lookup from LC_SUBCLASSES dict
+        sub_lookup = {}
+        for main_class, subs in LC_SUBCLASSES.items():
+            sub_lookup.update(subs)
+
+        sub_df = _build_cvu_table(
+            results['cvu_titles_sub'], results['cvu_usage_sub'],
+            total_titles, total_usage,
+            over, under, min_titles,
+            sub_lookup, 'LC Subclass'
+        )
+        if sub_df.empty:
+            st.info("No LC subclass data to display.")
+        else:
+            # Allow filtering to just one main class for readability
+            main_classes_present = sorted(set(
+                sc[0] for sc in sub_df['LC Subclass'] if isinstance(sc, str) and sc
+            ))
+            filter_main = st.selectbox(
+                "Filter subclass view by main class (optional)",
+                options=["All"] + [f"{c} – {LC_CLASSES.get(c, '?')}"
+                                    for c in main_classes_present],
+                key='prof_cvu_sub_filter'
+            )
+            if filter_main != "All":
+                prefix = filter_main.split(' –')[0]
+                sub_df_display = sub_df[
+                    sub_df['LC Subclass'].str.startswith(prefix, na=False)
+                ].copy()
+            else:
+                sub_df_display = sub_df.copy()
+
+            sub_df_display['_sort_key'] = sub_df_display['Use/Holdings Signal'].fillna(-1)
+            sub_df_display = sub_df_display.sort_values(
+                '_sort_key', ascending=False
+            ).drop(columns='_sort_key')
+
+            st.dataframe(
+                sub_df_display, use_container_width=True,
+                hide_index=True, height=400,
+                column_config={
+                    '% of Collection': st.column_config.NumberColumn(format="%.2f%%"),
+                    '% of Use': st.column_config.NumberColumn(format="%.2f%%"),
+                    'Use/Holdings Signal': st.column_config.NumberColumn(format="%.2f"),
+                }
+            )
+            st.download_button("📥 Coverage-vs-Use (Subclass) CSV",
+                               sub_df.to_csv(index=False),
+                               "coverage_vs_use_subclass.csv", "text/csv",
+                               key='prof_dl_cvu_sub')
+
+    # Interpretive callout
+    over_count = (main_df['Assessment'] == "🟢 Overperforming").sum()
+    under_count = (main_df['Assessment'] == "🔴 Underperforming").sum()
+    if over_count or under_count:
+        st.markdown("**What to do with this:**")
+        bullets = []
+        if over_count:
+            bullets.append(
+                f"- **{over_count} overperforming area(s)** are candidates for "
+                "deeper investment — strong use suggests demand you could grow into."
+            )
+        if under_count:
+            bullets.append(
+                f"- **{under_count} underperforming area(s)** are candidates for "
+                "weeding review or reassessment. Use the **Usage Analyzer → Print "
+                "Circulation** tool to see the specific low-use titles driving "
+                "those numbers."
+            )
+        st.markdown("\n".join(bullets))
 
 
 def _profiler_display_results(results, settings, df, idx):
@@ -663,6 +906,10 @@ def _profiler_display_results(results, settings, df, idx):
         ))
         fig.update_layout(height=max(400, len(lc_present) * 35), xaxis=dict(tickangle=45))
         st.plotly_chart(fig, use_container_width=True)
+
+    # ==== Coverage vs. Use ====
+    if (settings.get('show_coverage_vs_use') and results.get('cvu_available')):
+        _render_coverage_vs_use(results, settings)
 
     if settings['show_gap_analysis']:
         st.markdown("---")
@@ -818,8 +1065,53 @@ def page_collection_profiler():
         show_bars = st.checkbox("Top subjects bar chart", True, key="prof_bars")
         show_wordcloud = st.checkbox("Subject word cloud", True, key="prof_wc")
         show_heatmap = st.checkbox("LC × subject heatmap", True, key="prof_heat")
+        show_coverage_vs_use = st.checkbox(
+            "Coverage vs. Use (requires usage column)",
+            value=bool(weight_col),
+            disabled=not weight_col,
+            key="prof_cvu",
+            help="Compare what % of the collection each LC area holds vs. what % "
+                 "of use it drives. Shows overperforming (small but heavily used) "
+                 "and underperforming (large but lightly used) areas."
+        )
         show_gap = st.checkbox("Gap analysis", True, key="prof_gap")
         show_detail = st.checkbox("Title detail table", False, key="prof_detail")
+
+        # Coverage-vs-Use threshold configuration
+        if show_coverage_vs_use and weight_col:
+            with st.expander("⚖️ Coverage vs. Use thresholds"):
+                st.caption("Signal = (% of use) ÷ (% of holdings). A value of 1.0 means "
+                           "usage is proportional to holdings.")
+                cvu_over = st.slider(
+                    "Overperforming threshold (≥)",
+                    min_value=1.1, max_value=5.0, value=2.0, step=0.1,
+                    key="prof_cvu_over",
+                    help="Ratio at or above this flags an area as overperforming "
+                         "(higher % of use than of holdings). Lower = more areas flagged."
+                )
+                cvu_under = st.slider(
+                    "Underperforming threshold (≤)",
+                    min_value=0.1, max_value=0.9, value=0.5, step=0.05,
+                    key="prof_cvu_under",
+                    help="Ratio at or below this flags an area as underperforming "
+                         "(lower % of use than of holdings). Higher = more areas flagged."
+                )
+                cvu_min_titles = st.number_input(
+                    "Minimum titles to include in signal",
+                    min_value=1, max_value=1000, value=10,
+                    key="prof_cvu_min",
+                    help="LC areas with fewer titles than this won't get a signal "
+                         "label (too little data to draw conclusions). They still appear "
+                         "in the table marked as '—'."
+                )
+                cvu_show_sub = st.checkbox(
+                    "Also break down by LC subclass",
+                    value=True,
+                    key="prof_cvu_sub",
+                    help="Shows e.g. HQ1000s separately from HQ750s."
+                )
+        else:
+            cvu_over, cvu_under, cvu_min_titles, cvu_show_sub = 2.0, 0.5, 10, True
 
         # Word cloud sub-options (only shown when word cloud is on)
         if show_wordcloud:
@@ -847,7 +1139,10 @@ def page_collection_profiler():
     if st.button("🔍 Analyze Collection", type="primary", use_container_width=True, key="prof_run"):
         w_key = '_weight' if use_weight else None
         pbar = st.progress(0, "Starting analysis...")
-        results = _profiler_run_analysis(df, subj_col, lc_col, title_col, w_key, sel_classes, pbar)
+        results = _profiler_run_analysis(
+            df, subj_col, lc_col, title_col, w_key, sel_classes, pbar,
+            has_usage_col=bool(weight_col)
+        )
         st.session_state['prof_results'] = results
         if sel_classes is not None and lc_col:
             mask = df['_lc_main'].isin(sel_classes) | df['_lc_main'].isna()
@@ -856,12 +1151,16 @@ def page_collection_profiler():
             st.session_state['prof_filtered_idx'] = df.index
         st.session_state['prof_settings'] = {
             'weight_label': weight_label if use_weight else 'Title Count',
+            'usage_col_label': weight_col or 'Usage',
             'top_n_subjects': top_n,
             'show_sunburst': show_sunburst, 'show_treemap': show_treemap,
             'show_subject_bars': show_bars,
             'show_wordcloud': show_wordcloud,
             'wc_max_words': wc_max_words, 'wc_min_len': wc_min_len, 'wc_color': wc_color,
             'show_heatmap': show_heatmap,
+            'show_coverage_vs_use': show_coverage_vs_use,
+            'cvu_over': cvu_over, 'cvu_under': cvu_under,
+            'cvu_min_titles': cvu_min_titles, 'cvu_show_sub': cvu_show_sub,
             'show_gap_analysis': show_gap, 'show_detail_table': show_detail,
         }
         st.success("✅ Analysis complete!")
@@ -870,11 +1169,15 @@ def page_collection_profiler():
         _profiler_display_results(
             st.session_state['prof_results'],
             st.session_state.get('prof_settings', {
-                'weight_label': 'Title Count', 'top_n_subjects': 30,
+                'weight_label': 'Title Count', 'usage_col_label': 'Usage',
+                'top_n_subjects': 30,
                 'show_sunburst': True, 'show_treemap': True,
                 'show_subject_bars': True, 'show_wordcloud': True,
                 'wc_max_words': 100, 'wc_min_len': 3, 'wc_color': 'viridis',
                 'show_heatmap': True,
+                'show_coverage_vs_use': False,
+                'cvu_over': 2.0, 'cvu_under': 0.5,
+                'cvu_min_titles': 10, 'cvu_show_sub': True,
                 'show_gap_analysis': True, 'show_detail_table': False,
             }),
             df,
@@ -936,6 +1239,84 @@ def _identify_month_columns(df):
             if re.match(r'^[A-Za-z]{3}[- ]\d{4}$', c)]
 
 
+def _month_col_to_date(col):
+    """Convert 'Jan-2025' or 'Jan 2025' to a pd.Timestamp (first of month)."""
+    try:
+        return pd.to_datetime(col.replace(' ', '-'), format='%b-%Y')
+    except Exception:
+        return pd.NaT
+
+
+def _detect_counter_date_range(month_cols):
+    """From a list of month columns, return (min_date, max_date, sorted_cols)
+    or (None, None, []) if empty.
+    """
+    if not month_cols:
+        return None, None, []
+    dated = [(c, _month_col_to_date(c)) for c in month_cols]
+    dated = [(c, d) for c, d in dated if pd.notna(d)]
+    if not dated:
+        return None, None, []
+    dated.sort(key=lambda x: x[1])
+    return dated[0][1], dated[-1][1], [c for c, _ in dated]
+
+
+DATE_COL_ALIASES = [
+    'Checkout Date', 'checkout_date', 'Loan Date', 'loan_date',
+    'Transaction Date', 'transaction_date', 'Last Charge Date', 'last_charge_date',
+    'Last Used', 'last_used', 'Last Checkout', 'last_checkout',
+    'Date', 'date', 'DATE', 'Due Date', 'due_date',
+]
+
+
+def _detect_print_date_column(df):
+    """Find a date-like column in a print circulation dataframe.
+    Returns the column name or None. Tries aliases first, then falls back
+    to any column whose name contains date-related keywords AND parses as dates
+    for >50% of values.
+    """
+    # Try explicit aliases (exact match, case-insensitive)
+    for alias in DATE_COL_ALIASES:
+        for col in df.columns:
+            if alias.lower() == col.lower():
+                return col
+    # Partial match — must contain date-related keyword AND parse as dates
+    date_keywords = ['date', 'checkout', 'loan', 'charge']
+    for col in df.columns:
+        lc = col.lower()
+        if any(tok in lc for tok in date_keywords):
+            # Skip numeric columns — pd.to_datetime coerces numbers to epoch dates
+            if pd.api.types.is_numeric_dtype(df[col]):
+                continue
+            try:
+                parsed = pd.to_datetime(df[col], errors='coerce')
+                if parsed.notna().sum() / max(1, len(df)) > 0.5:
+                    return col
+            except Exception:
+                continue
+    return None
+
+
+def _format_date_range(start, end):
+    """Format a date range for display: 'Jan 2025 – Jun 2025' or 'Feb 12 – Mar 30, 2025'."""
+    if pd.isna(start) or pd.isna(end):
+        return "unknown"
+    if start.year == end.year and start.month == end.month:
+        return start.strftime('%B %Y')
+    if start.year == end.year:
+        return f"{start.strftime('%b')} – {end.strftime('%b %Y')}"
+    return f"{start.strftime('%b %Y')} – {end.strftime('%b %Y')}"
+
+
+def _slug_period(label):
+    """Turn a period label like 'Jan – Jun 2025' into a filename-safe 'Jan-Jun-2025'."""
+    if not label or label == "unknown period":
+        return ""
+    slug = re.sub(r'[^\w\s-]', '', label)  # drop punctuation
+    slug = re.sub(r'\s+', '-', slug.strip())  # spaces → dashes
+    return slug
+
+
 def _render_counter_mode():
     """COUNTER 5 Title Report analysis."""
     st.markdown(
@@ -949,14 +1330,20 @@ def _render_counter_mode():
         with st.expander("📖 How to use this mode", expanded=True):
             st.markdown("""
             Upload a standard COUNTER 5 TR export (from EBSCO, ProQuest, Springer, etc.).
-            The loader auto-skips the metadata header.
+            The loader auto-skips the metadata header and detects the reporting period
+            from month columns.
 
             **Typical workflow:**
             1. Load the file and pick a metric (usually `Unique_Item_Requests`)
-            2. Review the **Top Titles** tab to see your workhorses
-            3. Check **Cancellation Review** for underperformers
-            4. Use **Publisher Summary** to evaluate whole packages
-            5. Look at **Monthly Trends** to spot seasonality or decline
+            2. Check the detected reporting period at the top; narrow it with the
+               **Date Range** filter in the sidebar if you want to focus on a specific window
+            3. Review the **Top Titles** tab to see your workhorses
+            4. Check **Cancellation Review** for underperformers
+            5. Use **Publisher Summary** to evaluate whole packages
+            6. Look at **Monthly Trends** to spot seasonality or decline
+
+            **Tip:** Set a custom reporting-period label in the sidebar (e.g., "FY2025 Q1")
+            to label downloads clearly.
             """)
         return
 
@@ -975,11 +1362,24 @@ def _render_counter_mode():
             total_col = next((c for c in df_raw.columns
                              if 'total' in c.lower() and 'period' in c.lower()), None)
 
+        # Date range detection from month columns
+        date_min, date_max, sorted_month_cols = _detect_counter_date_range(month_cols)
+
+        # Reporting period banner
+        if date_min is not None:
+            period_label = _format_date_range(date_min, date_max)
+            st.info(f"📅 **Reporting period detected:** {period_label} "
+                    f"({len(sorted_month_cols)} months of data)")
+        else:
+            st.warning("📅 No month columns detected. The file may have a non-standard "
+                       "format, or may contain only aggregate totals.")
+            period_label = "unknown period"
+
         with st.expander("🔍 Column Detection", expanded=False):
             st.write(f"**Total column:** `{total_col}`")
             st.write(f"**Month columns detected:** {len(month_cols)} "
-                     f"({month_cols[0] if month_cols else 'none'} … "
-                     f"{month_cols[-1] if month_cols else 'none'})")
+                     f"({sorted_month_cols[0] if sorted_month_cols else 'none'} … "
+                     f"{sorted_month_cols[-1] if sorted_month_cols else 'none'})")
             st.write(f"**All columns:** {list(df_raw.columns)}")
 
         if total_col is None:
@@ -990,6 +1390,44 @@ def _render_counter_mode():
         # Sidebar filters
         st.sidebar.markdown("---")
         st.sidebar.subheader("🔎 Counter Filters")
+
+        # Date range filter (uses month columns)
+        use_date_filter = False
+        selected_month_cols = sorted_month_cols  # default: all months
+        if sorted_month_cols and len(sorted_month_cols) > 1:
+            with st.sidebar.expander("📅 Date Range", expanded=False):
+                use_date_filter = st.checkbox(
+                    "Filter by date range", value=False, key="usage_use_dates"
+                )
+                if use_date_filter:
+                    # Use select_slider over sorted month labels (simpler than date picker
+                    # for monthly granularity, and avoids confusion with non-month days)
+                    start_label, end_label = st.select_slider(
+                        "Months to include",
+                        options=sorted_month_cols,
+                        value=(sorted_month_cols[0], sorted_month_cols[-1]),
+                        key="usage_date_range"
+                    )
+                    start_idx = sorted_month_cols.index(start_label)
+                    end_idx = sorted_month_cols.index(end_label)
+                    selected_month_cols = sorted_month_cols[start_idx:end_idx + 1]
+                    sel_start = _month_col_to_date(start_label)
+                    sel_end = _month_col_to_date(end_label)
+                    period_label = _format_date_range(sel_start, sel_end)
+                    st.caption(f"Selected: **{period_label}** "
+                               f"({len(selected_month_cols)} months)")
+
+        # Override label for reports/downloads
+        with st.sidebar.expander("🏷️ Report label (optional)", expanded=False):
+            custom_period = st.text_input(
+                "Custom reporting period label",
+                value="",
+                placeholder=f"e.g., FY2025 Q1–Q2",
+                help="Overrides the auto-detected label on downloads and headers.",
+                key="usage_period_label"
+            )
+            if custom_period.strip():
+                period_label = custom_period.strip()
 
         if 'Metric_Type' in df_raw.columns:
             metric_options = sorted(df_raw['Metric_Type'].dropna().unique())
@@ -1019,23 +1457,34 @@ def _render_counter_mode():
             )
             df_filtered = df_filtered[df_filtered['Publisher'].isin(selected_pubs)]
 
-        # KPIs
+        # KPIs — if date-filtered, recompute totals from selected month columns
         st.markdown("---")
-        st.subheader(f"📊 Overview — {selected_metric}")
-        total_usage = pd.to_numeric(df_filtered[total_col], errors='coerce').fillna(0).sum()
+        st.subheader(f"📊 Overview — {selected_metric} · {period_label}")
+
+        # Compute the per-row total that respects the date filter
+        if use_date_filter and selected_month_cols:
+            # Sum just the selected months (coerce to numeric first)
+            month_data = df_filtered[selected_month_cols].apply(
+                pd.to_numeric, errors='coerce'
+            ).fillna(0)
+            df_filtered = df_filtered.copy()
+            df_filtered['_total'] = month_data.sum(axis=1)
+        else:
+            df_filtered = df_filtered.copy()
+            df_filtered['_total'] = pd.to_numeric(
+                df_filtered[total_col], errors='coerce'
+            ).fillna(0)
+
+        total_usage = df_filtered['_total'].sum()
         unique_titles = df_filtered['Title'].nunique() if 'Title' in df_filtered.columns else 0
         avg_usage = total_usage / unique_titles if unique_titles > 0 else 0
-        zero_use = (pd.to_numeric(df_filtered[total_col], errors='coerce').fillna(0) == 0).sum()
+        zero_use = (df_filtered['_total'] == 0).sum()
 
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Total Usage", f"{int(total_usage):,}")
         k2.metric("Unique Titles", f"{unique_titles:,}")
         k3.metric("Avg Usage / Title", f"{avg_usage:.1f}")
         k4.metric("Zero-Use Titles", f"{zero_use:,}")
-
-        # Ensure numeric for analysis
-        df_filtered = df_filtered.copy()
-        df_filtered['_total'] = pd.to_numeric(df_filtered[total_col], errors='coerce').fillna(0)
 
         # Analysis tabs
         st.markdown("---")
@@ -1066,7 +1515,8 @@ def _render_counter_mode():
             st.plotly_chart(fig_top, use_container_width=True)
             st.download_button("📥 Top Titles (CSV)",
                                top_titles.to_csv(index=False),
-                               "top_titles.csv", "text/csv", key="usage_dl_top")
+                               f"top_titles_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                               "text/csv", key="usage_dl_top")
 
         with tab2:
             st.info("📌 Review titles with low usage for potential cancellation or renegotiation.")
@@ -1091,7 +1541,8 @@ def _render_counter_mode():
             st.dataframe(low_use_df, use_container_width=True, height=400)
             st.download_button("📥 Cancellation Review List (CSV)",
                                low_use_df.to_csv(index=False),
-                               "cancellation_review.csv", "text/csv",
+                               f"cancellation_review_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                               "text/csv",
                                key="usage_dl_cancel")
 
         with tab3:
@@ -1113,18 +1564,19 @@ def _render_counter_mode():
                 st.dataframe(pub_summary, use_container_width=True, hide_index=True, height=500)
                 st.download_button("📥 Publisher Summary (CSV)",
                                    pub_summary.to_csv(index=False),
-                                   "publisher_summary.csv", "text/csv",
+                                   f"publisher_summary_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                                   "text/csv",
                                    key="usage_dl_pub")
             else:
                 st.info("No Publisher column in this file.")
 
         with tab4:
             if month_cols:
-                # Melt only month columns that are actually in the filtered df
+                # Use selected_month_cols (which equals sorted_month_cols when filter off)
                 id_vars = ['Title']
                 if 'Publisher' in df_filtered.columns:
                     id_vars.append('Publisher')
-                present_months = [c for c in month_cols if c in df_filtered.columns]
+                present_months = [c for c in selected_month_cols if c in df_filtered.columns]
                 if not present_months:
                     st.info("No month columns found in filtered data.")
                 else:
@@ -1133,19 +1585,18 @@ def _render_counter_mode():
                         var_name='Month', value_name='Usage'
                     )
                     df_melted['Usage'] = pd.to_numeric(df_melted['Usage'], errors='coerce').fillna(0)
-                    # Support both Jan-2025 and Jan 2025
                     df_melted['Month'] = pd.to_datetime(
                         df_melted['Month'].str.replace(' ', '-'), format='%b-%Y', errors='coerce'
                     )
                     monthly_trend = df_melted.groupby('Month', as_index=False)['Usage'].sum()
                     fig_trend = px.line(
                         monthly_trend, x='Month', y='Usage', markers=True,
-                        title=f"Monthly {selected_metric} — All Selected Titles",
+                        title=f"Monthly {selected_metric} — {period_label}",
                     )
                     fig_trend.update_traces(line_color='#285C4D')
                     st.plotly_chart(fig_trend, use_container_width=True)
 
-                    # Also offer top-title breakdown
+                    # Top-title breakdown
                     st.markdown("**Monthly trend for top 5 titles:**")
                     top5_titles = df_filtered.nlargest(5, '_total')['Title'].tolist()
                     tdf = df_melted[df_melted['Title'].isin(top5_titles)]
@@ -1153,7 +1604,7 @@ def _render_counter_mode():
                         fig_tt = px.line(
                             tdf.groupby(['Month', 'Title'], as_index=False)['Usage'].sum(),
                             x='Month', y='Usage', color='Title', markers=True,
-                            title="Monthly Usage — Top 5 Titles"
+                            title=f"Monthly Usage — Top 5 Titles — {period_label}"
                         )
                         st.plotly_chart(fig_tt, use_container_width=True)
             else:
@@ -1181,12 +1632,16 @@ def _render_print_mode():
             - `Title` *(required)*
             - `Loans` / `Checkouts` / `Circulation` *(one required as the usage metric)*
             - `Author`, `LC Classification`, `Location`, `Publication Year` *(optional, enable more analysis)*
+            - `Checkout Date` / `Loan Date` / `Last Charge Date` *(optional, enables date filtering)*
 
             **Typical workflow:**
-            1. Load the file; the loader auto-detects your usage column
-            2. Review **Top Titles** to see your workhorses
-            3. Check **Weeding Review** for low/no-circulation candidates
-            4. Use **LC Breakdown** to see which areas of the collection are pulling weight
+            1. Load the file; the loader auto-detects your usage column and any date column
+            2. If a date column is present, narrow the window with the sidebar **Date Range** filter
+            3. If no date column exists, set a manual label (e.g., "AY 2024–25") in the
+               sidebar so downloads are clearly named
+            4. Review **Top Titles** to see your workhorses
+            5. Check **Weeding Review** for low/no-circulation candidates
+            6. Use **LC Breakdown** to see which areas of the collection are pulling weight
             """)
         return
 
@@ -1201,10 +1656,12 @@ def _render_print_mode():
         lc_col = find_column(df, LC_ALIASES)
         author_col = find_column(df, ['Author', 'author', 'AUTHOR', 'Creator'])
         location_col = find_column(df, ['Location', 'Location Name', 'location'])
+        date_col = _detect_print_date_column(df)
 
         with st.expander("🔍 Column Detection", expanded=False):
             st.write(f"Title: `{title_col}` · Usage: `{weight_col}` · "
-                     f"LC: `{lc_col}` · Author: `{author_col}` · Location: `{location_col}`")
+                     f"LC: `{lc_col}` · Author: `{author_col}` · "
+                     f"Location: `{location_col}` · Date: `{date_col}`")
 
         if not title_col:
             st.error("❌ Need a Title column.")
@@ -1215,9 +1672,67 @@ def _render_print_mode():
 
         df['_usage'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(0)
 
+        # --- Reporting period handling ---
+        period_label = "unknown period"
+        if date_col:
+            # Parse the date column and show detected range
+            df['_date'] = pd.to_datetime(df[date_col], errors='coerce')
+            valid_dates = df['_date'].dropna()
+            if len(valid_dates) > 0:
+                date_min = valid_dates.min()
+                date_max = valid_dates.max()
+                period_label = _format_date_range(date_min, date_max)
+                st.info(f"📅 **Date range detected** (from `{date_col}`): "
+                        f"{date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')} "
+                        f"· {len(valid_dates):,} dated records")
+            else:
+                st.warning(f"📅 Found date column `{date_col}` but could not parse any values.")
+                date_col = None
+        else:
+            st.warning("📅 No date column detected. You can set a period label manually below "
+                       "for downloads and reports. (Date filtering is unavailable without date data.)")
+
         # Sidebar filters
         st.sidebar.markdown("---")
         st.sidebar.subheader("🔎 Print Filters")
+
+        # Date range filter (only if we have dates)
+        if date_col and df['_date'].notna().any():
+            with st.sidebar.expander("📅 Date Range", expanded=False):
+                use_date_filter = st.checkbox(
+                    "Filter by date range", value=False, key="usage_p_use_dates"
+                )
+                if use_date_filter:
+                    valid = df['_date'].dropna()
+                    dmin = valid.min().date()
+                    dmax = valid.max().date()
+                    start_date, end_date = st.date_input(
+                        "Select range",
+                        value=(dmin, dmax),
+                        min_value=dmin, max_value=dmax,
+                        key="usage_p_date_range"
+                    )
+                    # Apply filter
+                    mask = (df['_date'].dt.date >= start_date) & (df['_date'].dt.date <= end_date)
+                    df = df[mask | df['_date'].isna()].copy()
+                    period_label = _format_date_range(
+                        pd.Timestamp(start_date), pd.Timestamp(end_date)
+                    )
+                    st.caption(f"Selected: **{period_label}** ({len(df):,} records)")
+
+        # Manual period label override
+        with st.sidebar.expander("🏷️ Report label (optional)", expanded=False):
+            custom_period = st.text_input(
+                "Custom reporting period label",
+                value="",
+                placeholder="e.g., AY 2024–25, FY2025 Q1",
+                help="Used on headers and download filenames. "
+                     "Especially useful when no date column is present.",
+                key="usage_p_period_label"
+            )
+            if custom_period.strip():
+                period_label = custom_period.strip()
+
         if location_col:
             locs = sorted(df[location_col].dropna().unique())
             selected_locs = st.sidebar.multiselect(
@@ -1237,7 +1752,7 @@ def _render_print_mode():
 
         # KPIs
         st.markdown("---")
-        st.subheader(f"📊 Overview — {weight_col}")
+        st.subheader(f"📊 Overview — {weight_col} · {period_label}")
         total_loans = df['_usage'].sum()
         zero_use = (df['_usage'] == 0).sum()
         avg_loans = total_loans / max(1, len(df))
@@ -1269,7 +1784,7 @@ def _render_print_mode():
             )
             fig_top = px.bar(
                 top_titles, x=weight_col, y=title_col, orientation='h',
-                title=f"Top {top_n} Titles by {weight_col}",
+                title=f"Top {top_n} Titles by {weight_col} — {period_label}",
                 color=weight_col,
                 color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']]
             )
@@ -1302,7 +1817,8 @@ def _render_print_mode():
             st.dataframe(low_use_df, use_container_width=True, height=400)
             st.download_button("📥 Weeding Review List (CSV)",
                                low_use_df.to_csv(index=False),
-                               "weeding_review.csv", "text/csv",
+                               f"weeding_review_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                               "text/csv",
                                key="usage_p_dl_weed")
 
         if lc_col:
@@ -1326,7 +1842,8 @@ def _render_print_mode():
                              hide_index=True, height=500)
                 st.download_button("📥 LC Breakdown (CSV)",
                                    lc_summary.to_csv(index=False),
-                                   "lc_circulation_breakdown.csv", "text/csv",
+                                   f"lc_circulation_breakdown_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                                   "text/csv",
                                    key="usage_p_dl_lc")
 
         if author_col:
@@ -1343,7 +1860,8 @@ def _render_print_mode():
                              hide_index=True, height=500)
                 st.download_button("📥 Author Summary (CSV)",
                                    auth_summary.to_csv(index=False),
-                                   "author_circulation.csv", "text/csv",
+                                   f"author_circulation_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                                   "text/csv",
                                    key="usage_p_dl_auth")
 
     except Exception as e:
@@ -2258,7 +2776,8 @@ def page_home():
     | Pick books to weed from the stacks | **Usage & Subscription Analyzer** → Print |
     | Prioritize purchases from a vendor list | **Recommendation Scorer** |
     | Match new books to specific faculty research | **Recommendation Scorer** (with faculty file) |
-    | Compare what we own to what's being checked out | **Collection Profiler** (with usage column) |
+    | Find areas with strong use relative to holdings (or weak) | **Collection Profiler** → Coverage vs. Use |
+    | Identify specific low-use titles to weed in those areas | **Usage Analyzer** → Print (after Profiler) |
     | Find high-use areas missing from the catalog | **Recommendation Scorer** → Subject Analysis tab |
     """)
 
