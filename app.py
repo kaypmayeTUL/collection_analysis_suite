@@ -433,6 +433,112 @@ def _decision_box(title, body_md):
 
 
 # =====================================================================
+# SHARED: Session caching (across tool switches)
+# =====================================================================
+# Streamlit's @st.cache_data handles the raw CSV parse, but we also want to
+# cache the post-processing work (LC extraction, weight coercion, etc.) so
+# switching between tools and coming back doesn't force a re-setup.
+# Key scheme: one cache slot per tool, keyed by (filename, filesize).
+
+def _make_file_key(uploaded_file):
+    """Build a stable cache key from an uploaded file object."""
+    if uploaded_file is None:
+        return None
+    try:
+        return (uploaded_file.name, uploaded_file.size)
+    except AttributeError:
+        # Fallback for file-like objects without .size
+        return (uploaded_file.name, None)
+
+
+def _cached_df_for_tool(tool_key, uploaded_file):
+    """Retrieve a cached processed DataFrame for this tool+file, if it exists.
+
+    Returns the cached df, or None if nothing matches (caller should do the load).
+    """
+    cache_key = f"_df_cache_{tool_key}"
+    file_key = _make_file_key(uploaded_file)
+    cached = st.session_state.get(cache_key)
+    if cached and cached.get('file_key') == file_key:
+        return cached.get('df')
+    return None
+
+
+def _store_cached_df(tool_key, uploaded_file, df):
+    """Store a processed DataFrame in session state for this tool+file."""
+    cache_key = f"_df_cache_{tool_key}"
+    st.session_state[cache_key] = {
+        'file_key': _make_file_key(uploaded_file),
+        'df': df,
+    }
+
+
+# =====================================================================
+# SHARED: Analysis notes
+# =====================================================================
+# Users can attach free-text notes to any analysis; these travel with downloads
+# as a header comment and can be reviewed later. Notes persist per tool in
+# session state, keyed by tool so switching tools doesn't lose them.
+
+def _notes_widget(tool_key, label="📝 Analysis notes", placeholder=None):
+    """Render a notes text area and return its current value.
+
+    The value persists in session_state so it survives reruns and tool switches.
+    Intended to be called near the top of each tool's analysis output so users
+    can annotate *before* downloading.
+    """
+    note_key = f"_notes_{tool_key}"
+    if note_key not in st.session_state:
+        st.session_state[note_key] = ""
+
+    placeholder = placeholder or (
+        "e.g., Prepared for sociology liaison meeting, Nov 2025. "
+        "Follow-up: discuss HQ underperformance with Dr. Chen."
+    )
+
+    with st.expander(label, expanded=False):
+        st.caption("Notes are saved in this session and included as a header comment "
+                   "in any CSV you download below. They won't persist if you close "
+                   "the browser tab.")
+        notes = st.text_area(
+            "Add context, rationale, or follow-up items:",
+            value=st.session_state[note_key],
+            placeholder=placeholder,
+            key=f"{note_key}_widget",
+            height=100,
+        )
+        st.session_state[note_key] = notes
+    return notes
+
+
+def _annotate_csv(df, notes, extra_meta=None):
+    """Return CSV bytes with an optional notes header block prepended.
+
+    The notes appear as CSV comment lines (prefixed with #) which Excel reads
+    as a single first row but most CSV libraries skip. Kept simple and portable.
+    """
+    from io import StringIO
+    from datetime import datetime
+
+    lines = []
+    lines.append(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    if extra_meta:
+        for k, v in extra_meta.items():
+            lines.append(f"# {k}: {v}")
+    if notes and notes.strip():
+        lines.append("# Notes:")
+        for ln in notes.strip().splitlines():
+            lines.append(f"#   {ln}")
+    lines.append("")  # blank line before CSV body
+
+    buf = StringIO()
+    if lines:
+        buf.write("\n".join(lines) + "\n")
+    df.to_csv(buf, index=False)
+    return buf.getvalue()
+
+
+# =====================================================================
 # =====================================================================
 # TOOL 1: COLLECTION PROFILER
 # =====================================================================
@@ -630,7 +736,7 @@ def _build_cvu_table(titles_dict, usage_dict, total_titles, total_usage,
     return pd.DataFrame(rows)
 
 
-def _render_coverage_vs_use(results, settings):
+def _render_coverage_vs_use(results, settings, notes=""):
     """Render the Coverage vs. Use section — the core 'what we have vs what's used' view."""
     st.markdown("---")
     st.subheader("⚖️ Coverage vs. Use")
@@ -690,7 +796,11 @@ def _render_coverage_vs_use(results, settings):
     )
 
     st.download_button("📥 Coverage-vs-Use (Main Class) CSV",
-                       main_df.to_csv(index=False),
+                       _annotate_csv(main_df, notes,
+                                     extra_meta={'Tool': 'Collection Profiler',
+                                                 'View': 'Coverage vs. Use (main)',
+                                                 'Over threshold': settings['cvu_over'],
+                                                 'Under threshold': settings['cvu_under']}),
                        "coverage_vs_use_main.csv", "text/csv",
                        key='prof_dl_cvu_main')
 
@@ -778,7 +888,9 @@ def _render_coverage_vs_use(results, settings):
                 }
             )
             st.download_button("📥 Coverage-vs-Use (Subclass) CSV",
-                               sub_df.to_csv(index=False),
+                               _annotate_csv(sub_df, notes,
+                                             extra_meta={'Tool': 'Collection Profiler',
+                                                         'View': 'Coverage vs. Use (subclass)'}),
                                "coverage_vs_use_subclass.csv", "text/csv",
                                key='prof_dl_cvu_sub')
 
@@ -815,6 +927,13 @@ def _profiler_display_results(results, settings, df, idx):
     c2.metric(f"Total {wl}", f"{results['total_weight']:,.0f}")
     c3.metric("LC Classes Present", f"{len(results['lc_main_counts'])}")
     c4.metric("Unique Subjects", f"{len(results['subject_counts']):,}")
+
+    # Notes — shown above results so users annotate *before* downloading
+    notes = _notes_widget(
+        "profiler",
+        placeholder="e.g., Prepared for sociology accreditation report, Nov 2025. "
+                    "Follow-up: discuss HQ underperformance with Dr. Chen."
+    )
 
     # Word cloud (formerly its own tool — now a view option here)
     if settings['show_wordcloud'] and results['subject_counts']:
@@ -890,7 +1009,11 @@ def _profiler_display_results(results, settings, df, idx):
                           height=max(450, top_n * 24), showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
         st.download_button("📥 Download Subject Frequencies (CSV)",
-                           sdf.to_csv(index=False), "subject_frequencies.csv",
+                           _annotate_csv(sdf, notes,
+                                         extra_meta={'Tool': 'Collection Profiler',
+                                                     'View': 'Top Subjects',
+                                                     'Weighting': wl}),
+                           "subject_frequencies.csv",
                            "text/csv", key='prof_dl_subj')
 
     if settings['show_heatmap'] and results['subject_by_lc']:
@@ -909,7 +1032,7 @@ def _profiler_display_results(results, settings, df, idx):
 
     # ==== Coverage vs. Use ====
     if (settings.get('show_coverage_vs_use') and results.get('cvu_available')):
-        _render_coverage_vs_use(results, settings)
+        _render_coverage_vs_use(results, settings, notes=notes)
 
     if settings['show_gap_analysis']:
         st.markdown("---")
@@ -1006,26 +1129,61 @@ def page_collection_profiler():
             """)
         return
 
-    file_bytes = uploaded_file.getvalue()
-    all_cols = _detect_columns_from_header(file_bytes)
-    subj_col = find_column(all_cols, SUBJECT_ALIASES)
-    lc_col = find_column(all_cols, LC_ALIASES)
-    title_col = find_column(all_cols, TITLE_ALIASES)
-    weight_col = find_column(all_cols, WEIGHT_ALIASES)
+    # Check session cache first — if we've already processed this file in
+    # this session, skip the load + LC extraction + weight coercion entirely
+    cached_df = _cached_df_for_tool("profiler", uploaded_file)
+    if cached_df is not None:
+        df = cached_df
+        st.success(f"✅ Using cached data for *{uploaded_file.name}* "
+                   f"({len(df):,} records)")
+        # Re-detect columns from cached df
+        subj_col = find_column(df, SUBJECT_ALIASES)
+        lc_col = find_column(df, LC_ALIASES)
+        title_col = find_column(df, TITLE_ALIASES)
+        weight_col = find_column(df, WEIGHT_ALIASES)
+        # Derive weight_label the same way the fresh path does
+        weight_label = weight_col if weight_col else "Title Count"
+    else:
+        file_bytes = uploaded_file.getvalue()
+        all_cols = _detect_columns_from_header(file_bytes)
+        subj_col = find_column(all_cols, SUBJECT_ALIASES)
+        lc_col = find_column(all_cols, LC_ALIASES)
+        title_col = find_column(all_cols, TITLE_ALIASES)
+        weight_col = find_column(all_cols, WEIGHT_ALIASES)
 
-    needed_cols = [c for c in [subj_col, lc_col, title_col, weight_col] if c]
-    if not needed_cols:
-        needed_cols = None
+        needed_cols = [c for c in [subj_col, lc_col, title_col, weight_col] if c]
+        if not needed_cols:
+            needed_cols = None
 
-    with st.spinner(f"Loading {uploaded_file.name}..."):
-        df = _load_csv_chunked(file_bytes, uploaded_file.name, cols_to_keep=needed_cols)
+        with st.spinner(f"Loading {uploaded_file.name}..."):
+            df = _load_csv_chunked(file_bytes, uploaded_file.name, cols_to_keep=needed_cols)
 
-    st.success(f"✅ Loaded **{len(df):,}** records from *{uploaded_file.name}*")
+        st.success(f"✅ Loaded **{len(df):,}** records from *{uploaded_file.name}*")
 
-    subj_col = find_column(df, SUBJECT_ALIASES)
-    lc_col = find_column(df, LC_ALIASES)
-    title_col = find_column(df, TITLE_ALIASES)
-    weight_col = find_column(df, WEIGHT_ALIASES)
+        subj_col = find_column(df, SUBJECT_ALIASES)
+        lc_col = find_column(df, LC_ALIASES)
+        title_col = find_column(df, TITLE_ALIASES)
+        weight_col = find_column(df, WEIGHT_ALIASES)
+
+        if not subj_col and not lc_col:
+            st.error("❌ Could not find a Subjects or LC Classification column.")
+            return
+
+        if weight_col:
+            df['_weight'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(1)
+            weight_label = weight_col
+        else:
+            df['_weight'] = 1.0
+            weight_label = "Title Count"
+
+        if lc_col:
+            df['_lc_main'], df['_lc_sub'] = _extract_lc_vectorized(df[lc_col])
+        else:
+            df['_lc_main'] = None
+            df['_lc_sub'] = None
+
+        # Save to cache for future tool switches
+        _store_cached_df("profiler", uploaded_file, df)
 
     with st.expander("🔍 Column Detection", expanded=False):
         st.write(f"Subjects: `{subj_col}` · LC: `{lc_col}` · "
@@ -1034,19 +1192,6 @@ def page_collection_profiler():
     if not subj_col and not lc_col:
         st.error("❌ Could not find a Subjects or LC Classification column.")
         return
-
-    if weight_col:
-        df['_weight'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(1)
-        weight_label = weight_col
-    else:
-        df['_weight'] = 1.0
-        weight_label = "Title Count"
-
-    if lc_col:
-        df['_lc_main'], df['_lc_sub'] = _extract_lc_vectorized(df[lc_col])
-    else:
-        df['_lc_main'] = None
-        df['_lc_sub'] = None
 
     # Sidebar settings
     with st.sidebar:
@@ -1348,10 +1493,20 @@ def _render_counter_mode():
         return
 
     try:
-        file_bytes = uploaded_file.getvalue()
-        df_raw, skip_used = _load_counter_csv(file_bytes, uploaded_file.name)
-        st.success(f"✅ Loaded **{len(df_raw):,}** rows from *{uploaded_file.name}* "
-                   f"(skipped {skip_used} metadata rows)")
+        # Check session cache first
+        cached = _cached_df_for_tool("usage_counter", uploaded_file)
+        if cached is not None:
+            df_raw = cached['df']
+            skip_used = cached['skip_used']
+            st.success(f"✅ Using cached data for *{uploaded_file.name}* "
+                       f"({len(df_raw):,} rows)")
+        else:
+            file_bytes = uploaded_file.getvalue()
+            df_raw, skip_used = _load_counter_csv(file_bytes, uploaded_file.name)
+            _store_cached_df("usage_counter", uploaded_file,
+                             {'df': df_raw, 'skip_used': skip_used})
+            st.success(f"✅ Loaded **{len(df_raw):,}** rows from *{uploaded_file.name}* "
+                       f"(skipped {skip_used} metadata rows)")
 
         # Detect columns
         month_cols = _identify_month_columns(df_raw)
@@ -1486,6 +1641,13 @@ def _render_counter_mode():
         k3.metric("Avg Usage / Title", f"{avg_usage:.1f}")
         k4.metric("Zero-Use Titles", f"{zero_use:,}")
 
+        # Notes — shown above tabs so users annotate *before* downloading
+        notes = _notes_widget(
+            "usage_counter",
+            placeholder="e.g., Prepared for FY2025 e-resource renewal review. "
+                        "Cancellation candidates flagged for follow-up with Anthony."
+        )
+
         # Analysis tabs
         st.markdown("---")
         tab1, tab2, tab3, tab4 = st.tabs([
@@ -1514,7 +1676,11 @@ def _render_counter_mode():
             )
             st.plotly_chart(fig_top, use_container_width=True)
             st.download_button("📥 Top Titles (CSV)",
-                               top_titles.to_csv(index=False),
+                               _annotate_csv(top_titles, notes,
+                                             extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                         'View': 'Top Titles',
+                                                         'Metric': selected_metric,
+                                                         'Period': period_label}),
                                f"top_titles_{_slug_period(period_label)}.csv".replace('_.', '.'),
                                "text/csv", key="usage_dl_top")
 
@@ -1540,7 +1706,12 @@ def _render_counter_mode():
 
             st.dataframe(low_use_df, use_container_width=True, height=400)
             st.download_button("📥 Cancellation Review List (CSV)",
-                               low_use_df.to_csv(index=False),
+                               _annotate_csv(low_use_df, notes,
+                                             extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                         'View': 'Cancellation Review',
+                                                         'Metric': selected_metric,
+                                                         'Threshold': threshold,
+                                                         'Period': period_label}),
                                f"cancellation_review_{_slug_period(period_label)}.csv".replace('_.', '.'),
                                "text/csv",
                                key="usage_dl_cancel")
@@ -1563,7 +1734,11 @@ def _render_counter_mode():
 
                 st.dataframe(pub_summary, use_container_width=True, hide_index=True, height=500)
                 st.download_button("📥 Publisher Summary (CSV)",
-                                   pub_summary.to_csv(index=False),
+                                   _annotate_csv(pub_summary, notes,
+                                                 extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                             'View': 'Publisher Summary',
+                                                             'Metric': selected_metric,
+                                                             'Period': period_label}),
                                    f"publisher_summary_{_slug_period(period_label)}.csv".replace('_.', '.'),
                                    "text/csv",
                                    key="usage_dl_pub")
@@ -1646,9 +1821,17 @@ def _render_print_mode():
         return
 
     try:
-        file_bytes = uploaded_file.getvalue()
-        df = _load_print_csv(file_bytes, uploaded_file.name)
-        st.success(f"✅ Loaded **{len(df):,}** records from *{uploaded_file.name}*")
+        # Check session cache first
+        cached_df = _cached_df_for_tool("usage_print", uploaded_file)
+        if cached_df is not None:
+            df = cached_df.copy()  # copy so sidebar filtering doesn't mutate cache
+            st.success(f"✅ Using cached data for *{uploaded_file.name}* "
+                       f"({len(df):,} records)")
+        else:
+            file_bytes = uploaded_file.getvalue()
+            df = _load_print_csv(file_bytes, uploaded_file.name)
+            _store_cached_df("usage_print", uploaded_file, df)
+            st.success(f"✅ Loaded **{len(df):,}** records from *{uploaded_file.name}*")
 
         # Detect columns
         title_col = find_column(df, TITLE_ALIASES)
@@ -1763,6 +1946,13 @@ def _render_print_mode():
         k3.metric(f"Avg {weight_col} / Title", f"{avg_loans:.1f}")
         k4.metric("Zero-Use Titles", f"{zero_use:,}")
 
+        # Notes — shown above tabs so users annotate *before* downloading
+        notes = _notes_widget(
+            "usage_print",
+            placeholder="e.g., Annual weeding review for HQ section, Spring 2026. "
+                        "Proposed off-site storage candidates flagged for DelRosario review."
+        )
+
         # Analysis tabs
         st.markdown("---")
         tabs = ["🏆 Top Titles", "✂️ Weeding Review"]
@@ -1816,7 +2006,12 @@ def _render_print_mode():
 
             st.dataframe(low_use_df, use_container_width=True, height=400)
             st.download_button("📥 Weeding Review List (CSV)",
-                               low_use_df.to_csv(index=False),
+                               _annotate_csv(low_use_df, notes,
+                                             extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                         'View': 'Weeding Review',
+                                                         'Metric': weight_col,
+                                                         'Threshold': threshold,
+                                                         'Period': period_label}),
                                f"weeding_review_{_slug_period(period_label)}.csv".replace('_.', '.'),
                                "text/csv",
                                key="usage_p_dl_weed")
@@ -1841,7 +2036,11 @@ def _render_print_mode():
                 st.dataframe(lc_summary, use_container_width=True,
                              hide_index=True, height=500)
                 st.download_button("📥 LC Breakdown (CSV)",
-                                   lc_summary.to_csv(index=False),
+                                   _annotate_csv(lc_summary, notes,
+                                                 extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                             'View': 'LC Breakdown',
+                                                             'Metric': weight_col,
+                                                             'Period': period_label}),
                                    f"lc_circulation_breakdown_{_slug_period(period_label)}.csv".replace('_.', '.'),
                                    "text/csv",
                                    key="usage_p_dl_lc")
@@ -1859,7 +2058,11 @@ def _render_print_mode():
                 st.dataframe(auth_summary, use_container_width=True,
                              hide_index=True, height=500)
                 st.download_button("📥 Author Summary (CSV)",
-                                   auth_summary.to_csv(index=False),
+                                   _annotate_csv(auth_summary, notes,
+                                                 extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                             'View': 'Author Summary',
+                                                             'Metric': weight_col,
+                                                             'Period': period_label}),
                                    f"author_circulation_{_slug_period(period_label)}.csv".replace('_.', '.'),
                                    "text/csv",
                                    key="usage_p_dl_auth")
@@ -2435,9 +2638,20 @@ def page_recommendation_scorer():
 
     if checkouts_file and recommendations_file:
         try:
-            with st.spinner("Loading and validating data..."):
-                checkouts_df = pd.read_csv(checkouts_file)
-                recommendations_df = pd.read_csv(recommendations_file)
+            # Check session cache for each file independently (different shape/roles)
+            cached_co = _cached_df_for_tool("rec_checkouts", checkouts_file)
+            cached_rec = _cached_df_for_tool("rec_recommendations", recommendations_file)
+
+            if cached_co is not None and cached_rec is not None:
+                checkouts_df = cached_co.copy()
+                recommendations_df = cached_rec.copy()
+                st.success(f"✅ Using cached data for both files")
+            else:
+                with st.spinner("Loading and validating data..."):
+                    checkouts_df = pd.read_csv(checkouts_file)
+                    recommendations_df = pd.read_csv(recommendations_file)
+                _store_cached_df("rec_checkouts", checkouts_file, checkouts_df)
+                _store_cached_df("rec_recommendations", recommendations_file, recommendations_df)
 
             co_valid, co_warns = validate_columns(checkouts_df, REQUIRED_CHECKOUT_COLS,
                                                    RECOMMENDED_CHECKOUT_COLS, "Checkouts file")
@@ -2550,6 +2764,13 @@ def page_recommendation_scorer():
                 results_df = st.session_state["rec_results"]
                 st.subheader("📊 Step 3: Review Results")
 
+                # Notes — annotate before downloading
+                notes = _notes_widget(
+                    "recommendation_scorer",
+                    placeholder="e.g., YBP slip list Nov 2025, sociology liaison review. "
+                                "Weights adjusted to favor faculty interest (Dr. Chen's lab)."
+                )
+
                 tab_r1, tab_r2, tab_r3, tab_r4 = st.tabs([
                     "📊 Scored Recommendations", "📈 Score Distribution",
                     "🏷️ Subject Analysis", "🎓 Faculty Analysis"
@@ -2659,18 +2880,40 @@ def page_recommendation_scorer():
                 # Downloads
                 st.subheader("💾 Step 4: Download Results")
                 dc1, dc2, dc3 = st.columns(3)
+                _weights = st.session_state.get("rec_weights", {})
+                _weights_str = (f"subject={_weights.get('subject', 0)}, "
+                                f"lc={_weights.get('lc', 0)}, "
+                                f"author={_weights.get('author', 0)}, "
+                                f"faculty={_weights.get('faculty', 0)}")
                 with dc1:
                     st.download_button("📥 Full Results (CSV)",
-                                       results_df.to_csv(index=False),
+                                       _annotate_csv(results_df, notes,
+                                                     extra_meta={'Tool': 'Recommendation Scorer',
+                                                                 'View': 'Full Results',
+                                                                 'Weights': _weights_str}),
                                        "recommendations_scored.csv", "text/csv",
                                        key="rec_dl_full")
                 with dc2:
-                    high_csv = results_df[results_df["likelihood_score"] >= 70].to_csv(index=False)
-                    st.download_button("🟢 High Priority Only", high_csv,
+                    high_df = results_df[results_df["likelihood_score"] >= 70]
+                    st.download_button("🟢 High Priority Only",
+                                       _annotate_csv(high_df, notes,
+                                                     extra_meta={'Tool': 'Recommendation Scorer',
+                                                                 'View': 'High Priority (≥70)',
+                                                                 'Weights': _weights_str}),
                                        "recommendations_high_priority.csv", "text/csv",
                                        key="rec_dl_high")
                 with dc3:
-                    st.download_button("📄 Report (TXT)", generate_report(results_df),
+                    # TXT report: prepend notes as a header block (not CSV, so different format)
+                    report_body = generate_report(results_df)
+                    if notes and notes.strip():
+                        from datetime import datetime
+                        notes_block = (
+                            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                            f"Weights: {_weights_str}\n\n"
+                            f"NOTES\n{'-' * 80}\n{notes.strip()}\n\n"
+                        )
+                        report_body = notes_block + report_body
+                    st.download_button("📄 Report (TXT)", report_body,
                                        "recommendation_report.txt", "text/plain",
                                        key="rec_dl_txt")
 
