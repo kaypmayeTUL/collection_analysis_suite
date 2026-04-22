@@ -86,11 +86,8 @@ div[data-testid="metric-container"] {
     margin: 5px 0;
 }
 .uploadbox {
-    border: 2px dashed #285C4D;
-    border-radius: 10px;
-    padding: 30px;
-    text-align: center;
-    background-color: #eef6f3;
+    /* deprecated — formerly wrapped file uploaders; kept only to avoid breaking any cached HTML */
+    display: none;
 }
 .decision-box {
     background-color: #eef6f3;
@@ -415,7 +412,7 @@ def _footer():
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666;'>
-        <p>Library Collection Dashboard v2.0 | Howard-Tilton Memorial Library, Tulane University</p>
+        <p>Library Collection Dashboard v2.0  built with Claude| Howard-Tilton Memorial Library, Tulane University</p>
         <p>For support, contact Kay P Maye at kmaye@tulane.edu</p>
     </div>
     """, unsafe_allow_html=True)
@@ -536,6 +533,76 @@ def _annotate_csv(df, notes, extra_meta=None):
         buf.write("\n".join(lines) + "\n")
     df.to_csv(buf, index=False)
     return buf.getvalue()
+
+
+# =====================================================================
+# SHARED: Download tray
+# =====================================================================
+# Collects every downloadable artifact produced during a single tool run
+# so users can grab everything as one ZIP at the end of the page instead
+# of hunting for individual buttons.
+#
+# Usage: alongside an existing st.download_button, call
+#     _add_to_tray(tool_key, filename, data)
+# Then at the end of the tool's output, call
+#     _render_download_tray(tool_key)
+# to render a "Download all (ZIP)" button.
+
+def _reset_tray(tool_key):
+    """Clear the tray for this tool. Call at the start of a fresh render pass
+    so stale artifacts from a previous run don't leak into the ZIP."""
+    st.session_state[f"_tray_{tool_key}"] = []
+
+
+def _add_to_tray(tool_key, filename, data):
+    """Register a downloadable artifact (CSV string or bytes) for this tool."""
+    tray_key = f"_tray_{tool_key}"
+    if tray_key not in st.session_state:
+        st.session_state[tray_key] = []
+    # De-dup: if this filename is already in the tray, overwrite it
+    tray = st.session_state[tray_key]
+    tray[:] = [item for item in tray if item[0] != filename]
+    tray.append((filename, data))
+
+
+def _render_download_tray(tool_key, zip_filename="results.zip"):
+    """Render a 'Download all' button that bundles everything in the tray."""
+    tray = st.session_state.get(f"_tray_{tool_key}", [])
+    if not tray:
+        return
+    import zipfile
+    from io import BytesIO as _BIO
+    buf = _BIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, data in tray:
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            zf.writestr(filename, data)
+    buf.seek(0)
+    count = len(tray)
+    st.download_button(
+        f"📦 Download all ({count} file{'s' if count != 1 else ''}) as ZIP",
+        buf.getvalue(),
+        zip_filename,
+        "application/zip",
+        key=f"_tray_dl_{tool_key}",
+        use_container_width=True,
+        type="primary",
+    )
+    with st.expander(f"Files included ({count})", expanded=False):
+        for filename, _ in tray:
+            st.caption(f"• {filename}")
+
+
+def _dl(label, data, filename, mime, key, tool_key=None):
+    """Render a download button AND stash it in the tool's tray.
+
+    Thin wrapper over st.download_button so existing call sites can be
+    converted with minimal change.
+    """
+    st.download_button(label, data, filename, mime, key=key)
+    if tool_key is not None:
+        _add_to_tray(tool_key, filename, data)
 
 
 # =====================================================================
@@ -739,7 +806,7 @@ def _build_cvu_table(titles_dict, usage_dict, total_titles, total_usage,
 def _render_coverage_vs_use(results, settings, notes=""):
     """Render the Coverage vs. Use section — the core 'what we have vs what's used' view."""
     st.markdown("---")
-    st.subheader("⚖️ Coverage vs. Use")
+    st.subheader("Coverage vs. use")
     st.markdown(
         "Compares **% of your collection** in each LC area against **% of use** it drives. "
         "The *Assessment* column uses ratios you can tune in the sidebar:"
@@ -795,14 +862,16 @@ def _render_coverage_vs_use(results, settings, notes=""):
         }
     )
 
+    _cvu_main_bytes = _annotate_csv(main_df, notes,
+                                    extra_meta={'Tool': 'Collection Profiler',
+                                                'View': 'Coverage vs. Use (main)',
+                                                'Over threshold': settings['cvu_over'],
+                                                'Under threshold': settings['cvu_under']})
     st.download_button("📥 Coverage-vs-Use (Main Class) CSV",
-                       _annotate_csv(main_df, notes,
-                                     extra_meta={'Tool': 'Collection Profiler',
-                                                 'View': 'Coverage vs. Use (main)',
-                                                 'Over threshold': settings['cvu_over'],
-                                                 'Under threshold': settings['cvu_under']}),
+                       _cvu_main_bytes,
                        "coverage_vs_use_main.csv", "text/csv",
                        key='prof_dl_cvu_main')
+    _add_to_tray("profiler", "coverage_vs_use_main.csv", _cvu_main_bytes)
 
     # Scatter plot: % titles vs % use, with diagonal reference line
     plot_df = main_df[main_df['Assessment'] != "—"].copy()
@@ -887,12 +956,14 @@ def _render_coverage_vs_use(results, settings, notes=""):
                     'Use/Holdings Signal': st.column_config.NumberColumn(format="%.2f"),
                 }
             )
+            _cvu_sub_bytes = _annotate_csv(sub_df, notes,
+                                           extra_meta={'Tool': 'Collection Profiler',
+                                                       'View': 'Coverage vs. Use (subclass)'})
             st.download_button("📥 Coverage-vs-Use (Subclass) CSV",
-                               _annotate_csv(sub_df, notes,
-                                             extra_meta={'Tool': 'Collection Profiler',
-                                                         'View': 'Coverage vs. Use (subclass)'}),
+                               _cvu_sub_bytes,
                                "coverage_vs_use_subclass.csv", "text/csv",
                                key='prof_dl_cvu_sub')
+            _add_to_tray("profiler", "coverage_vs_use_subclass.csv", _cvu_sub_bytes)
 
     # Interpretive callout
     over_count = (main_df['Assessment'] == "🟢 Overperforming").sum()
@@ -920,8 +991,11 @@ def _profiler_display_results(results, settings, df, idx):
     wl = settings['weight_label']
     top_n = settings['top_n_subjects']
 
+    # Fresh tray for this render pass
+    _reset_tray("profiler")
+
     st.markdown("---")
-    st.subheader("📊 Collection Overview")
+    st.subheader("Collection overview")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Records Analyzed", f"{results['n_records']:,}")
     c2.metric(f"Total {wl}", f"{results['total_weight']:,.0f}")
@@ -938,7 +1012,7 @@ def _profiler_display_results(results, settings, df, idx):
     # Word cloud (formerly its own tool — now a view option here)
     if settings['show_wordcloud'] and results['subject_counts']:
         st.markdown("---")
-        st.subheader(f"☁️ Subject Word Cloud ({wl}-weighted)")
+        st.subheader(f"Subject word cloud ({wl}-weighted)")
         if not WORDCLOUD_AVAILABLE:
             st.warning("Install `wordcloud` and `matplotlib` to enable this view: "
                        "`pip install wordcloud matplotlib`")
@@ -963,16 +1037,18 @@ def _profiler_display_results(results, settings, df, idx):
                 fig.savefig(buf, format='png', dpi=200, bbox_inches='tight',
                             facecolor='white', edgecolor='none')
                 buf.seek(0)
-                st.download_button("📥 Download Word Cloud (PNG)", buf,
+                _wc_png_bytes = buf.getvalue()
+                st.download_button("📥 Word cloud (PNG)", _wc_png_bytes,
                                    "collection_wordcloud.png", "image/png",
                                    key='prof_dl_wc')
+                _add_to_tray("profiler", "collection_wordcloud.png", _wc_png_bytes)
                 plt.close(fig)
             else:
                 st.info(f"No subjects meet the minimum length of {min_len} characters.")
 
     if settings['show_sunburst'] and results['sunburst_data']:
         st.markdown("---")
-        st.subheader("🌞 LC Classification Sunburst")
+        st.subheader("LC classification sunburst")
         sb = results['sunburst_data']
         fig = go.Figure(go.Sunburst(
             ids=[r['id'] for r in sb], labels=[r['label'] for r in sb],
@@ -987,7 +1063,7 @@ def _profiler_display_results(results, settings, df, idx):
 
     if settings['show_treemap'] and results['lc_main_counts']:
         st.markdown("---")
-        st.subheader("🗺️ LC Classification Treemap")
+        st.subheader("LC classification treemap")
         tm_data = [{'Class': f"{c} – {LC_CLASSES.get(c, c)}", 'Count': ct,
                     'Pct': ct / results['total_weight'] * 100}
                    for c, ct in sorted(results['lc_main_counts'].items(), key=lambda x: -x[1])]
@@ -1000,7 +1076,7 @@ def _profiler_display_results(results, settings, df, idx):
 
     if settings['show_subject_bars'] and results['subject_counts']:
         st.markdown("---")
-        st.subheader(f"📖 Top {top_n} Subject Terms")
+        st.subheader(f"Top {top_n} subject terms")
         top_subjects = results['subject_counts'].most_common(top_n)
         sdf = pd.DataFrame(top_subjects, columns=['Subject', 'Count'])
         fig = px.bar(sdf, x='Count', y='Subject', orientation='h', color='Count',
@@ -1008,17 +1084,19 @@ def _profiler_display_results(results, settings, df, idx):
         fig.update_layout(yaxis={'categoryorder': 'total ascending'},
                           height=max(450, top_n * 24), showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
-        st.download_button("📥 Download Subject Frequencies (CSV)",
-                           _annotate_csv(sdf, notes,
-                                         extra_meta={'Tool': 'Collection Profiler',
-                                                     'View': 'Top Subjects',
-                                                     'Weighting': wl}),
+        _subj_bytes = _annotate_csv(sdf, notes,
+                                    extra_meta={'Tool': 'Collection Profiler',
+                                                'View': 'Top Subjects',
+                                                'Weighting': wl})
+        st.download_button("📥 Subject frequencies (CSV)",
+                           _subj_bytes,
                            "subject_frequencies.csv",
                            "text/csv", key='prof_dl_subj')
+        _add_to_tray("profiler", "subject_frequencies.csv", _subj_bytes)
 
     if settings['show_heatmap'] and results['subject_by_lc']:
         st.markdown("---")
-        st.subheader("🔥 LC Class × Top Subjects Heatmap")
+        st.subheader("LC class × top subjects heatmap")
         global_top = [s for s, _ in results['subject_counts'].most_common(min(top_n, 25))]
         lc_present = sorted(results['subject_by_lc'].keys())
         matrix = [[results['subject_by_lc'][c].get(s, 0) for s in global_top] for c in lc_present]
@@ -1036,7 +1114,7 @@ def _profiler_display_results(results, settings, df, idx):
 
     if settings['show_gap_analysis']:
         st.markdown("---")
-        st.subheader("🔎 Collection Gap Analysis")
+        st.subheader("Collection gap analysis")
         missing = results['missing_lc_classes']
         thin = results['thin_lc_classes']
         if missing:
@@ -1063,7 +1141,7 @@ def _profiler_display_results(results, settings, df, idx):
 
     if settings['show_detail_table'] and results.get('detail_available') and df is not None:
         st.markdown("---")
-        st.subheader("📋 Title Details (paginated)")
+        st.subheader("Title details (paginated)")
         PAGE_SIZE = 5_000
         total = results['detail_total']
         total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -1075,6 +1153,11 @@ def _profiler_display_results(results, settings, df, idx):
         st.dataframe(df.loc[page_idx, results['detail_cols']],
                      use_container_width=True, height=400, hide_index=True)
 
+    # Consolidated download tray — everything produced above in one ZIP
+    st.markdown("---")
+    st.subheader("Downloads")
+    _render_download_tray("profiler", zip_filename="collection_profiler_results.zip")
+
 
 def page_collection_profiler():
     """Tool 1: Collection Profiler."""
@@ -1085,48 +1168,33 @@ def page_collection_profiler():
 
     st.header("🗺️ Collection Profiler")
     st.markdown(
-        "**What does our collection look like?** Upload a title list with **subject terms** "
-        "and/or **LC call numbers** to map disciplinary strengths, spot gaps, and explore "
+        "**What does our collection look like?** Upload a title list with subject terms "
+        "and/or LC call numbers to map disciplinary strengths, spot gaps, and explore "
         "subject coverage."
     )
-    _decision_box(
-        "When to use this tool",
-        "- **Collections:** Baseline assessment, accreditation self-studies, weeding prep "
-        "(find thin/missing areas), justifying budget asks by showing strengths.\n"
-        "- **Instruction:** Prepare for a liaison session — see at a glance what you "
-        "actually have in HQ or PN before walking into the class.\n"
-        "- **Outreach:** Quick visuals for faculty meetings and annual reports "
-        "(\"here's what sociology looks like in our collection\")."
-    )
-    st.markdown("---")
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown("""
-        <div class="uploadbox">
-            <h2>📂 Upload Title List (CSV)</h2>
-            <p>Drag and drop or click to browse</p>
-        </div>
-        """, unsafe_allow_html=True)
-        uploaded_file = st.file_uploader(
-            "Choose CSV", type=['csv'],
-            help="Needs Subjects and/or LC Classification; usage columns are optional.",
-            label_visibility="collapsed", key="prof_upload"
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- **Collections:** Baseline assessment, accreditation self-studies, weeding prep "
+            "(find thin/missing areas), justifying budget asks by showing strengths.\n"
+            "- **Instruction:** Prepare for a liaison session — see at a glance what you "
+            "actually have in HQ or PN before walking into the class.\n"
+            "- **Outreach:** Quick visuals for faculty meetings and annual reports "
+            "(\"here's what sociology looks like in our collection\")."
         )
 
+
+    uploaded_file = st.file_uploader(
+        "📂 Upload title list (CSV)", type=['csv'],
+        help="Needs Subjects and/or LC Classification; usage columns (Loans, Checkouts) are optional. Optimized for 500K–1M+ records.",
+        key="prof_upload"
+    )
+
     if uploaded_file is None:
-        with st.expander("📖 How to use this tool", expanded=True):
-            st.markdown("""
-            **Step 1:** Prepare a CSV with some combination of `Subjects`, `LC Classification` /
-            `Call Number`, `Title`, and optionally a usage column like `Loans` or `Checkouts`.
-
-            **Step 2:** Upload and configure analysis settings in the sidebar.
-
-            **Step 3:** Click **Analyze Collection** to see sunburst charts, treemaps,
-            top subjects, word cloud, heatmaps, and gap analysis.
-
-            Optimized for datasets of 500K–1M+ records.
-            """)
+        st.caption(
+            "💡 Your CSV should have some combination of **Subjects**, "
+            "**LC Classification** or **Call Number**, **Title**, "
+            "and optionally a usage column like **Loans** or **Checkouts**."
+        )
         return
 
     # Check session cache first — if we've already processed this file in
@@ -1151,12 +1219,11 @@ def page_collection_profiler():
         title_col = find_column(all_cols, TITLE_ALIASES)
         weight_col = find_column(all_cols, WEIGHT_ALIASES)
 
-        needed_cols = [c for c in [subj_col, lc_col, title_col, weight_col] if c]
-        if not needed_cols:
-            needed_cols = None
-
+        # Load all columns so the manual-override dropdown has full options.
+        # This is a small cost vs. the prior partial-load optimization, but it
+        # means users can recover when our aliases miss their column names.
         with st.spinner(f"Loading {uploaded_file.name}..."):
-            df = _load_csv_chunked(file_bytes, uploaded_file.name, cols_to_keep=needed_cols)
+            df = _load_csv_chunked(file_bytes, uploaded_file.name, cols_to_keep=None)
 
         st.success(f"✅ Loaded **{len(df):,}** records from *{uploaded_file.name}*")
 
@@ -1164,10 +1231,6 @@ def page_collection_profiler():
         lc_col = find_column(df, LC_ALIASES)
         title_col = find_column(df, TITLE_ALIASES)
         weight_col = find_column(df, WEIGHT_ALIASES)
-
-        if not subj_col and not lc_col:
-            st.error("❌ Could not find a Subjects or LC Classification column.")
-            return
 
         if weight_col:
             df['_weight'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(1)
@@ -1185,42 +1248,106 @@ def page_collection_profiler():
         # Save to cache for future tool switches
         _store_cached_df("profiler", uploaded_file, df)
 
-    with st.expander("🔍 Column Detection", expanded=False):
-        st.write(f"Subjects: `{subj_col}` · LC: `{lc_col}` · "
-                 f"Title: `{title_col}` · Weight: `{weight_col}`")
+    # Track prior LC column so we re-extract if user changes it
+    _original_lc_col = find_column(df, LC_ALIASES)
+
+    # Column detection + manual override
+    detected_ok = bool(subj_col or lc_col)
+    with st.expander(
+        "🔍 Column mapping" + ("" if detected_ok else " — ⚠️ action needed"),
+        expanded=not detected_ok
+    ):
+        if detected_ok:
+            st.caption("We auto-detected these columns. Override any of them if we guessed wrong.")
+        else:
+            st.warning(
+                "We couldn't automatically find a Subjects or LC Classification column. "
+                "Pick the right ones from your file below — you need at least one of Subjects or LC."
+            )
+        all_cols = list(df.columns)
+        # Hide internal columns we added
+        all_cols = [c for c in all_cols if not c.startswith('_')]
+        none_opt = "— none —"
+        options = [none_opt] + all_cols
+
+        def _idx(col):
+            return options.index(col) if col in all_cols else 0
+
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            subj_pick = st.selectbox("Subjects column", options, index=_idx(subj_col), key="prof_map_subj")
+            title_pick = st.selectbox("Title column (optional)", options, index=_idx(title_col), key="prof_map_title")
+        with mc2:
+            lc_pick = st.selectbox("LC / Call Number column", options, index=_idx(lc_col), key="prof_map_lc")
+            weight_pick = st.selectbox("Usage / weight column (optional)", options, index=_idx(weight_col), key="prof_map_weight")
+
+        subj_col = None if subj_pick == none_opt else subj_pick
+        lc_col = None if lc_pick == none_opt else lc_pick
+        title_col = None if title_pick == none_opt else title_pick
+        new_weight_col = None if weight_pick == none_opt else weight_pick
+
+    # If user changed the weight column, re-coerce _weight
+    if new_weight_col != weight_col:
+        weight_col = new_weight_col
+        if weight_col:
+            df['_weight'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(1)
+            weight_label = weight_col
+        else:
+            df['_weight'] = 1.0
+            weight_label = "Title Count"
+
+    # If user picked a different LC column than what was auto-detected, re-extract
+    if lc_col and lc_col != _original_lc_col:
+        df['_lc_main'], df['_lc_sub'] = _extract_lc_vectorized(df[lc_col])
+    elif not lc_col:
+        df['_lc_main'] = None
+        df['_lc_sub'] = None
 
     if not subj_col and not lc_col:
-        st.error("❌ Could not find a Subjects or LC Classification column.")
+        st.error("❌ Please pick at least a Subjects or LC Classification column above to continue.")
         return
 
-    # Sidebar settings
+    # Sidebar: weight mode + LC filter only (upstream choices that change what's analyzed)
     with st.sidebar:
-        st.subheader("⚙️ Analysis Settings")
+        st.subheader("Analysis settings")
         weight_options = ["Title count (1 per title)"]
         if weight_col:
             weight_options.append(f"Usage metric ({weight_label})")
         analysis_mode = st.radio("Weight titles by:", weight_options, index=0, key="prof_mode")
         use_weight = weight_col and "Usage" in analysis_mode
 
-        st.markdown("---")
-        st.subheader("📊 Visualizations")
-        top_n = st.slider("Top N subjects", 10, 100, 30, 5, key="prof_topn")
-        show_sunburst = st.checkbox("LC sunburst", True, key="prof_sun")
-        show_treemap = st.checkbox("LC treemap", True, key="prof_tree")
-        show_bars = st.checkbox("Top subjects bar chart", True, key="prof_bars")
-        show_wordcloud = st.checkbox("Subject word cloud", True, key="prof_wc")
-        show_heatmap = st.checkbox("LC × subject heatmap", True, key="prof_heat")
-        show_coverage_vs_use = st.checkbox(
-            "Coverage vs. Use (requires usage column)",
-            value=bool(weight_col),
-            disabled=not weight_col,
-            key="prof_cvu",
-            help="Compare what % of the collection each LC area holds vs. what % "
-                 "of use it drives. Shows overperforming (small but heavily used) "
-                 "and underperforming (large but lightly used) areas."
-        )
-        show_gap = st.checkbox("Gap analysis", True, key="prof_gap")
-        show_detail = st.checkbox("Title detail table", False, key="prof_detail")
+        if lc_col:
+            st.markdown("---")
+            st.subheader("Filter by LC class")
+            avail = sorted(df['_lc_main'].dropna().unique())
+            labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in avail]
+            sel_labels = st.multiselect("Include:", labels, default=labels, key="prof_lc_filter")
+            sel_classes = [l.split(' –')[0] for l in sel_labels]
+        else:
+            sel_classes = None
+
+    # Main-body: visualization toggles in a collapsed "Customize view" expander
+    with st.expander("🎨 Customize view (visualizations, word cloud, thresholds)", expanded=False):
+        vc1, vc2 = st.columns(2)
+        with vc1:
+            top_n = st.slider("Top N subjects", 10, 100, 30, 5, key="prof_topn")
+            show_sunburst = st.checkbox("LC sunburst", True, key="prof_sun")
+            show_treemap = st.checkbox("LC treemap", True, key="prof_tree")
+            show_bars = st.checkbox("Top subjects bar chart", True, key="prof_bars")
+            show_wordcloud = st.checkbox("Subject word cloud", True, key="prof_wc")
+        with vc2:
+            show_heatmap = st.checkbox("LC × subject heatmap", True, key="prof_heat")
+            show_coverage_vs_use = st.checkbox(
+                "Coverage vs. Use (requires usage column)",
+                value=bool(weight_col),
+                disabled=not weight_col,
+                key="prof_cvu",
+                help="Compare what % of the collection each LC area holds vs. what % "
+                     "of use it drives. Shows overperforming (small but heavily used) "
+                     "and underperforming (large but lightly used) areas."
+            )
+            show_gap = st.checkbox("Gap analysis", True, key="prof_gap")
+            show_detail = st.checkbox("Title detail table", False, key="prof_detail")
 
         # Coverage-vs-Use threshold configuration
         if show_coverage_vs_use and weight_col:
@@ -1271,17 +1398,29 @@ def page_collection_profiler():
         else:
             wc_max_words, wc_min_len, wc_color = 100, 3, "viridis"
 
-        if lc_col:
-            st.markdown("---")
-            st.subheader("🔎 Filter by LC Class")
-            avail = sorted(df['_lc_main'].dropna().unique())
-            labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in avail]
-            sel_labels = st.multiselect("Include:", labels, default=labels, key="prof_lc_filter")
-            sel_classes = [l.split(' –')[0] for l in sel_labels]
-        else:
-            sel_classes = None
+        st.caption(
+            "Changes here apply the next time you click **Re-run analysis** "
+            "(or the main button below)."
+        )
+        rerun_clicked = st.button("🔄 Re-run analysis", key="prof_rerun", use_container_width=True)
 
-    if st.button("🔍 Analyze Collection", type="primary", use_container_width=True, key="prof_run"):
+    # Decide whether to run analysis:
+    # - Always run on first upload of a file (no cached results for this file)
+    # - Re-run if user clicks the rerun button inside the expander
+    # - Re-run if user explicitly clicks the main Analyze button (shown below)
+    file_key = _make_file_key(uploaded_file)
+    last_run_key = st.session_state.get('prof_last_run_file_key')
+    needs_autorun = st.session_state.get('prof_results') is None or last_run_key != file_key
+
+    main_run_clicked = st.button(
+        "🔍 Re-analyze collection",
+        type="secondary",
+        use_container_width=True,
+        key="prof_run",
+        help="Click to re-run with current settings."
+    )
+
+    if needs_autorun or rerun_clicked or main_run_clicked:
         w_key = '_weight' if use_weight else None
         pbar = st.progress(0, "Starting analysis...")
         results = _profiler_run_analysis(
@@ -1289,6 +1428,7 @@ def page_collection_profiler():
             has_usage_col=bool(weight_col)
         )
         st.session_state['prof_results'] = results
+        st.session_state['prof_last_run_file_key'] = file_key
         if sel_classes is not None and lc_col:
             mask = df['_lc_main'].isin(sel_classes) | df['_lc_main'].isna()
             st.session_state['prof_filtered_idx'] = df.index[mask]
@@ -1308,7 +1448,7 @@ def page_collection_profiler():
             'cvu_min_titles': cvu_min_titles, 'cvu_show_sub': cvu_show_sub,
             'show_gap_analysis': show_gap, 'show_detail_table': show_detail,
         }
-        st.success("✅ Analysis complete!")
+        pbar.empty()
 
     if st.session_state['prof_results']:
         _profiler_display_results(
@@ -1614,7 +1754,7 @@ def _render_counter_mode():
 
         # KPIs — if date-filtered, recompute totals from selected month columns
         st.markdown("---")
-        st.subheader(f"📊 Overview — {selected_metric} · {period_label}")
+        st.subheader(f"Overview — {selected_metric} · {period_label}")
 
         # Compute the per-row total that respects the date filter
         if use_date_filter and selected_month_cols:
@@ -1648,11 +1788,14 @@ def _render_counter_mode():
                         "Cancellation candidates flagged for follow-up with Anthony."
         )
 
+        # Fresh tray for this render pass
+        _reset_tray("usage_counter")
+
         # Analysis tabs
         st.markdown("---")
         tab1, tab2, tab3, tab4 = st.tabs([
-            "🏆 Top Titles", "✂️ Cancellation Review",
-            "🏢 Publisher Summary", "📈 Monthly Trends"
+            "Top titles", "Cancellation review",
+            "Publisher summary", "Monthly trends"
         ])
 
         with tab1:
@@ -1675,17 +1818,18 @@ def _render_counter_mode():
                 height=max(450, top_n * 22)
             )
             st.plotly_chart(fig_top, use_container_width=True)
-            st.download_button("📥 Top Titles (CSV)",
-                               _annotate_csv(top_titles, notes,
-                                             extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
-                                                         'View': 'Top Titles',
-                                                         'Metric': selected_metric,
-                                                         'Period': period_label}),
-                               f"top_titles_{_slug_period(period_label)}.csv".replace('_.', '.'),
+            _top_fname = f"top_titles_{_slug_period(period_label)}.csv".replace('_.', '.')
+            _top_bytes = _annotate_csv(top_titles, notes,
+                                       extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                   'View': 'Top Titles',
+                                                   'Metric': selected_metric,
+                                                   'Period': period_label})
+            st.download_button("📥 Top titles (CSV)", _top_bytes, _top_fname,
                                "text/csv", key="usage_dl_top")
+            _add_to_tray("usage_counter", _top_fname, _top_bytes)
 
         with tab2:
-            st.info("📌 Review titles with low usage for potential cancellation or renegotiation.")
+            st.info("Review titles with low usage for potential cancellation or renegotiation.")
             threshold = st.number_input(
                 "Low-Usage Threshold (total for reporting period)",
                 min_value=0, value=5, key="usage_threshold"
@@ -1705,16 +1849,17 @@ def _render_counter_mode():
                        f"{int(low_use_df[selected_metric].sum()):,}")
 
             st.dataframe(low_use_df, use_container_width=True, height=400)
-            st.download_button("📥 Cancellation Review List (CSV)",
-                               _annotate_csv(low_use_df, notes,
-                                             extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
-                                                         'View': 'Cancellation Review',
-                                                         'Metric': selected_metric,
-                                                         'Threshold': threshold,
-                                                         'Period': period_label}),
-                               f"cancellation_review_{_slug_period(period_label)}.csv".replace('_.', '.'),
-                               "text/csv",
+            _cancel_fname = f"cancellation_review_{_slug_period(period_label)}.csv".replace('_.', '.')
+            _cancel_bytes = _annotate_csv(low_use_df, notes,
+                                          extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                      'View': 'Cancellation Review',
+                                                      'Metric': selected_metric,
+                                                      'Threshold': threshold,
+                                                      'Period': period_label})
+            st.download_button("📥 Cancellation review list (CSV)",
+                               _cancel_bytes, _cancel_fname, "text/csv",
                                key="usage_dl_cancel")
+            _add_to_tray("usage_counter", _cancel_fname, _cancel_bytes)
 
         with tab3:
             if 'Publisher' in df_filtered.columns:
@@ -1733,15 +1878,16 @@ def _render_counter_mode():
                 pub_summary = pub_summary.sort_values('Total Usage', ascending=False)
 
                 st.dataframe(pub_summary, use_container_width=True, hide_index=True, height=500)
-                st.download_button("📥 Publisher Summary (CSV)",
-                                   _annotate_csv(pub_summary, notes,
-                                                 extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
-                                                             'View': 'Publisher Summary',
-                                                             'Metric': selected_metric,
-                                                             'Period': period_label}),
-                                   f"publisher_summary_{_slug_period(period_label)}.csv".replace('_.', '.'),
-                                   "text/csv",
+                _pub_fname = f"publisher_summary_{_slug_period(period_label)}.csv".replace('_.', '.')
+                _pub_bytes = _annotate_csv(pub_summary, notes,
+                                           extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                       'View': 'Publisher Summary',
+                                                       'Metric': selected_metric,
+                                                       'Period': period_label})
+                st.download_button("📥 Publisher summary (CSV)",
+                                   _pub_bytes, _pub_fname, "text/csv",
                                    key="usage_dl_pub")
+                _add_to_tray("usage_counter", _pub_fname, _pub_bytes)
             else:
                 st.info("No Publisher column in this file.")
 
@@ -1784,6 +1930,12 @@ def _render_counter_mode():
                         st.plotly_chart(fig_tt, use_container_width=True)
             else:
                 st.info("No month columns (e.g., `Jan-2025`) detected in this file.")
+
+        # Consolidated download tray
+        st.markdown("---")
+        st.subheader("Downloads")
+        _render_download_tray("usage_counter",
+                              zip_filename=f"usage_counter_{_slug_period(period_label)}.zip".replace('_.', '.'))
 
     except Exception as e:
         st.error(f"❌ Error processing file: {e}")
@@ -1935,7 +2087,7 @@ def _render_print_mode():
 
         # KPIs
         st.markdown("---")
-        st.subheader(f"📊 Overview — {weight_col} · {period_label}")
+        st.subheader(f"Overview — {weight_col} · {period_label}")
         total_loans = df['_usage'].sum()
         zero_use = (df['_usage'] == 0).sum()
         avg_loans = total_loans / max(1, len(df))
@@ -1953,13 +2105,16 @@ def _render_print_mode():
                         "Proposed off-site storage candidates flagged for DelRosario review."
         )
 
+        # Fresh tray for this render pass
+        _reset_tray("usage_print")
+
         # Analysis tabs
         st.markdown("---")
-        tabs = ["🏆 Top Titles", "✂️ Weeding Review"]
+        tabs = ["Top titles", "Weeding review"]
         if lc_col:
-            tabs.append("📚 LC Breakdown")
+            tabs.append("LC breakdown")
         if author_col:
-            tabs.append("✍️ Author Summary")
+            tabs.append("Author summary")
         tab_objs = st.tabs(tabs)
 
         with tab_objs[0]:
@@ -1985,7 +2140,7 @@ def _render_print_mode():
             st.plotly_chart(fig_top, use_container_width=True)
 
         with tab_objs[1]:
-            st.info("📌 Review titles with low or zero circulation for potential weeding, "
+            st.info("Review titles with low or zero circulation for potential weeding, "
                     "off-site storage, or replacement.")
             threshold = st.number_input(
                 f"Low-Usage Threshold ({weight_col})", min_value=0, value=0, key="usage_p_thr"
@@ -2005,16 +2160,17 @@ def _render_print_mode():
             cc2.metric("% of Collection", f"{len(low_use_df)/max(1,len(df))*100:.1f}%")
 
             st.dataframe(low_use_df, use_container_width=True, height=400)
-            st.download_button("📥 Weeding Review List (CSV)",
-                               _annotate_csv(low_use_df, notes,
-                                             extra_meta={'Tool': 'Usage Analyzer (Print)',
-                                                         'View': 'Weeding Review',
-                                                         'Metric': weight_col,
-                                                         'Threshold': threshold,
-                                                         'Period': period_label}),
-                               f"weeding_review_{_slug_period(period_label)}.csv".replace('_.', '.'),
-                               "text/csv",
+            _weed_fname = f"weeding_review_{_slug_period(period_label)}.csv".replace('_.', '.')
+            _weed_bytes = _annotate_csv(low_use_df, notes,
+                                        extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                    'View': 'Weeding Review',
+                                                    'Metric': weight_col,
+                                                    'Threshold': threshold,
+                                                    'Period': period_label})
+            st.download_button("📥 Weeding review list (CSV)",
+                               _weed_bytes, _weed_fname, "text/csv",
                                key="usage_p_dl_weed")
+            _add_to_tray("usage_print", _weed_fname, _weed_bytes)
 
         if lc_col:
             with tab_objs[2]:
@@ -2035,15 +2191,16 @@ def _render_print_mode():
                 lc_summary = lc_summary.sort_values(f'Total {weight_col}', ascending=False)
                 st.dataframe(lc_summary, use_container_width=True,
                              hide_index=True, height=500)
-                st.download_button("📥 LC Breakdown (CSV)",
-                                   _annotate_csv(lc_summary, notes,
-                                                 extra_meta={'Tool': 'Usage Analyzer (Print)',
-                                                             'View': 'LC Breakdown',
-                                                             'Metric': weight_col,
-                                                             'Period': period_label}),
-                                   f"lc_circulation_breakdown_{_slug_period(period_label)}.csv".replace('_.', '.'),
-                                   "text/csv",
+                _lc_fname = f"lc_circulation_breakdown_{_slug_period(period_label)}.csv".replace('_.', '.')
+                _lc_bytes = _annotate_csv(lc_summary, notes,
+                                          extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                      'View': 'LC Breakdown',
+                                                      'Metric': weight_col,
+                                                      'Period': period_label})
+                st.download_button("📥 LC breakdown (CSV)",
+                                   _lc_bytes, _lc_fname, "text/csv",
                                    key="usage_p_dl_lc")
+                _add_to_tray("usage_print", _lc_fname, _lc_bytes)
 
         if author_col:
             idx = 3 if lc_col else 2
@@ -2057,15 +2214,22 @@ def _render_print_mode():
                 st.markdown("**Top 100 authors by total circulation:**")
                 st.dataframe(auth_summary, use_container_width=True,
                              hide_index=True, height=500)
-                st.download_button("📥 Author Summary (CSV)",
-                                   _annotate_csv(auth_summary, notes,
-                                                 extra_meta={'Tool': 'Usage Analyzer (Print)',
-                                                             'View': 'Author Summary',
-                                                             'Metric': weight_col,
-                                                             'Period': period_label}),
-                                   f"author_circulation_{_slug_period(period_label)}.csv".replace('_.', '.'),
-                                   "text/csv",
+                _auth_fname = f"author_circulation_{_slug_period(period_label)}.csv".replace('_.', '.')
+                _auth_bytes = _annotate_csv(auth_summary, notes,
+                                            extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                        'View': 'Author Summary',
+                                                        'Metric': weight_col,
+                                                        'Period': period_label})
+                st.download_button("📥 Author summary (CSV)",
+                                   _auth_bytes, _auth_fname, "text/csv",
                                    key="usage_p_dl_auth")
+                _add_to_tray("usage_print", _auth_fname, _auth_bytes)
+
+        # Consolidated download tray
+        st.markdown("---")
+        st.subheader("Downloads")
+        _render_download_tray("usage_print",
+                              zip_filename=f"usage_print_{_slug_period(period_label)}.zip".replace('_.', '.'))
 
     except Exception as e:
         st.error(f"❌ Error processing file: {e}")
@@ -2078,18 +2242,18 @@ def page_usage_analyzer():
         "**What's being used and what isn't?** Title-level usage analysis for "
         "renewal, cancellation, and weeding decisions."
     )
-    _decision_box(
-        "When to use this tool",
-        "- **Collections:** Annual database renewals, print weeding by low circulation, "
-        "identifying single-title-driven subscriptions (candidates for swap to pay-per-view "
-        "or title-level purchase), publisher package evaluation.\n"
-        "- **Instruction:** Rarely — this is primarily a purchasing/weeding tool, not "
-        "an instructional one.\n"
-        "- **Outreach:** Evidence for faculty conversations (\"this database gets 12 uses "
-        "a year across your whole department — can we talk alternatives?\"), value reports "
-        "to administration, package-vs-title comparisons for liaison meetings."
-    )
-    st.markdown("---")
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- **Collections:** Annual database renewals, print weeding by low circulation, "
+            "identifying single-title-driven subscriptions (candidates for swap to pay-per-view "
+            "or title-level purchase), publisher package evaluation.\n"
+            "- **Instruction:** Rarely — this is primarily a purchasing/weeding tool, not "
+            "an instructional one.\n"
+            "- **Outreach:** Evidence for faculty conversations (\"this database gets 12 uses "
+            "a year across your whole department — can we talk alternatives?\"), value reports "
+            "to administration, package-vs-title comparisons for liaison meetings."
+        )
+
 
     mode = st.radio(
         "Select data source:",
@@ -2599,23 +2763,23 @@ def page_recommendation_scorer():
         "**What should we buy next?** Score candidate books against your checkout "
         "history to prioritize purchases."
     )
-    _decision_box(
-        "When to use this tool",
-        "- **Collections:** Evaluating vendor slip lists and GOBI picks, approval-plan "
-        "exceptions, triaging faculty requests, flipping DDA candidates to purchase, "
-        "reviewing author/publisher lists for standing orders.\n"
-        "- **Instruction:** Occasionally — clusters of high-scoring recommendations in "
-        "one area can reveal curricular momentum worth a targeted info-lit session.\n"
-        "- **Outreach:** Showing faculty *why* a recommendation scored high (with "
-        "the faculty-interest score naming their research match) makes this a strong "
-        "conversation-starter at liaison meetings."
-    )
-    st.info("💡 For a broader view of your collection's LC distribution and subject "
-            "coverage, use the **Collection Profiler** (first tool in the sidebar).")
-    st.markdown("---")
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- **Collections:** Evaluating vendor slip lists and GOBI picks, approval-plan "
+            "exceptions, triaging faculty requests, flipping DDA candidates to purchase, "
+            "reviewing author/publisher lists for standing orders.\n"
+            "- **Instruction:** Occasionally — clusters of high-scoring recommendations in "
+            "one area can reveal curricular momentum worth a targeted info-lit session.\n"
+            "- **Outreach:** Showing faculty *why* a recommendation scored high (with "
+            "the faculty-interest score naming their research match) makes this a strong "
+            "conversation-starter at liaison meetings.\n\n"
+            "💡 For a broader view of your collection's LC distribution and subject "
+            "coverage, use the **Collection Profiler** (first tool in the sidebar)."
+        )
+
 
     # File uploads
-    st.subheader("📁 Step 1: Upload Your Data")
+    st.subheader("Step 1: Upload your data")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Checkouts File** — Required: `title`, `checkouts`; "
@@ -2707,35 +2871,106 @@ def page_recommendation_scorer():
 
             # --- (Collection Insights panel removed — see Collection Profiler instead) ---
 
-            # Scoring configuration
-            st.subheader("⚙️ Step 2: Configure Scoring Weights")
-            _fac_default = 0.15 if faculty_df is not None else 0.0
-            wc1, wc2, wc3, wc4 = st.columns(4)
-            with wc1:
-                subject_weight = st.slider("Subject Similarity", 0.0, 1.0,
-                                            0.45 if faculty_df else 0.5, 0.05, key="rec_sw")
-            with wc2:
-                lc_weight = st.slider("LC Classification", 0.0, 1.0,
-                                       0.25 if faculty_df else 0.3, 0.05, key="rec_lw")
-            with wc3:
-                author_weight = st.slider("Author Popularity", 0.0, 1.0,
-                                           0.15 if faculty_df else 0.2, 0.05, key="rec_aw")
-            with wc4:
-                faculty_weight = st.slider("Faculty Interest", 0.0, 1.0, _fac_default, 0.05,
-                                            disabled=(faculty_df is None), key="rec_fw")
+            # Scoring configuration — preset-first, with manual override in advanced
+            st.subheader("Step 2: Choose scoring approach")
 
-            total_weight = subject_weight + lc_weight + author_weight + faculty_weight
-            if abs(total_weight - 1.0) > 0.01:
-                st.warning(f"⚠️ Weights sum to {total_weight:.2f}. Adjust so they total 1.0.")
+            PRESETS = {
+                "Balanced": {"subject": 0.50, "lc": 0.30, "author": 0.20, "faculty": 0.00},
+                "Subject-focused": {"subject": 0.70, "lc": 0.20, "author": 0.10, "faculty": 0.00},
+                "Faculty-driven": {"subject": 0.35, "lc": 0.20, "author": 0.10, "faculty": 0.35},
+            }
+            # If faculty file is loaded, default to the preset that uses it
+            default_preset = "Faculty-driven" if faculty_df is not None else "Balanced"
+
+            # Initialize preset selection in session state
+            if "rec_preset_choice" not in st.session_state:
+                st.session_state["rec_preset_choice"] = default_preset
+
+            preset_options = list(PRESETS.keys()) + ["Advanced (custom weights)"]
+            # Disable Faculty-driven if no faculty file
+            preset_help = ("Pick how to weight the four scoring factors. "
+                           "Faculty-driven needs a faculty CSV (upload one above).")
+            preset_choice = st.radio(
+                "Scoring approach:",
+                preset_options,
+                index=preset_options.index(st.session_state["rec_preset_choice"])
+                      if st.session_state["rec_preset_choice"] in preset_options else 0,
+                horizontal=True,
+                key="rec_preset_choice",
+                help=preset_help,
+            )
+
+            if preset_choice in PRESETS:
+                w = PRESETS[preset_choice]
+                # If a preset wants faculty weight but no faculty file is loaded, warn and fall back
+                if w["faculty"] > 0 and faculty_df is None:
+                    st.warning(
+                        "**Faculty-driven** needs a faculty CSV. Upload one above or "
+                        "pick a different approach. Falling back to **Balanced** for now."
+                    )
+                    w = PRESETS["Balanced"]
+                subject_weight = w["subject"]
+                lc_weight = w["lc"]
+                author_weight = w["author"]
+                faculty_weight = w["faculty"]
+                # Show what the preset does in a compact caption
+                parts = []
+                parts.append(f"Subject {int(subject_weight*100)}%")
+                parts.append(f"LC {int(lc_weight*100)}%")
+                parts.append(f"Author {int(author_weight*100)}%")
+                if faculty_weight > 0:
+                    parts.append(f"Faculty {int(faculty_weight*100)}%")
+                st.caption(" · ".join(parts))
             else:
-                st.success(f"✅ Weights sum to {total_weight:.2f}")
+                # Advanced mode — keep the four sliders, with auto-normalize help
+                with st.container(border=True):
+                    st.caption(
+                        "Set any values you want; they'll be normalized to sum to 1.0 "
+                        "before scoring."
+                    )
+                    _fac_default = 0.15 if faculty_df is not None else 0.0
+                    wc1, wc2, wc3, wc4 = st.columns(4)
+                    with wc1:
+                        subject_weight = st.slider(
+                            "Subject Similarity", 0.0, 1.0,
+                            0.45 if faculty_df else 0.5, 0.05, key="rec_sw"
+                        )
+                    with wc2:
+                        lc_weight = st.slider(
+                            "LC Classification", 0.0, 1.0,
+                            0.25 if faculty_df else 0.3, 0.05, key="rec_lw"
+                        )
+                    with wc3:
+                        author_weight = st.slider(
+                            "Author Popularity", 0.0, 1.0,
+                            0.15 if faculty_df else 0.2, 0.05, key="rec_aw"
+                        )
+                    with wc4:
+                        faculty_weight = st.slider(
+                            "Faculty Interest", 0.0, 1.0, _fac_default, 0.05,
+                            disabled=(faculty_df is None), key="rec_fw"
+                        )
+                    raw_total = subject_weight + lc_weight + author_weight + faculty_weight
+                    if raw_total <= 0:
+                        st.error("All weights are zero — set at least one above 0.")
+                    else:
+                        # Auto-normalize silently
+                        subject_weight = subject_weight / raw_total
+                        lc_weight = lc_weight / raw_total
+                        author_weight = author_weight / raw_total
+                        faculty_weight = faculty_weight / raw_total
+                        st.caption(
+                            f"Normalized: Subject {subject_weight:.0%} · "
+                            f"LC {lc_weight:.0%} · Author {author_weight:.0%} · "
+                            f"Faculty {faculty_weight:.0%}"
+                        )
 
             for key in ("rec_results", "rec_checkouts_scored", "rec_recs_scored",
                         "rec_faculty_scored", "rec_weights"):
                 if key not in st.session_state:
                     st.session_state[key] = None
 
-            if st.button("🚀 Score Recommendations", type="primary", key="rec_score_btn"):
+            if st.button("Score recommendations", type="primary", key="rec_score_btn"):
                 with st.spinner("Analyzing..."):
                     _stemmer = SnowballStemmer("english")
                     syn_map = build_synonym_map(_stemmer, synonym_overrides_df)
@@ -2762,7 +2997,10 @@ def page_recommendation_scorer():
             # Results display
             if st.session_state["rec_results"] is not None:
                 results_df = st.session_state["rec_results"]
-                st.subheader("📊 Step 3: Review Results")
+                st.subheader("Step 3: Review results")
+
+                # Fresh tray for this render pass
+                _reset_tray("rec_scorer")
 
                 # Notes — annotate before downloading
                 notes = _notes_widget(
@@ -2772,8 +3010,8 @@ def page_recommendation_scorer():
                 )
 
                 tab_r1, tab_r2, tab_r3, tab_r4 = st.tabs([
-                    "📊 Scored Recommendations", "📈 Score Distribution",
-                    "🏷️ Subject Analysis", "🎓 Faculty Analysis"
+                    "Scored recommendations", "Score distribution",
+                    "Subject analysis", "Faculty analysis"
                 ])
 
                 with tab_r1:
@@ -2849,7 +3087,7 @@ def page_recommendation_scorer():
 
                     gap_subj = {k: v for k, v in co_subj.items() if k not in rec_subj and v >= 2}
                     if gap_subj:
-                        st.subheader("🔍 Recommendation Gaps")
+                        st.subheader("Recommendation gaps")
                         st.markdown("High-circulation subjects missing from your recommendations list:")
                         gdf = pd.DataFrame([
                             {"Subject": s, "Checkout Occurrences": c}
@@ -2878,7 +3116,7 @@ def page_recommendation_scorer():
                             )
 
                 # Downloads
-                st.subheader("💾 Step 4: Download Results")
+                st.subheader("Downloads")
                 dc1, dc2, dc3 = st.columns(3)
                 _weights = st.session_state.get("rec_weights", {})
                 _weights_str = (f"subject={_weights.get('subject', 0)}, "
@@ -2886,22 +3124,26 @@ def page_recommendation_scorer():
                                 f"author={_weights.get('author', 0)}, "
                                 f"faculty={_weights.get('faculty', 0)}")
                 with dc1:
-                    st.download_button("📥 Full Results (CSV)",
-                                       _annotate_csv(results_df, notes,
-                                                     extra_meta={'Tool': 'Recommendation Scorer',
-                                                                 'View': 'Full Results',
-                                                                 'Weights': _weights_str}),
+                    _full_bytes = _annotate_csv(results_df, notes,
+                                                extra_meta={'Tool': 'Recommendation Scorer',
+                                                            'View': 'Full Results',
+                                                            'Weights': _weights_str})
+                    st.download_button("📥 Full results (CSV)",
+                                       _full_bytes,
                                        "recommendations_scored.csv", "text/csv",
                                        key="rec_dl_full")
+                    _add_to_tray("rec_scorer", "recommendations_scored.csv", _full_bytes)
                 with dc2:
                     high_df = results_df[results_df["likelihood_score"] >= 70]
-                    st.download_button("🟢 High Priority Only",
-                                       _annotate_csv(high_df, notes,
-                                                     extra_meta={'Tool': 'Recommendation Scorer',
-                                                                 'View': 'High Priority (≥70)',
-                                                                 'Weights': _weights_str}),
+                    _high_bytes = _annotate_csv(high_df, notes,
+                                                extra_meta={'Tool': 'Recommendation Scorer',
+                                                            'View': 'High Priority (≥70)',
+                                                            'Weights': _weights_str})
+                    st.download_button("📥 High priority only (CSV)",
+                                       _high_bytes,
                                        "recommendations_high_priority.csv", "text/csv",
                                        key="rec_dl_high")
+                    _add_to_tray("rec_scorer", "recommendations_high_priority.csv", _high_bytes)
                 with dc3:
                     # TXT report: prepend notes as a header block (not CSV, so different format)
                     report_body = generate_report(results_df)
@@ -2916,17 +3158,22 @@ def page_recommendation_scorer():
                     st.download_button("📄 Report (TXT)", report_body,
                                        "recommendation_report.txt", "text/plain",
                                        key="rec_dl_txt")
+                    _add_to_tray("rec_scorer", "recommendation_report.txt", report_body)
+
+                # ZIP-all option
+                _render_download_tray("rec_scorer",
+                                      zip_filename="recommendation_scorer_results.zip")
 
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
             st.info("Check that your CSV files have the required columns.")
     else:
-        st.info("👆 Upload both a checkouts file and a recommendations file to begin.")
+        st.info("Upload both a checkouts file and a recommendations file to begin.")
 
     # Sidebar instructions
     with st.sidebar:
         st.markdown("---")
-        st.subheader("📖 Scorer Instructions")
+        st.subheader("Scorer instructions")
         st.markdown("""
         1. Upload **checkouts CSV** *(required)*
         2. Upload **recommendations CSV** *(required)*
@@ -3010,7 +3257,7 @@ def page_home():
         """, unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("🧭 Quick decision guide")
+    st.subheader("Quick decision guide")
     st.markdown("""
     | You need to… | Use |
     |---|---|
