@@ -348,6 +348,77 @@ def _extract_lc_vectorized(series):
     return main_class, letters
 
 
+# Title-keyword analysis ------------------------------------------------------
+# A separate lens from subject headings: titles are uncontrolled vocabulary, so
+# we strip a generous stopword list (English + publishing/library noise) before
+# counting. This view is supplementary — it surfaces vocabulary that subject
+# headings missed (newer concepts, methodological terms, interdisciplinary
+# phrases) without diluting the controlled-vocabulary subject analysis.
+TITLE_STOPWORDS = frozenset({
+    # Articles, conjunctions, prepositions, pronouns, common verbs
+    'a', 'an', 'the', 'and', 'or', 'but', 'nor', 'so', 'yet', 'for',
+    'of', 'in', 'on', 'at', 'to', 'from', 'by', 'with', 'without', 'about',
+    'as', 'into', 'onto', 'upon', 'over', 'under', 'through', 'across',
+    'after', 'before', 'between', 'among', 'against', 'during', 'until',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+    'has', 'have', 'had', 'having', 'do', 'does', 'did', 'doing',
+    'this', 'that', 'these', 'those', 'it', 'its', "it's",
+    'i', 'you', 'he', 'she', 'we', 'they', 'them', 'us', 'our', 'their',
+    'his', 'her', 'my', 'your',
+    'not', 'no', 'yes', 'if', 'then', 'than', 'when', 'where', 'why', 'how',
+    'what', 'which', 'who', 'whom', 'whose',
+    'all', 'any', 'some', 'each', 'every', 'other', 'another', 'such',
+    'will', 'would', 'can', 'could', 'should', 'may', 'might', 'must',
+    'shall', 'one', 'two', 'three', 'first', 'second', 'third',
+    # Generic publishing / book-title noise
+    'introduction', 'introductory', 'guide', 'handbook', 'companion',
+    'reader', 'manual', 'primer', 'textbook', 'workbook', 'casebook',
+    'overview', 'survey', 'review', 'reviews', 'essays', 'essay',
+    'studies', 'study', 'research', 'researches', 'analysis', 'analyses',
+    'approach', 'approaches', 'perspective', 'perspectives',
+    'edition', 'ed', 'eds', 'editor', 'editors', 'edited', 'rev', 'revised',
+    'volume', 'vol', 'vols', 'series', 'collection', 'selected', 'works',
+    'new', 'newer', 'newest', 'modern', 'contemporary', 'recent',
+    'practical', 'theoretical', 'theory', 'theories',
+    'principles', 'principle', 'fundamentals', 'fundamental', 'basics', 'basic',
+    'concepts', 'concept', 'topics', 'topic', 'issues', 'issue',
+    'history', 'introduction', 'making', 'understanding',
+    # Single letters (strays from initials, "u s" from "U.S.", roman numerals)
+    'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    'ii', 'iii', 'iv', 'vi', 'vii', 'viii', 'ix', 'xi', 'xii',
+    # Subtitle / format words common in book titles
+    'using', 'use', 'used', 'within', 'across', 'toward', 'towards',
+})
+
+_RE_TITLE_TOKEN = re.compile(r"[A-Za-z][A-Za-z'\-]+")
+
+
+def _tokenize_title(title, min_len=4, extra_stopwords=None):
+    """Lowercase a title, strip punctuation, drop stopwords + short tokens.
+
+    Returns a list of tokens (with duplicates preserved — the caller decides
+    whether to count by occurrence or unique-per-title).
+    """
+    if not isinstance(title, str) or not title.strip():
+        return []
+    stops = TITLE_STOPWORDS if not extra_stopwords else (TITLE_STOPWORDS | extra_stopwords)
+    raw = _RE_TITLE_TOKEN.findall(title.lower())
+    tokens = []
+    for tok in raw:
+        # Strip leading/trailing apostrophes and hyphens
+        tok = tok.strip("'-")
+        if len(tok) < min_len:
+            continue
+        if tok in stops:
+            continue
+        # Drop pure-numeric (shouldn't match the regex but be safe)
+        if tok.isdigit():
+            continue
+        tokens.append(tok)
+    return tokens
+
+
 # =====================================================================
 # SHARED: Column detection & CSV loading
 # =====================================================================
@@ -359,8 +430,15 @@ LC_ALIASES = ['LC Classification Code', 'LC Classification', 'LC Class',
               'LC Call Number', 'LCC', 'Classification', 'lc_classification']
 TITLE_ALIASES = ['Title', 'title', 'TITLE', 'Book Title', 'Item Title']
 WEIGHT_ALIASES = ['Loans', 'Loans (Total)', 'Checkouts', 'Circulation',
-                  'Total_Item_Requests', 'Usage', 'Count',
-                  'Digital File Downloads', 'Digital File Views', 'checkouts']
+                  'Total_Item_Requests', 'Unique_Item_Requests',
+                  'Total_Item_Investigations', 'Usage', 'Uses', 'Count',
+                  'Digital File Downloads', 'Digital File Views', 'checkouts',
+                  # ProQuest / Ebook Central title reports
+                  'Total Book Downloads', 'Book Downloads', 'Downloads',
+                  'Read Online (post Trigger) Sessions',
+                  'Read Online Sessions', 'Sessions',
+                  # Other vendor variants
+                  'Views', 'Requests', 'Hits', 'Total Uses']
 
 
 def find_column(df_or_cols, aliases, partial=True):
@@ -739,9 +817,80 @@ def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
             progress_bar.progress(pct, f"Processed {end:,} of {n_records:,} records...")
         results['subject_counts'] = subject_counter
         results['subject_by_lc'] = dict(subject_by_lc)
+
+        # When a usage column is present, build BOTH title-count and usage-weighted
+        # subject distributions so we can render Coverage-vs-Use by subject (this
+        # is the analog of the LC version, and it's what makes use metrics visible
+        # for vendor reports that have Subject but no LC/call number column —
+        # e.g., ProQuest Ebook Central title reports).
+        if has_usage_col:
+            subj_titles = Counter()      # one count per title-subject occurrence
+            subj_usage = Counter()       # weighted by '_weight' (the usage column)
+            usage_series = df.loc[idx, '_weight']
+            ones_series = pd.Series(1.0, index=idx)
+            for ci in range(n_chunks):
+                start = ci * CHUNK_SIZE
+                end = min(start + CHUNK_SIZE, n_records)
+                if start >= n_records:
+                    break
+                cidx = idx[start:end]
+                _profiler_process_subjects_chunk(
+                    subj_full.loc[cidx], ones_series.loc[cidx], lc_full.loc[cidx],
+                    subj_titles, defaultdict(Counter)
+                )
+                _profiler_process_subjects_chunk(
+                    subj_full.loc[cidx], usage_series.loc[cidx], lc_full.loc[cidx],
+                    subj_usage, defaultdict(Counter)
+                )
+            results['subj_titles'] = subj_titles
+            results['subj_usage'] = subj_usage
+            results['subj_total_titles'] = sum(subj_titles.values())
+            results['subj_total_usage'] = sum(subj_usage.values())
+            results['cvu_by_subject_available'] = True
+        else:
+            results['cvu_by_subject_available'] = False
     else:
         results['subject_counts'] = Counter()
         results['subject_by_lc'] = {}
+        results['cvu_by_subject_available'] = False
+
+    progress_bar.progress(80, "Tokenizing titles...")
+
+    # Title-keyword analysis — supplementary lens, NOT merged into subject_counts.
+    # Uses uncontrolled vocabulary (title text), so it can surface terminology
+    # the controlled subject headings missed. Always built when title column is
+    # present; cheap to compute even on large datasets.
+    if title_col:
+        title_keyword_counter = Counter()        # weighted by 1 per title-occurrence of token
+        title_keyword_usage = Counter()          # weighted by usage
+        title_unique_titles = Counter()          # how many distinct titles each token appears in
+        title_series = df.loc[idx, title_col]
+        if has_usage_col:
+            usage_series = df.loc[idx, '_weight']
+        else:
+            usage_series = pd.Series(1.0, index=idx)
+        for ti, raw_title in title_series.items():
+            tokens = _tokenize_title(raw_title)
+            if not tokens:
+                continue
+            u = usage_series.at[ti] if ti in usage_series.index else 0
+            seen_in_title = set()
+            for tok in tokens:
+                title_keyword_counter[tok] += 1
+                if has_usage_col:
+                    title_keyword_usage[tok] += u
+                if tok not in seen_in_title:
+                    title_unique_titles[tok] += 1
+                    seen_in_title.add(tok)
+        results['title_keyword_counts'] = title_keyword_counter
+        results['title_keyword_usage'] = title_keyword_usage
+        results['title_keyword_unique_titles'] = title_unique_titles
+        results['title_keyword_available'] = len(title_keyword_counter) > 0
+    else:
+        results['title_keyword_counts'] = Counter()
+        results['title_keyword_usage'] = Counter()
+        results['title_keyword_unique_titles'] = Counter()
+        results['title_keyword_available'] = False
 
     progress_bar.progress(85, "Running gap analysis...")
 
@@ -801,6 +950,93 @@ def _build_cvu_table(titles_dict, usage_dict, total_titles, total_usage,
             'Assessment': signal,
         })
     return pd.DataFrame(rows)
+
+
+def _render_coverage_vs_use_by_subject(results, settings, notes=""):
+    """Coverage vs. Use broken down by Subject term.
+
+    Used when the file has a usage column but no LC/call number (e.g., ProQuest
+    Ebook Central title reports). Mirrors the LC version's logic and thresholds.
+    """
+    st.markdown("---")
+    st.subheader("Coverage vs. use — by subject")
+    st.markdown(
+        "Compares **% of titles** carrying each subject against **% of use** those titles drive. "
+        "Useful when your file has subject headings but no LC/call number column."
+    )
+    st.markdown(
+        f"- 🟢 **Overperforming** — ratio ≥ **{settings['cvu_over']}** (subject area pulling heavy use; consider expanding)\n"
+        f"- 🔴 **Underperforming** — ratio ≤ **{settings['cvu_under']}** (well-represented but lightly used; review or weed)\n"
+        f"- ✅ **Proportional** — use roughly matches representation\n"
+        f"- — **Insufficient data** — fewer than **{settings['cvu_min_titles']}** title-tags in that subject"
+    )
+    st.caption(
+        "Note: a single title with multiple subjects contributes to each. "
+        "Totals here count *title-subject pairs*, not unique titles."
+    )
+
+    usage_label = settings.get('usage_col_label', 'Usage')
+    titles_dict = results['subj_titles']
+    usage_dict = results['subj_usage']
+    total_titles = results['subj_total_titles']
+    total_usage = results['subj_total_usage']
+    top_n = settings.get('top_n_subjects', 30)
+
+    # KPI summary
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Subject-Title Tags", f"{int(total_titles):,}")
+    k2.metric(f"Total {usage_label}", f"{int(total_usage):,}")
+    k3.metric(f"Overall {usage_label} / Tag",
+              f"{total_usage / max(1, total_titles):.2f}")
+
+    if total_usage == 0:
+        st.warning(
+            f"⚠️ The selected usage column has **zero total {usage_label.lower()}** across "
+            "all titles in this file. Coverage-vs-Use analysis needs at least some non-zero "
+            "values. Double-check that you mapped the right column above."
+        )
+        return
+
+    subj_df = _build_cvu_table(
+        titles_dict, usage_dict,
+        total_titles, total_usage,
+        settings['cvu_over'], settings['cvu_under'], settings['cvu_min_titles'],
+        {}, 'Subject'
+    )
+    if subj_df.empty:
+        st.info("No subject data to display.")
+        return
+
+    # Drop the 'Description' column — not meaningful for subject terms
+    if 'Description' in subj_df.columns:
+        subj_df = subj_df.drop(columns='Description')
+
+    # Sort by Total Use descending so the heaviest-used subjects lead, then trim
+    subj_df = subj_df.sort_values('Total Use', ascending=False).head(top_n)
+
+    st.dataframe(
+        subj_df, use_container_width=True, hide_index=True, height=min(450, 50 + 35 * len(subj_df)),
+        column_config={
+            '% of Collection': st.column_config.NumberColumn(format="%.2f%%"),
+            '% of Use': st.column_config.NumberColumn(format="%.2f%%"),
+            'Use/Holdings Signal': st.column_config.NumberColumn(
+                format="%.2f",
+                help="(% of use) ÷ (% of representation). 1.0 = proportional."
+            ),
+        }
+    )
+
+    _bytes = _annotate_csv(subj_df, notes,
+                           extra_meta={'Tool': 'Collection Profiler',
+                                       'View': 'Coverage vs. Use by Subject',
+                                       'Usage column': usage_label,
+                                       'Over threshold': settings['cvu_over'],
+                                       'Under threshold': settings['cvu_under']})
+    st.download_button(f"📥 Coverage-vs-Use by Subject (top {top_n}) CSV",
+                       _bytes,
+                       "coverage_vs_use_by_subject.csv",
+                       "text/csv", key='prof_dl_cvu_subj')
+    _add_to_tray("profiler", "coverage_vs_use_by_subject.csv", _bytes)
 
 
 def _render_coverage_vs_use(results, settings, notes=""):
@@ -986,6 +1222,132 @@ def _render_coverage_vs_use(results, settings, notes=""):
         st.markdown("\n".join(bullets))
 
 
+def _render_title_keywords(results, settings, notes=""):
+    """Render the title-keyword view: bar chart + optional word cloud + table.
+
+    This is a SEPARATE lens from the subject view. It tokenizes title text
+    (uncontrolled vocabulary) with stopwords stripped, so it surfaces
+    terminology that subject headings might have missed — newer concepts,
+    methodological terms, interdisciplinary phrases. Distinct from subject
+    analysis on purpose: titles are not curated metadata.
+    """
+    if not results.get('title_keyword_available'):
+        return
+
+    counter = results['title_keyword_counts']
+    usage_counter = results.get('title_keyword_usage', Counter())
+    unique_titles = results.get('title_keyword_unique_titles', Counter())
+
+    # Apply user-tunable extra stopwords from settings (top_n filter applied later)
+    extra_stops = settings.get('tk_extra_stopwords') or set()
+    if extra_stops:
+        counter = Counter({k: v for k, v in counter.items() if k not in extra_stops})
+        usage_counter = Counter({k: v for k, v in usage_counter.items() if k not in extra_stops})
+        unique_titles = Counter({k: v for k, v in unique_titles.items() if k not in extra_stops})
+
+    if not counter:
+        return
+
+    top_n = settings.get('tk_top_n', 30)
+    has_usage = bool(settings.get('has_usage_col'))
+    usage_label = settings.get('usage_col_label', 'Usage')
+
+    st.markdown("---")
+    st.subheader(f"Title keywords (top {top_n})")
+    st.caption(
+        "A supplementary lens on the collection. Unlike the subject view above "
+        "(which uses curated subject headings), this counts words appearing in "
+        "**title text** with English stopwords and common publishing-noise words "
+        "removed. Use it to spot vocabulary that controlled subject vocabularies "
+        "may have missed — newer concepts, methodological terms, interdisciplinary "
+        "phrases. Titles are uncontrolled vocabulary, so treat findings as "
+        "exploratory."
+    )
+
+    # Bar chart of top keywords
+    top_items = counter.most_common(top_n)
+    rows = []
+    for kw, occurrences in top_items:
+        rows.append({
+            'Keyword': kw,
+            'Title Occurrences': int(occurrences),
+            'Distinct Titles': int(unique_titles.get(kw, 0)),
+            f'Total {usage_label}': int(usage_counter.get(kw, 0)) if has_usage else None,
+        })
+    kw_df = pd.DataFrame(rows)
+    if not has_usage:
+        kw_df = kw_df.drop(columns=[f'Total {usage_label}'])
+
+    fig = px.bar(
+        kw_df, x='Title Occurrences', y='Keyword',
+        orientation='h', color='Title Occurrences',
+        color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+        hover_data=[c for c in ['Distinct Titles', f'Total {usage_label}']
+                    if c in kw_df.columns],
+    )
+    fig.update_layout(
+        yaxis={'categoryorder': 'total ascending'},
+        height=max(450, top_n * 24),
+        showlegend=False,
+        margin=dict(t=30, l=0, r=0, b=30),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Sortable table — gives the user another angle (sort by use, by distinct titles)
+    with st.expander("📋 Full keyword table (sortable)"):
+        display_df = kw_df.copy()
+        st.dataframe(
+            display_df, use_container_width=True, hide_index=True,
+            height=min(450, 50 + 35 * len(display_df)),
+        )
+
+    _kw_bytes = _annotate_csv(
+        kw_df, notes,
+        extra_meta={'Tool': 'Collection Profiler',
+                    'View': 'Title Keywords',
+                    'Top N': top_n,
+                    'Stopwords': 'Built-in English + library/publishing noise'
+                                 + (f' + {len(extra_stops)} custom' if extra_stops else '')}
+    )
+    st.download_button(
+        "📥 Title keywords (CSV)", _kw_bytes,
+        "title_keywords.csv", "text/csv", key='prof_dl_tk',
+    )
+    _add_to_tray("profiler", "title_keywords.csv", _kw_bytes)
+
+    # Word cloud — only if requested AND wordcloud lib available
+    if settings.get('tk_show_wordcloud') and WORDCLOUD_AVAILABLE:
+        st.markdown("##### Title keyword cloud")
+        max_words = settings.get('tk_wc_max_words', 100)
+        color_scheme = settings.get('tk_wc_color', 'plasma')
+        # Use occurrence counts (not usage) for the cloud — visualizing prevalence
+        cloud_data = dict(counter.most_common(max_words))
+        if cloud_data:
+            wc = WordCloud(
+                width=1200, height=500, background_color='white',
+                colormap=color_scheme, max_words=max_words,
+                relative_scaling=0.5, min_font_size=10, prefer_horizontal=0.7,
+            ).generate_from_frequencies(cloud_data)
+            fig_wc, ax_wc = plt.subplots(figsize=(14, 6))
+            ax_wc.imshow(wc, interpolation='bilinear')
+            ax_wc.axis('off')
+            st.pyplot(fig_wc, use_container_width=True)
+            buf = BytesIO()
+            fig_wc.savefig(buf, format='png', dpi=200, bbox_inches='tight',
+                           facecolor='white', edgecolor='none')
+            buf.seek(0)
+            _tk_wc_bytes = buf.getvalue()
+            st.download_button(
+                "📥 Title keyword cloud (PNG)", _tk_wc_bytes,
+                "title_keywords_wordcloud.png", "image/png",
+                key='prof_dl_tk_wc',
+            )
+            _add_to_tray("profiler", "title_keywords_wordcloud.png", _tk_wc_bytes)
+            plt.close(fig_wc)
+    elif settings.get('tk_show_wordcloud') and not WORDCLOUD_AVAILABLE:
+        st.info("Install `wordcloud` and `matplotlib` to enable the keyword cloud.")
+
+
 def _profiler_display_results(results, settings, df, idx):
     """Render all enabled visualizations in a sensible narrative order."""
     wl = settings['weight_label']
@@ -996,11 +1358,29 @@ def _profiler_display_results(results, settings, df, idx):
 
     st.markdown("---")
     st.subheader("Collection overview")
+    # Top KPIs — when a usage column is mapped, always show total use up here,
+    # regardless of weighting mode, so the metric is visible even when the
+    # primary analysis weights titles by 1.
+    usage_col_label = settings.get('usage_col_label', 'Usage')
+    has_usage = bool(settings.get('has_usage_col'))
+    total_use = 0
+    if has_usage:
+        if results.get('cvu_available'):
+            total_use = results.get('cvu_total_usage', 0)
+        elif results.get('cvu_by_subject_available'):
+            total_use = results.get('subj_total_usage', 0)
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Records Analyzed", f"{results['n_records']:,}")
     c2.metric(f"Total {wl}", f"{results['total_weight']:,.0f}")
-    c3.metric("LC Classes Present", f"{len(results['lc_main_counts'])}")
-    c4.metric("Unique Subjects", f"{len(results['subject_counts']):,}")
+    if has_usage and wl != usage_col_label:
+        # Replace "LC Classes Present" with total use when more informative
+        # (i.e., when weighting mode is Title Count, so total_weight == n_records)
+        c3.metric(f"Total {usage_col_label}", f"{int(total_use):,}")
+        c4.metric("Unique Subjects", f"{len(results['subject_counts']):,}")
+    else:
+        c3.metric("LC Classes Present", f"{len(results['lc_main_counts'])}")
+        c4.metric("Unique Subjects", f"{len(results['subject_counts']):,}")
 
     # Notes — shown above results so users annotate *before* downloading
     notes = _notes_widget(
@@ -1108,9 +1488,19 @@ def _profiler_display_results(results, settings, df, idx):
         fig.update_layout(height=max(400, len(lc_present) * 35), xaxis=dict(tickangle=45))
         st.plotly_chart(fig, use_container_width=True)
 
+    # ==== Title keywords (supplementary lens — uncontrolled vocabulary) ====
+    if settings.get('show_title_keywords'):
+        _render_title_keywords(results, settings, notes=notes)
+
     # ==== Coverage vs. Use ====
-    if (settings.get('show_coverage_vs_use') and results.get('cvu_available')):
-        _render_coverage_vs_use(results, settings, notes=notes)
+    if settings.get('show_coverage_vs_use'):
+        if results.get('cvu_available'):
+            # Preferred: LC-based view (full granularity)
+            _render_coverage_vs_use(results, settings, notes=notes)
+        elif results.get('cvu_by_subject_available'):
+            # Fallback: subject-level view for files without LC/call number
+            # (e.g., ProQuest Ebook Central title reports)
+            _render_coverage_vs_use_by_subject(results, settings, notes=notes)
 
     if settings['show_gap_analysis']:
         st.markdown("---")
@@ -1337,14 +1727,25 @@ def page_collection_profiler():
             show_wordcloud = st.checkbox("Subject word cloud", True, key="prof_wc")
         with vc2:
             show_heatmap = st.checkbox("LC × subject heatmap", True, key="prof_heat")
+            show_title_keywords = st.checkbox(
+                "Title keywords (uncontrolled vocabulary)",
+                value=bool(title_col),
+                disabled=not title_col,
+                key="prof_tk",
+                help="A supplementary lens that tokenizes title text (with stopwords "
+                     "stripped) — useful for surfacing terminology that subject "
+                     "headings may have missed. Requires a Title column. Distinct "
+                     "from the subject view above."
+            )
             show_coverage_vs_use = st.checkbox(
                 "Coverage vs. Use (requires usage column)",
                 value=bool(weight_col),
                 disabled=not weight_col,
                 key="prof_cvu",
-                help="Compare what % of the collection each LC area holds vs. what % "
+                help="Compare what % of the collection each area holds vs. what % "
                      "of use it drives. Shows overperforming (small but heavily used) "
-                     "and underperforming (large but lightly used) areas."
+                     "and underperforming (large but lightly used) areas. "
+                     "Uses LC class when available; falls back to subject terms otherwise."
             )
             show_gap = st.checkbox("Gap analysis", True, key="prof_gap")
             show_detail = st.checkbox("Title detail table", False, key="prof_detail")
@@ -1398,6 +1799,49 @@ def page_collection_profiler():
         else:
             wc_max_words, wc_min_len, wc_color = 100, 3, "viridis"
 
+        # Title-keyword sub-options
+        if show_title_keywords:
+            with st.expander("🔤 Title keyword options"):
+                tk_top_n = st.slider(
+                    "Top N keywords", 10, 100, 30, 5, key="prof_tk_topn",
+                    help="Number of keywords to chart and include in the table."
+                )
+                tk_show_wordcloud = st.checkbox(
+                    "Also show keyword word cloud", value=False, key="prof_tk_wc",
+                    help="A separate cloud from the subject one — built from title "
+                         "tokens, not subject headings."
+                )
+                if tk_show_wordcloud:
+                    tk_wc_max_words = st.slider(
+                        "Cloud: max words", 20, 200, 100, 10, key="prof_tk_wc_max"
+                    )
+                    tk_wc_color = st.selectbox(
+                        "Cloud: color scheme",
+                        ["plasma", "viridis", "inferno", "magma", "cividis",
+                         "twilight", "rainbow"],
+                        key="prof_tk_wc_color"
+                    )
+                else:
+                    tk_wc_max_words, tk_wc_color = 100, "plasma"
+                tk_extra_raw = st.text_area(
+                    "Extra stopwords (comma- or newline-separated)",
+                    value="",
+                    height=80,
+                    key="prof_tk_stops",
+                    help="Add domain-specific words to ignore — e.g., your "
+                         "publisher's series name, or a recurring genre word that "
+                         "isn't analytically interesting."
+                )
+                tk_extra_stopwords = {
+                    w.strip().lower() for w in re.split(r"[,\n]", tk_extra_raw) if w.strip()
+                }
+                if tk_extra_stopwords:
+                    st.caption(f"Filtering out {len(tk_extra_stopwords)} extra word(s).")
+        else:
+            tk_top_n, tk_show_wordcloud = 30, False
+            tk_wc_max_words, tk_wc_color = 100, "plasma"
+            tk_extra_stopwords = set()
+
         st.caption(
             "Changes here apply the next time you click **Re-run analysis** "
             "(or the main button below)."
@@ -1437,12 +1881,17 @@ def page_collection_profiler():
         st.session_state['prof_settings'] = {
             'weight_label': weight_label if use_weight else 'Title Count',
             'usage_col_label': weight_col or 'Usage',
+            'has_usage_col': bool(weight_col),
             'top_n_subjects': top_n,
             'show_sunburst': show_sunburst, 'show_treemap': show_treemap,
             'show_subject_bars': show_bars,
             'show_wordcloud': show_wordcloud,
             'wc_max_words': wc_max_words, 'wc_min_len': wc_min_len, 'wc_color': wc_color,
             'show_heatmap': show_heatmap,
+            'show_title_keywords': show_title_keywords,
+            'tk_top_n': tk_top_n, 'tk_show_wordcloud': tk_show_wordcloud,
+            'tk_wc_max_words': tk_wc_max_words, 'tk_wc_color': tk_wc_color,
+            'tk_extra_stopwords': tk_extra_stopwords,
             'show_coverage_vs_use': show_coverage_vs_use,
             'cvu_over': cvu_over, 'cvu_under': cvu_under,
             'cvu_min_titles': cvu_min_titles, 'cvu_show_sub': cvu_show_sub,
@@ -1460,6 +1909,10 @@ def page_collection_profiler():
                 'show_subject_bars': True, 'show_wordcloud': True,
                 'wc_max_words': 100, 'wc_min_len': 3, 'wc_color': 'viridis',
                 'show_heatmap': True,
+                'show_title_keywords': False,
+                'tk_top_n': 30, 'tk_show_wordcloud': False,
+                'tk_wc_max_words': 100, 'tk_wc_color': 'plasma',
+                'tk_extra_stopwords': set(),
                 'show_coverage_vs_use': False,
                 'cvu_over': 2.0, 'cvu_under': 0.5,
                 'cvu_min_titles': 10, 'cvu_show_sub': True,
