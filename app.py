@@ -389,34 +389,69 @@ TITLE_STOPWORDS = frozenset({
     'ii', 'iii', 'iv', 'vi', 'vii', 'viii', 'ix', 'xi', 'xii',
     # Subtitle / format words common in book titles
     'using', 'use', 'used', 'within', 'across', 'toward', 'towards',
+    'more', 'most', 'less', 'least', 'much', 'many', 'few', 'fewer',
+    'years', 'year', 'century', 'centuries', 'decade', 'decades',
+    'today', 'tomorrow', 'yesterday',
+    'also', 'just', 'only', 'even', 'still', 'already', 'always', 'never',
+    'really', 'actually', 'simply', 'indeed', 'thus', 'hence',
+    'beyond', 'around', 'something', 'someone', 'anything', 'nothing',
 })
 
 _RE_TITLE_TOKEN = re.compile(r"[A-Za-z][A-Za-z'\-]+")
+# Split a title into segments at subtitle/clause boundaries so n-grams don't
+# cross conceptual breaks (e.g., "Insurgent Cuba: Race, Nation, and Revolution"
+# should not produce the bigram "cuba race"). Splits on : ; — – and commas.
+_RE_TITLE_SEGMENT = re.compile(r"[:;,()\[\]\u2013\u2014/\\]+|\s-\s")
 
 
-def _tokenize_title(title, min_len=4, extra_stopwords=None):
-    """Lowercase a title, strip punctuation, drop stopwords + short tokens.
+def _tokenize_title_segments(title, min_len=4, extra_stopwords=None):
+    """Return a list of token-lists, one per subtitle/clause segment.
 
-    Returns a list of tokens (with duplicates preserved — the caller decides
-    whether to count by occurrence or unique-per-title).
+    N-gram extraction respects segment boundaries, so phrases like 'race nation'
+    won't be formed across a colon or comma. Within each segment, stopwords
+    and short tokens are dropped.
     """
     if not isinstance(title, str) or not title.strip():
         return []
     stops = TITLE_STOPWORDS if not extra_stopwords else (TITLE_STOPWORDS | extra_stopwords)
-    raw = _RE_TITLE_TOKEN.findall(title.lower())
-    tokens = []
-    for tok in raw:
-        # Strip leading/trailing apostrophes and hyphens
-        tok = tok.strip("'-")
-        if len(tok) < min_len:
-            continue
-        if tok in stops:
-            continue
-        # Drop pure-numeric (shouldn't match the regex but be safe)
-        if tok.isdigit():
-            continue
-        tokens.append(tok)
-    return tokens
+    segments_raw = _RE_TITLE_SEGMENT.split(title.lower())
+    segments = []
+    for seg in segments_raw:
+        raw_tokens = _RE_TITLE_TOKEN.findall(seg)
+        kept = []
+        for tok in raw_tokens:
+            tok = tok.strip("'-")
+            if len(tok) < min_len:
+                continue
+            if tok in stops:
+                continue
+            if tok.isdigit():
+                continue
+            kept.append(tok)
+        if kept:
+            segments.append(kept)
+    return segments
+
+
+def _tokenize_title(title, min_len=4, extra_stopwords=None):
+    """Flat token list (preserves segment-aware filtering). Kept for callers
+    that just want unigrams without segment structure."""
+    return [tok for seg in _tokenize_title_segments(title, min_len, extra_stopwords)
+            for tok in seg]
+
+
+def _extract_ngrams(segments, n_values=(1,)):
+    """Yield (n, ngram_string) tuples from segment-aware token lists.
+
+    n_values controls which sizes to extract. N-grams of size n require a
+    segment of length ≥ n; they never cross segment boundaries.
+    """
+    for seg in segments:
+        for n in n_values:
+            if n < 1 or len(seg) < n:
+                continue
+            for i in range(len(seg) - n + 1):
+                yield n, ' '.join(seg[i:i + n])
 
 
 # =====================================================================
@@ -724,13 +759,17 @@ def _profiler_process_subjects_chunk(subj_series, weight_series, lc_series,
 
 def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
                            selected_classes, progress_bar,
-                           has_usage_col=False):
+                           has_usage_col=False, ngram_sizes=(1, 2, 3)):
     """Single pass that builds everything: LC counts, subject counter, subject-by-LC, gaps.
 
     When a usage column is present in the dataframe (indicated by `has_usage_col=True`),
     also computes a second set of LC counts using usage weighting — this is what powers
     the Coverage-vs-Use view. The weight_col parameter controls the primary analysis;
     the secondary pass always uses the '_weight' column (which holds usage values).
+
+    `ngram_sizes` controls which title-keyword n-gram sizes are extracted
+    (1=words, 2=bigrams, 3=trigrams). All sizes are stored together in a single
+    counter keyed by (size, phrase); the renderer filters by size.
     """
     n_total = len(df)
     if selected_classes is not None and lc_col:
@@ -860,37 +899,46 @@ def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
     # Uses uncontrolled vocabulary (title text), so it can surface terminology
     # the controlled subject headings missed. Always built when title column is
     # present; cheap to compute even on large datasets.
+    #
+    # N-grams: we tokenize each title into segments (split at colons/commas/semis
+    # so phrases don't cross subtitle boundaries), drop stopwords, then build
+    # all configured n-gram sizes. Each n-gram is stored as a (size, phrase)
+    # tuple so the renderer can show separate top-N lists per size.
     if title_col:
-        title_keyword_counter = Counter()        # weighted by 1 per title-occurrence of token
-        title_keyword_usage = Counter()          # weighted by usage
-        title_unique_titles = Counter()          # how many distinct titles each token appears in
+        title_keyword_counter = Counter()        # keys: (n, phrase) -> occurrences
+        title_keyword_usage = Counter()          # keys: (n, phrase) -> usage sum
+        title_unique_titles = Counter()          # keys: (n, phrase) -> distinct titles
         title_series = df.loc[idx, title_col]
         if has_usage_col:
             usage_series = df.loc[idx, '_weight']
         else:
             usage_series = pd.Series(1.0, index=idx)
+        ngram_sizes = tuple(sorted(set(int(n) for n in ngram_sizes if int(n) >= 1))) or (1,)
         for ti, raw_title in title_series.items():
-            tokens = _tokenize_title(raw_title)
-            if not tokens:
+            segments = _tokenize_title_segments(raw_title)
+            if not segments:
                 continue
             u = usage_series.at[ti] if ti in usage_series.index else 0
             seen_in_title = set()
-            for tok in tokens:
-                title_keyword_counter[tok] += 1
+            for n, phrase in _extract_ngrams(segments, n_values=ngram_sizes):
+                key = (n, phrase)
+                title_keyword_counter[key] += 1
                 if has_usage_col:
-                    title_keyword_usage[tok] += u
-                if tok not in seen_in_title:
-                    title_unique_titles[tok] += 1
-                    seen_in_title.add(tok)
+                    title_keyword_usage[key] += u
+                if key not in seen_in_title:
+                    title_unique_titles[key] += 1
+                    seen_in_title.add(key)
         results['title_keyword_counts'] = title_keyword_counter
         results['title_keyword_usage'] = title_keyword_usage
         results['title_keyword_unique_titles'] = title_unique_titles
         results['title_keyword_available'] = len(title_keyword_counter) > 0
+        results['title_keyword_ngram_sizes'] = tuple(ngram_sizes)
     else:
         results['title_keyword_counts'] = Counter()
         results['title_keyword_usage'] = Counter()
         results['title_keyword_unique_titles'] = Counter()
         results['title_keyword_available'] = False
+        results['title_keyword_ngram_sizes'] = ()
 
     progress_bar.progress(85, "Running gap analysis...")
 
@@ -1237,13 +1285,23 @@ def _render_title_keywords(results, settings, notes=""):
     counter = results['title_keyword_counts']
     usage_counter = results.get('title_keyword_usage', Counter())
     unique_titles = results.get('title_keyword_unique_titles', Counter())
+    available_sizes = results.get('title_keyword_ngram_sizes', (1,))
 
-    # Apply user-tunable extra stopwords from settings (top_n filter applied later)
+    # Apply user-tunable extra stopwords. Stopwords are applied per-token so
+    # bigrams/trigrams containing any user-flagged word also get filtered.
     extra_stops = settings.get('tk_extra_stopwords') or set()
+
+    def _key_passes_stops(key):
+        # key is (n, phrase). Drop the whole n-gram if any token is in extra_stops.
+        if not extra_stops:
+            return True
+        _, phrase = key
+        return not any(tok in extra_stops for tok in phrase.split())
+
     if extra_stops:
-        counter = Counter({k: v for k, v in counter.items() if k not in extra_stops})
-        usage_counter = Counter({k: v for k, v in usage_counter.items() if k not in extra_stops})
-        unique_titles = Counter({k: v for k, v in unique_titles.items() if k not in extra_stops})
+        counter = Counter({k: v for k, v in counter.items() if _key_passes_stops(k)})
+        usage_counter = Counter({k: v for k, v in usage_counter.items() if _key_passes_stops(k)})
+        unique_titles = Counter({k: v for k, v in unique_titles.items() if _key_passes_stops(k)})
 
     if not counter:
         return
@@ -1251,77 +1309,138 @@ def _render_title_keywords(results, settings, notes=""):
     top_n = settings.get('tk_top_n', 30)
     has_usage = bool(settings.get('has_usage_col'))
     usage_label = settings.get('usage_col_label', 'Usage')
+    selected_sizes = tuple(settings.get('tk_ngram_sizes', (1, 2, 3)))
+    min_freq = settings.get('tk_min_freq', 2)
+
+    # Restrict to sizes the user actually selected AND that we built
+    sizes_to_show = tuple(n for n in selected_sizes if n in available_sizes)
+    if not sizes_to_show:
+        sizes_to_show = available_sizes
 
     st.markdown("---")
-    st.subheader(f"Title keywords (top {top_n})")
+    st.subheader("Title keywords & phrases")
     st.caption(
         "A supplementary lens on the collection. Unlike the subject view above "
-        "(which uses curated subject headings), this counts words appearing in "
-        "**title text** with English stopwords and common publishing-noise words "
-        "removed. Use it to spot vocabulary that controlled subject vocabularies "
-        "may have missed — newer concepts, methodological terms, interdisciplinary "
-        "phrases. Titles are uncontrolled vocabulary, so treat findings as "
-        "exploratory."
+        "(which uses curated subject headings), this counts words and phrases "
+        "appearing in **title text** with English stopwords and common "
+        "publishing-noise words removed. N-grams are built from tokens that "
+        "survive stopword removal and never cross subtitle punctuation. "
+        "Use this view to spot terminology that controlled subject vocabularies "
+        "may have missed — newer concepts, methodological terms, "
+        "interdisciplinary phrases. Treat findings as exploratory."
     )
 
-    # Bar chart of top keywords
-    top_items = counter.most_common(top_n)
-    rows = []
-    for kw, occurrences in top_items:
-        rows.append({
-            'Keyword': kw,
-            'Title Occurrences': int(occurrences),
-            'Distinct Titles': int(unique_titles.get(kw, 0)),
-            f'Total {usage_label}': int(usage_counter.get(kw, 0)) if has_usage else None,
-        })
-    kw_df = pd.DataFrame(rows)
-    if not has_usage:
-        kw_df = kw_df.drop(columns=[f'Total {usage_label}'])
+    _SIZE_LABELS = {
+        1: "Single words",
+        2: "Two-word phrases",
+        3: "Three-word phrases",
+    }
+    tab_labels = [f"{_SIZE_LABELS.get(n, f'{n}-grams')} (top {top_n})"
+                  for n in sizes_to_show]
+    tabs = st.tabs(tab_labels) if len(sizes_to_show) > 1 else [None]
 
-    fig = px.bar(
-        kw_df, x='Title Occurrences', y='Keyword',
-        orientation='h', color='Title Occurrences',
-        color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
-        hover_data=[c for c in ['Distinct Titles', f'Total {usage_label}']
-                    if c in kw_df.columns],
-    )
-    fig.update_layout(
-        yaxis={'categoryorder': 'total ascending'},
-        height=max(450, top_n * 24),
-        showlegend=False,
-        margin=dict(t=30, l=0, r=0, b=30),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    all_export_rows = []  # for combined CSV export at end
 
-    # Sortable table — gives the user another angle (sort by use, by distinct titles)
-    with st.expander("📋 Full keyword table (sortable)"):
-        display_df = kw_df.copy()
-        st.dataframe(
-            display_df, use_container_width=True, hide_index=True,
-            height=min(450, 50 + 35 * len(display_df)),
+    for tab, n in zip(tabs, sizes_to_show):
+        ctx = tab if tab is not None else st.container()
+        with ctx:
+            # Filter: for n>1, require the phrase to appear in at least `min_freq`
+            # distinct titles (not just total occurrences — this filters out
+            # duplicate-title noise like a book listed under multiple ISBNs).
+            # Unigrams always passed (they're already filtered by min word length).
+            this_min = 1 if n == 1 else min_freq
+            sub_items = []
+            for key, cnt in counter.items():
+                if key[0] != n:
+                    continue
+                ut = unique_titles.get(key, 0)
+                if n > 1 and ut < this_min:
+                    continue
+                sub_items.append((key[1], cnt))
+            if not sub_items:
+                st.info(
+                    f"No {_SIZE_LABELS.get(n, str(n)+'-gram').lower()} appeared in "
+                    f"at least {this_min} distinct title{'s' if this_min != 1 else ''}. "
+                    "Try lowering **Min occurrences** in the title-keyword options "
+                    "(it filters by distinct titles for multi-word phrases)."
+                )
+                continue
+            sub_items.sort(key=lambda x: -x[1])
+            top_items = sub_items[:top_n]
+
+            rows = []
+            for phrase, occurrences in top_items:
+                key = (n, phrase)
+                row = {
+                    'Phrase' if n > 1 else 'Keyword': phrase,
+                    'Title Occurrences': int(occurrences),
+                    'Distinct Titles': int(unique_titles.get(key, 0)),
+                }
+                if has_usage:
+                    row[f'Total {usage_label}'] = int(usage_counter.get(key, 0))
+                rows.append(row)
+                all_export_rows.append({
+                    'N-gram Size': n,
+                    'Phrase': phrase,
+                    'Title Occurrences': int(occurrences),
+                    'Distinct Titles': int(unique_titles.get(key, 0)),
+                    f'Total {usage_label}': int(usage_counter.get(key, 0)) if has_usage else None,
+                })
+            kw_df = pd.DataFrame(rows)
+            label_col = 'Phrase' if n > 1 else 'Keyword'
+
+            fig = px.bar(
+                kw_df, x='Title Occurrences', y=label_col,
+                orientation='h', color='Title Occurrences',
+                color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                hover_data=[c for c in ['Distinct Titles', f'Total {usage_label}']
+                            if c in kw_df.columns],
+            )
+            fig.update_layout(
+                yaxis={'categoryorder': 'total ascending'},
+                height=max(450, len(kw_df) * 24),
+                showlegend=False,
+                margin=dict(t=30, l=0, r=0, b=30),
+            )
+            st.plotly_chart(fig, use_container_width=True, key=f"prof_tk_chart_{n}")
+
+            with st.expander(f"📋 Full {label_col.lower()} table (sortable)"):
+                st.dataframe(
+                    kw_df, use_container_width=True, hide_index=True,
+                    height=min(450, 50 + 35 * len(kw_df)),
+                )
+
+    # Single combined CSV export covering all selected sizes
+    if all_export_rows:
+        export_df = pd.DataFrame(all_export_rows)
+        if not has_usage and f'Total {usage_label}' in export_df.columns:
+            export_df = export_df.drop(columns=[f'Total {usage_label}'])
+        _kw_bytes = _annotate_csv(
+            export_df, notes,
+            extra_meta={'Tool': 'Collection Profiler',
+                        'View': 'Title Keywords (n-grams)',
+                        'Top N (per size)': top_n,
+                        'N-gram sizes': ', '.join(str(n) for n in sizes_to_show),
+                        'Min occurrences (n>1)': min_freq,
+                        'Stopwords': 'Built-in English + library/publishing noise'
+                                     + (f' + {len(extra_stops)} custom' if extra_stops else '')}
         )
+        st.download_button(
+            "📥 Title keywords & phrases (CSV)", _kw_bytes,
+            "title_keywords.csv", "text/csv", key='prof_dl_tk',
+        )
+        _add_to_tray("profiler", "title_keywords.csv", _kw_bytes)
 
-    _kw_bytes = _annotate_csv(
-        kw_df, notes,
-        extra_meta={'Tool': 'Collection Profiler',
-                    'View': 'Title Keywords',
-                    'Top N': top_n,
-                    'Stopwords': 'Built-in English + library/publishing noise'
-                                 + (f' + {len(extra_stops)} custom' if extra_stops else '')}
-    )
-    st.download_button(
-        "📥 Title keywords (CSV)", _kw_bytes,
-        "title_keywords.csv", "text/csv", key='prof_dl_tk',
-    )
-    _add_to_tray("profiler", "title_keywords.csv", _kw_bytes)
-
-    # Word cloud — only if requested AND wordcloud lib available
+    # Word cloud — unigrams only (clouds don't render multi-word phrases well).
     if settings.get('tk_show_wordcloud') and WORDCLOUD_AVAILABLE:
-        st.markdown("##### Title keyword cloud")
+        unigram_counter = Counter({key[1]: cnt for key, cnt in counter.items()
+                                   if key[0] == 1})
+        if not unigram_counter:
+            return
+        st.markdown("##### Title keyword cloud (single words)")
         max_words = settings.get('tk_wc_max_words', 100)
         color_scheme = settings.get('tk_wc_color', 'plasma')
-        # Use occurrence counts (not usage) for the cloud — visualizing prevalence
-        cloud_data = dict(counter.most_common(max_words))
+        cloud_data = dict(unigram_counter.most_common(max_words))
         if cloud_data:
             wc = WordCloud(
                 width=1200, height=500, background_color='white',
@@ -1803,13 +1922,46 @@ def page_collection_profiler():
         if show_title_keywords:
             with st.expander("🔤 Title keyword options"):
                 tk_top_n = st.slider(
-                    "Top N keywords", 10, 100, 30, 5, key="prof_tk_topn",
-                    help="Number of keywords to chart and include in the table."
+                    "Top N keywords (per n-gram size)", 10, 100, 30, 5, key="prof_tk_topn",
+                    help="Number of keywords/phrases to chart and include in the "
+                         "table for each n-gram size you've selected."
+                )
+                tk_ngram_choice = st.multiselect(
+                    "N-gram sizes",
+                    options=["Single words (unigrams)",
+                             "Two-word phrases (bigrams)",
+                             "Three-word phrases (trigrams)"],
+                    default=["Single words (unigrams)",
+                             "Two-word phrases (bigrams)"],
+                    key="prof_tk_ngrams",
+                    help="Phrases preserve concepts that single words split apart "
+                         "(e.g., 'data science' as a unit, not 'data' + 'science'). "
+                         "N-grams don't cross subtitle punctuation, and stopwords "
+                         "are removed before phrases are built. Selecting more sizes "
+                         "doesn't slow analysis meaningfully."
+                )
+                _ngram_map = {
+                    "Single words (unigrams)": 1,
+                    "Two-word phrases (bigrams)": 2,
+                    "Three-word phrases (trigrams)": 3,
+                }
+                tk_ngram_sizes = tuple(sorted(
+                    _ngram_map[c] for c in tk_ngram_choice
+                )) or (1,)
+                tk_min_freq = st.number_input(
+                    "Min distinct titles (for bigrams/trigrams)",
+                    min_value=1, max_value=20, value=2, step=1,
+                    key="prof_tk_minfreq",
+                    help="Multi-word phrases that appear in only one title are "
+                         "usually noise (or a duplicate record). Set to 1 to "
+                         "include them anyway. Doesn't apply to single-word "
+                         "keywords."
                 )
                 tk_show_wordcloud = st.checkbox(
                     "Also show keyword word cloud", value=False, key="prof_tk_wc",
                     help="A separate cloud from the subject one — built from title "
-                         "tokens, not subject headings."
+                         "tokens, not subject headings. Uses unigrams only "
+                         "(word clouds don't render multi-word phrases well)."
                 )
                 if tk_show_wordcloud:
                     tk_wc_max_words = st.slider(
@@ -1830,7 +1982,10 @@ def page_collection_profiler():
                     key="prof_tk_stops",
                     help="Add domain-specific words to ignore — e.g., your "
                          "publisher's series name, or a recurring genre word that "
-                         "isn't analytically interesting."
+                         "isn't analytically interesting. Applied before n-grams "
+                         "are built, so 'history of medicine' becomes the bigram "
+                         "'history medicine' if 'of' is in the stopword list "
+                         "(it already is)."
                 )
                 tk_extra_stopwords = {
                     w.strip().lower() for w in re.split(r"[,\n]", tk_extra_raw) if w.strip()
@@ -1841,6 +1996,8 @@ def page_collection_profiler():
             tk_top_n, tk_show_wordcloud = 30, False
             tk_wc_max_words, tk_wc_color = 100, "plasma"
             tk_extra_stopwords = set()
+            tk_ngram_sizes = (1, 2, 3)
+            tk_min_freq = 2
 
         st.caption(
             "Changes here apply the next time you click **Re-run analysis** "
@@ -1869,7 +2026,8 @@ def page_collection_profiler():
         pbar = st.progress(0, "Starting analysis...")
         results = _profiler_run_analysis(
             df, subj_col, lc_col, title_col, w_key, sel_classes, pbar,
-            has_usage_col=bool(weight_col)
+            has_usage_col=bool(weight_col),
+            ngram_sizes=tk_ngram_sizes,
         )
         st.session_state['prof_results'] = results
         st.session_state['prof_last_run_file_key'] = file_key
@@ -1892,6 +2050,7 @@ def page_collection_profiler():
             'tk_top_n': tk_top_n, 'tk_show_wordcloud': tk_show_wordcloud,
             'tk_wc_max_words': tk_wc_max_words, 'tk_wc_color': tk_wc_color,
             'tk_extra_stopwords': tk_extra_stopwords,
+            'tk_ngram_sizes': tk_ngram_sizes, 'tk_min_freq': tk_min_freq,
             'show_coverage_vs_use': show_coverage_vs_use,
             'cvu_over': cvu_over, 'cvu_under': cvu_under,
             'cvu_min_titles': cvu_min_titles, 'cvu_show_sub': cvu_show_sub,
@@ -1913,6 +2072,7 @@ def page_collection_profiler():
                 'tk_top_n': 30, 'tk_show_wordcloud': False,
                 'tk_wc_max_words': 100, 'tk_wc_color': 'plasma',
                 'tk_extra_stopwords': set(),
+                'tk_ngram_sizes': (1, 2, 3), 'tk_min_freq': 2,
                 'show_coverage_vs_use': False,
                 'cvu_over': 2.0, 'cvu_under': 0.5,
                 'cvu_min_titles': 10, 'cvu_show_sub': True,
