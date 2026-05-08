@@ -475,6 +475,19 @@ WEIGHT_ALIASES = ['Loans', 'Loans (Total)', 'Checkouts', 'Circulation',
                   # Other vendor variants
                   'Views', 'Requests', 'Hits', 'Total Uses']
 
+# Identifier columns for cross-file matching (used by Zero-Use Identifier).
+# ISBN/ISSN/DOI/OCLC are reliable join keys; title+author is the fallback
+# when identifiers are absent.
+ISBN_ALIASES = ['ISBN', 'isbn', 'ISBN-13', 'ISBN13', 'ISBN-10', 'ISBN10',
+                'eISBN', 'Print ISBN', 'Online ISBN', 'Print_ISBN', 'Online_ISBN']
+ISSN_ALIASES = ['ISSN', 'issn', 'eISSN', 'Print ISSN', 'Online ISSN',
+                'Print_ISSN', 'Online_ISSN']
+DOI_ALIASES = ['DOI', 'doi', 'DOI Link']
+OCLC_ALIASES = ['OCLC', 'OCLC Number', 'OCLC #', 'OCLC_Number',
+                'WorldCat Number', 'OCN']
+AUTHOR_ALIASES = ['Author', 'author', 'AUTHOR', 'Creator', 'Authors',
+                  'Primary Author', 'Main Author']
+
 
 def find_column(df_or_cols, aliases, partial=True):
     """Find a column matching any alias. Accepts a DataFrame or list of column names."""
@@ -3798,6 +3811,804 @@ def page_recommendation_scorer():
         """)
 
 
+
+
+# =====================================================================
+# =====================================================================
+# TOOL 4: ZERO-USE IDENTIFIER
+# =====================================================================
+# "What do we own that isn't being used at all?"
+# Two-file comparison: holdings universe vs. usage report.
+# Surfaces titles in holdings that don't appear in usage — the inverse
+# of the Usage Analyzer, which starts with what HAS been used.
+# =====================================================================
+# =====================================================================
+
+# ---- Identifier normalization helpers ----
+
+def _normalize_isbn(val):
+    """Strip hyphens, spaces, and non-digits (except trailing X for ISBN-10).
+    Returns the canonical form, or None if not a plausible ISBN."""
+    if pd.isna(val):
+        return None
+    s = str(val).upper().strip()
+    s = re.sub(r'[^\dX]', '', s)
+    if len(s) not in (10, 13):
+        # Some files cram multiple ISBNs in one cell; try first 13 then 10
+        for length in (13, 10):
+            if len(s) >= length:
+                candidate = s[:length]
+                if length == 10 or candidate.startswith(('978', '979')):
+                    return candidate
+        return None
+    return s
+
+
+def _normalize_issn(val):
+    """ISSNs are 8 chars; canonical form has hyphen but we strip it for matching."""
+    if pd.isna(val):
+        return None
+    s = str(val).upper().strip()
+    s = re.sub(r'[^\dX]', '', s)
+    return s if len(s) == 8 else None
+
+
+def _normalize_doi(val):
+    """Lowercase, strip leading 'doi:' or URL prefix, trim whitespace."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip().lower()
+    s = re.sub(r'^https?://(dx\.)?doi\.org/', '', s)
+    s = re.sub(r'^doi:\s*', '', s)
+    return s if s and '/' in s else None  # Real DOIs always have a slash
+
+
+def _normalize_oclc(val):
+    """OCLC numbers — strip prefixes like 'ocm', 'ocn', '(OCoLC)', leave digits."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    s = re.sub(r'^\(OCoLC\)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^(ocm|ocn|on)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\D', '', s)
+    return s if s else None
+
+
+def _build_title_author_key(title, author):
+    """Composite key for fallback matching when identifiers are absent.
+    Uses normalized title + first significant word of author."""
+    t = normalize_text(title) if title else ""
+    if not t:
+        return None
+    a = normalize_text(author) if author else ""
+    # First token of normalized author — for "Smith, John" → "smith"
+    a_tok = a.split()[0] if a else ""
+    return f"{t}|{a_tok}" if t else None
+
+
+def _detect_id_columns(df):
+    """Detect identifier columns in a dataframe."""
+    return {
+        'isbn': find_column(df, ISBN_ALIASES),
+        'issn': find_column(df, ISSN_ALIASES),
+        'doi': find_column(df, DOI_ALIASES),
+        'oclc': find_column(df, OCLC_ALIASES),
+        'title': find_column(df, TITLE_ALIASES),
+        'author': find_column(df, AUTHOR_ALIASES),
+    }
+
+
+def _build_match_keys(df, id_cols):
+    """Add normalized matching key columns to a dataframe in place.
+    Returns the list of (key_type, column_name) actually built."""
+    built = []
+    if id_cols.get('isbn'):
+        df['_key_isbn'] = df[id_cols['isbn']].apply(_normalize_isbn)
+        built.append(('isbn', '_key_isbn'))
+    if id_cols.get('issn'):
+        df['_key_issn'] = df[id_cols['issn']].apply(_normalize_issn)
+        built.append(('issn', '_key_issn'))
+    if id_cols.get('doi'):
+        df['_key_doi'] = df[id_cols['doi']].apply(_normalize_doi)
+        built.append(('doi', '_key_doi'))
+    if id_cols.get('oclc'):
+        df['_key_oclc'] = df[id_cols['oclc']].apply(_normalize_oclc)
+        built.append(('oclc', '_key_oclc'))
+    if id_cols.get('title'):
+        author_series = df[id_cols['author']] if id_cols.get('author') else pd.Series([None] * len(df), index=df.index)
+        df['_key_titleauth'] = [_build_title_author_key(t, a)
+                                 for t, a in zip(df[id_cols['title']], author_series)]
+        built.append(('title+author', '_key_titleauth'))
+    return built
+
+
+def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
+                              usage_weight_col=None):
+    """Cascade-match each holdings row against the usage file.
+
+    Returns the holdings_df with two new columns:
+        _matched_via : str (which key matched, or 'unmatched')
+        _usage_total : float (sum of usage from matched usage rows, or 0)
+
+    Matching cascades by reliability: ISBN > DOI > OCLC > ISSN > title+author.
+    A holdings row counts as 'matched' on the first key that finds at least
+    one usage row.
+    """
+    holdings_df = holdings_df.copy()
+    holdings_df['_matched_via'] = 'unmatched'
+    holdings_df['_usage_total'] = 0.0
+
+    # Build per-key lookup tables from usage side: key_value → total_usage.
+    # Done once per key type to avoid row-by-row iteration on the usage df.
+    usage_lookups = {}
+    for key_type, key_col in usage_keys:
+        if key_col not in usage_df.columns:
+            continue
+        valid = usage_df[usage_df[key_col].notna() & (usage_df[key_col] != '')]
+        if valid.empty:
+            continue
+        if usage_weight_col and usage_weight_col in valid.columns:
+            grouped = valid.groupby(key_col)[usage_weight_col].sum()
+        else:
+            # No weight column → just count rows per key
+            grouped = valid.groupby(key_col).size().astype(float)
+        usage_lookups[key_type] = grouped.to_dict()
+
+    # Identifiers first (most reliable), title+author last
+    priority = ['isbn', 'doi', 'oclc', 'issn', 'title+author']
+    for key_type in priority:
+        h_col = next((kc for kt, kc in holdings_keys if kt == key_type), None)
+        if h_col is None or key_type not in usage_lookups:
+            continue
+        lookup = usage_lookups[key_type]
+        # Only fill rows still unmatched — keeps higher-priority matches sticky
+        unmatched_mask = holdings_df['_matched_via'] == 'unmatched'
+        h_values = holdings_df.loc[unmatched_mask, h_col]
+        for idx, val in h_values.items():
+            if val and val in lookup:
+                holdings_df.at[idx, '_matched_via'] = key_type
+                holdings_df.at[idx, '_usage_total'] = lookup[val]
+
+    return holdings_df
+
+
+def page_zero_use_identifier():
+    """Tool 4: Zero-Use Identifier — compare a holdings list to a usage list."""
+    st.header("🔍 Zero-Use Identifier")
+    st.markdown(
+        "**What do we own that isn't being used?** Compare a list of all your "
+        "holdings against a usage report to surface titles, journals, or "
+        "databases that aren't appearing in usage at all."
+    )
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- **Collections:** Identify dead-weight items in any format (print, "
+            "e-books, e-journals, databases, streaming media). Especially powerful "
+            "for e-resources where 'zero use' is invisible in the usage report itself "
+            "(many vendors omit titles with no use entirely).\n"
+            "- **Cancellation prep:** Combine with the Usage Analyzer's COUNTER mode — "
+            "use this tool to find titles missing from usage altogether, then use "
+            "COUNTER to triage low-but-nonzero items.\n"
+            "- **Off-site storage:** Surface print holdings with no circulation, "
+            "filtered by pub-year cutoff so newer items don't get flagged unfairly.\n"
+            "- **Renewal evidence:** Show admin or faculty exactly which package "
+            "titles haven't been used at all."
+        )
+
+    with st.expander("📖 How matching works", expanded=False):
+        st.markdown("""
+        Two files, one job: **what's in holdings but missing from usage?**
+
+        **Matching cascade** (most reliable first):
+        1. **ISBN / ISSN / DOI / OCLC** — exact match after normalization
+           (strips hyphens, prefixes like `(OCoLC)`, URL wrappers on DOIs, etc.)
+        2. **Title + first author word** — fallback when no shared identifier
+           exists. Uses the same text normalization as the rest of the dashboard
+           (lowercase, accent-strip, punctuation collapse).
+
+        **Holdings file** = the universe (full catalog, e-journal A-to-Z list,
+        database list, etc.). At minimum needs a Title column; identifier
+        columns improve match quality dramatically.
+
+        **Usage file** = anything with a count attached. COUNTER reports,
+        circulation exports, link-resolver clicks — the same kind of file the
+        Usage Analyzer accepts.
+
+        **Match quality:** the result table includes a `Matched Via` column so
+        you can spot-check whether a fallback title-match looks right.
+
+        **The unmatched ≠ zero-use caveat:** If your usage report only includes
+        titles that had at least one use (very common — many vendors omit
+        zero-use rows), then unmatched items are genuinely zero-use. If your
+        usage report includes zero-use rows explicitly, then unmatched items
+        might just be metadata mismatches. The two populations are split into
+        separate tabs so you can decide.
+        """)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**📚 Holdings file** — the universe")
+        holdings_file = st.file_uploader(
+            "Upload holdings CSV", type=['csv'], key="zu_holdings_upload",
+            help="Your full title list, e-journal A-Z, database list, etc."
+        )
+    with c2:
+        st.markdown("**📊 Usage file** — what's been used")
+        usage_file = st.file_uploader(
+            "Upload usage CSV", type=['csv'], key="zu_usage_upload",
+            help="COUNTER report, circulation export, or any list with a count column."
+        )
+
+    if not (holdings_file and usage_file):
+        st.info("Upload **both** files to begin. The holdings file is your "
+                "full list; the usage file is what has been used.")
+        return
+
+    try:
+        # Load both files (with caching)
+        cached_h = _cached_df_for_tool("zu_holdings", holdings_file)
+        cached_u = _cached_df_for_tool("zu_usage", usage_file)
+
+        if cached_h is not None:
+            holdings_df = cached_h.copy()
+        else:
+            holdings_df = _load_print_csv(holdings_file.getvalue(), holdings_file.name)
+            _store_cached_df("zu_holdings", holdings_file, holdings_df)
+
+        if cached_u is not None:
+            usage_df = cached_u.copy()
+        else:
+            usage_df = _load_print_csv(usage_file.getvalue(), usage_file.name)
+            _store_cached_df("zu_usage", usage_file, usage_df)
+
+        st.success(
+            f"✅ Loaded **{len(holdings_df):,}** holdings rows and "
+            f"**{len(usage_df):,}** usage rows."
+        )
+
+        # Detect columns in both files
+        h_ids = _detect_id_columns(holdings_df)
+        u_ids = _detect_id_columns(usage_df)
+        h_lc = find_column(holdings_df, LC_ALIASES)
+        h_loc = find_column(holdings_df, ['Location', 'Location Name', 'location',
+                                          'Library', 'Branch'])
+        h_format = find_column(holdings_df, ['Format', 'Material Type', 'Resource Type',
+                                             'Type', 'format', 'Bibliographic Format'])
+        h_pubyear = find_column(holdings_df, ['Publication Year', 'Pub Year', 'Year',
+                                              'pub_year', 'Publication Date',
+                                              'Date of Publication'])
+        u_weight = find_column(usage_df, WEIGHT_ALIASES)
+
+        with st.expander("🔍 Column detection & overrides", expanded=False):
+            st.markdown("**Holdings file:**")
+            hcols_text = " · ".join([f"{k.upper()}: `{v}`" if v else f"{k.upper()}: —"
+                                     for k, v in h_ids.items()])
+            st.caption(hcols_text)
+            st.caption(f"LC: `{h_lc}` · Location: `{h_loc}` · "
+                       f"Format: `{h_format}` · Pub Year: `{h_pubyear}`")
+
+            st.markdown("**Usage file:**")
+            ucols_text = " · ".join([f"{k.upper()}: `{v}`" if v else f"{k.upper()}: —"
+                                     for k, v in u_ids.items()])
+            st.caption(ucols_text)
+            st.caption(f"Usage metric: `{u_weight}`")
+
+            none_opt = "— count rows (no weighting) —"
+            usage_cols = [none_opt] + list(usage_df.columns)
+            default_idx = usage_cols.index(u_weight) if u_weight in usage_df.columns else 0
+            new_weight = st.selectbox(
+                "Override usage metric column",
+                usage_cols, index=default_idx, key="zu_weight_override"
+            )
+            u_weight = None if new_weight == none_opt else new_weight
+
+        # Validate: need at least Title in holdings, or one identifier
+        if not h_ids.get('title') and not any(h_ids.get(k) for k in ('isbn', 'issn', 'doi', 'oclc')):
+            st.error("❌ Holdings file needs at least a **Title** column or one "
+                     "identifier column (ISBN, ISSN, DOI, OCLC). Couldn't find any.")
+            return
+
+        # Find shared key types between the two files
+        shared_keys = []
+        for k in ('isbn', 'issn', 'doi', 'oclc'):
+            if h_ids.get(k) and u_ids.get(k):
+                shared_keys.append(k.upper())
+        if h_ids.get('title') and u_ids.get('title'):
+            shared_keys.append('Title+Author')
+
+        if not shared_keys:
+            st.error("❌ No matchable columns found in common between the two files. "
+                     "Need at least one of ISBN, ISSN, DOI, OCLC, or Title in both.")
+            return
+
+        st.info(f"🔗 Will match using: **{', '.join(shared_keys)}** "
+                f"(cascading from most reliable to fallback)")
+
+        # Coerce usage weight to numeric (or use row counts if no weight col)
+        if u_weight and u_weight in usage_df.columns:
+            usage_df['_weight'] = pd.to_numeric(usage_df[u_weight], errors='coerce').fillna(0)
+            weight_for_match = '_weight'
+        else:
+            weight_for_match = None
+
+        # Build match keys on both sides
+        h_keys = _build_match_keys(holdings_df, h_ids)
+        u_keys = _build_match_keys(usage_df, u_ids)
+
+        # Run match
+        with st.spinner("Matching holdings against usage..."):
+            matched = _match_holdings_to_usage(
+                holdings_df, usage_df, h_keys, u_keys,
+                usage_weight_col=weight_for_match
+            )
+
+        # Sidebar filters
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔎 Zero-Use Filters")
+
+        # LC filter
+        if h_lc:
+            matched['_lc_main'] = matched[h_lc].apply(extract_lc_prefix)
+            lc_avail = sorted(matched['_lc_main'].dropna().unique())
+            if lc_avail:
+                lc_labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in lc_avail]
+                sel_lc_labels = st.sidebar.multiselect(
+                    "LC Class", lc_labels, default=lc_labels, key="zu_lc_filter"
+                )
+                sel_lc = [l.split(' –')[0] for l in sel_lc_labels]
+                matched = matched[matched['_lc_main'].isin(sel_lc) | matched['_lc_main'].isna()].copy()
+
+        # Location filter
+        if h_loc:
+            locs = sorted(matched[h_loc].dropna().unique())
+            if locs:
+                sel_locs = st.sidebar.multiselect(
+                    "Location", locs, default=locs, key="zu_loc_filter"
+                )
+                matched = matched[matched[h_loc].isin(sel_locs) | matched[h_loc].isna()].copy()
+
+        # Format filter
+        if h_format:
+            fmts = sorted(matched[h_format].dropna().unique())
+            if fmts:
+                sel_fmts = st.sidebar.multiselect(
+                    "Format", fmts, default=fmts, key="zu_fmt_filter"
+                )
+                matched = matched[matched[h_format].isin(sel_fmts) | matched[h_format].isna()].copy()
+
+        # Threshold for "low use"
+        threshold = st.sidebar.number_input(
+            "Use threshold (≤ this = flagged)",
+            min_value=0.0, value=0.0, step=1.0, key="zu_threshold",
+            help="0 = strictly zero use. Raise this to also catch low-use items."
+        )
+
+        # Treat unmatched items as zero-use? Off by default (safer assumption);
+        # turn on when the usage report is known to include zero-use rows
+        # explicitly (then unmatched truly = zero-use, not a coverage gap).
+        treat_unmatched_as_zero = st.sidebar.checkbox(
+            "Treat unmatched items as zero-use",
+            value=False, key="zu_combine_unmatched",
+            help="OFF (default): unmatched items appear in their own tab. Use when "
+                 "your usage report omits zero-use titles (most COUNTER reports do).\n\n"
+                 "ON: unmatched items are merged into the zero/low-use list. Use only "
+                 "when you trust your usage report's coverage — i.e., it explicitly "
+                 "includes rows for unused titles. Spot-check the match preview "
+                 "below before flipping this on for a final cancellation list."
+        )
+
+        # Optional pub-year cutoff
+        pubyear_cutoff = None
+        if h_pubyear:
+            with st.sidebar.expander("📅 Optional: limit by pub year", expanded=False):
+                use_year = st.checkbox("Only flag items older than:", value=False, key="zu_use_year")
+                if use_year:
+                    pubyear_cutoff = st.number_input(
+                        "Published before",
+                        min_value=1800, max_value=2030, value=2015,
+                        step=1, key="zu_year_cutoff",
+                        help="Newer items often haven't had time to circulate. "
+                             "Setting a cutoff focuses on items old enough that "
+                             "zero use is meaningful."
+                    )
+                    matched['_pubyear'] = pd.to_numeric(matched[h_pubyear], errors='coerce')
+
+        # KPIs
+        st.markdown("---")
+        st.subheader("Matching summary")
+
+        total_holdings = len(matched)
+        n_matched = (matched['_matched_via'] != 'unmatched').sum()
+        n_unmatched = total_holdings - n_matched
+        matched_only = matched[matched['_matched_via'] != 'unmatched']
+        n_matched_low = (matched_only['_usage_total'] <= threshold).sum()
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Holdings", f"{total_holdings:,}")
+        k2.metric("Matched to Usage", f"{n_matched:,}",
+                  f"{n_matched/max(1,total_holdings)*100:.1f}%")
+        if treat_unmatched_as_zero:
+            # Combined view: matched-low + unmatched are both treated as zero/low-use
+            n_combined = n_matched_low + n_unmatched
+            k3.metric(f"≤ {threshold:g} Use (combined)", f"{n_combined:,}",
+                      help="Matched-low + unmatched items, treated together "
+                           "since you've indicated unmatched = zero-use.")
+            k4.metric("Unmatched (now in main list)", f"{n_unmatched:,}",
+                      f"{n_unmatched/max(1,total_holdings)*100:.1f}%",
+                      help="These items are now folded into the zero/low-use list.")
+        else:
+            k3.metric(f"≤ {threshold:g} Use (matched)", f"{n_matched_low:,}",
+                      help="Items that joined to the usage file but had use ≤ threshold.")
+            k4.metric("Unmatched", f"{n_unmatched:,}",
+                      f"{n_unmatched/max(1,total_holdings)*100:.1f}%",
+                      help="Items in holdings with no row in the usage file. Likely "
+                           "zero-use, but could also indicate a coverage gap in the "
+                           "usage report.")
+
+        # Match-method breakdown
+        method_counts = matched['_matched_via'].value_counts()
+        if len(method_counts) > 1:
+            st.caption(
+                "**Match methods used:** " +
+                " · ".join([f"{m}: {c:,}" for m, c in method_counts.items()])
+            )
+
+        # ---- Match preview ----
+        # Show a sample of each match type with both holdings & usage rows side-by-side
+        # so users can sanity-check before trusting the join. Especially valuable for
+        # the title+author fallback, which is the highest-risk match type.
+        title_match_count = int(method_counts.get('title+author', 0))
+        with st.expander(
+            f"🔍 Match preview — spot-check the joins"
+            + (f" ({title_match_count:,} via title+author fallback — review!)"
+               if title_match_count > 0 else ""),
+            expanded=False
+        ):
+            st.caption(
+                "Random samples from each match type. The **title+author** "
+                "tab is the most important to review — it's the fallback when no "
+                "shared identifier exists, and it's the most likely place for "
+                "false positives (e.g., two unrelated books with similar titles "
+                "and the same first-token last name)."
+            )
+            # Build a sample-per-method preview, max 10 rows per method
+            preview_methods = [m for m in method_counts.index if m != 'unmatched']
+            if not preview_methods:
+                st.info("No matches to preview yet. Run with files that share an "
+                        "identifier or title column.")
+            else:
+                # Default to title+author tab if it exists (highest-risk to review)
+                preview_tab_labels = []
+                for m in preview_methods:
+                    n = int(method_counts[m])
+                    flag = " ⚠️" if m == 'title+author' else ""
+                    preview_tab_labels.append(f"{m} ({n:,}){flag}")
+                preview_tabs = st.tabs(preview_tab_labels)
+                # Build usage-side title/author lookups so we can show what we matched against
+                u_title_col = u_ids.get('title')
+                u_author_col = u_ids.get('author')
+                # Map each key column on the usage side to the original Title/Author columns
+                u_keys_by_type = dict(u_keys)
+                for tab_obj, method in zip(preview_tabs, preview_methods):
+                    with tab_obj:
+                        sample = matched[matched['_matched_via'] == method]
+                        sample_size = min(10, len(sample))
+                        if sample_size == 0:
+                            st.info("No items in this method.")
+                            continue
+                        sample = sample.sample(n=sample_size,
+                                               random_state=42).reset_index(drop=True)
+                        # Find the matching usage row(s) for each sample row,
+                        # using the same key column that produced the match.
+                        h_key_col = next((kc for kt, kc in h_keys if kt == method), None)
+                        u_key_col = u_keys_by_type.get(method)
+                        rows = []
+                        for _, hrow in sample.iterrows():
+                            h_title = (hrow.get(h_ids['title'], '—')
+                                       if h_ids.get('title') else '—')
+                            h_author = (hrow.get(h_ids['author'], '—')
+                                        if h_ids.get('author') else '—')
+                            # Find first matching usage row
+                            u_title = u_author = '—'
+                            if h_key_col and u_key_col:
+                                key_val = hrow.get(h_key_col)
+                                if pd.notna(key_val) and key_val:
+                                    matches_in_usage = usage_df[
+                                        usage_df[u_key_col] == key_val
+                                    ]
+                                    if not matches_in_usage.empty:
+                                        first = matches_in_usage.iloc[0]
+                                        if u_title_col:
+                                            u_title = first.get(u_title_col, '—')
+                                        if u_author_col:
+                                            u_author = first.get(u_author_col, '—')
+                            rows.append({
+                                'Holdings title': str(h_title)[:80],
+                                'Holdings author': str(h_author)[:50],
+                                'Usage title': str(u_title)[:80],
+                                'Usage author': str(u_author)[:50],
+                                'Total Use': hrow.get('_usage_total', 0),
+                            })
+                        preview_df = pd.DataFrame(rows)
+                        st.dataframe(preview_df, use_container_width=True,
+                                     hide_index=True, height=min(400, 50 + 35 * len(preview_df)))
+                        if method == 'title+author':
+                            st.caption(
+                                "💡 If the holdings and usage titles look like genuinely "
+                                "different books, your fallback joins are unreliable. "
+                                "Consider adding identifier columns to one or both files, "
+                                "or only trusting matches via ISBN/ISSN/DOI/OCLC."
+                            )
+
+        # Notes — annotate before downloading
+        notes = _notes_widget(
+            "zero_use",
+            placeholder="e.g., FY2025 e-journal cancellation review. "
+                        "Holdings = A-Z list export 11/1; usage = COUNTER TR_J3 (Jan-Oct)."
+        )
+
+        # Fresh tray for this render pass
+        _reset_tray("zero_use")
+
+        # Build the zero-use result set.
+        # Default (split): only MATCHED items with low use go in the main list.
+        # Unmatched items live in their own tab so users can review them
+        # separately. When the combine toggle is on, unmatched items are
+        # folded in (treating them as zero-use items the report didn't return).
+        if treat_unmatched_as_zero:
+            zero_use = matched[
+                ((matched['_matched_via'] != 'unmatched')
+                 & (matched['_usage_total'] <= threshold))
+                | (matched['_matched_via'] == 'unmatched')
+            ].copy()
+        else:
+            zero_use = matched[
+                (matched['_matched_via'] != 'unmatched')
+                & (matched['_usage_total'] <= threshold)
+            ].copy()
+        if pubyear_cutoff is not None and '_pubyear' in zero_use.columns:
+            zero_use = zero_use[zero_use['_pubyear'] < pubyear_cutoff]
+
+        # Tabs
+        st.markdown("---")
+        tabs_to_show = ["Zero/low-use list", "Unmatched items"]
+        if h_lc:
+            tabs_to_show.append("LC breakdown")
+        if h_format:
+            tabs_to_show.append("Format breakdown")
+        if h_pubyear:
+            tabs_to_show.append("Age distribution")
+        tab_objs = st.tabs(tabs_to_show)
+
+        # Build display columns once (used by Zero/low-use and Unmatched tabs)
+        display_cols = []
+        if h_ids.get('title'):
+            display_cols.append(h_ids['title'])
+        if h_ids.get('author'):
+            display_cols.append(h_ids['author'])
+        for k in ('isbn', 'issn', 'doi', 'oclc'):
+            if h_ids.get(k):
+                display_cols.append(h_ids[k])
+        if h_lc:
+            display_cols.append(h_lc)
+        if h_loc:
+            display_cols.append(h_loc)
+        if h_format:
+            display_cols.append(h_format)
+        if h_pubyear:
+            display_cols.append(h_pubyear)
+        # De-dup in case of overlap
+        seen = set()
+        display_cols = [c for c in display_cols if not (c in seen or seen.add(c))]
+
+        # --- Zero/low-use list ---
+        with tab_objs[0]:
+            cutoff_msg = (' AND were published before ' + str(pubyear_cutoff)
+                          if pubyear_cutoff else '')
+            if treat_unmatched_as_zero:
+                st.markdown(
+                    f"**{len(zero_use):,} items** flagged as zero/low-use "
+                    f"(matched ≤ {threshold:g} use **plus** unmatched "
+                    f"items){cutoff_msg}."
+                )
+                st.caption(
+                    "📌 Combining matched-low and unmatched items because "
+                    "**Treat unmatched as zero-use** is on in the sidebar. "
+                    "The `Matched Via` column shows which group each item "
+                    "came from."
+                )
+            else:
+                st.markdown(
+                    f"**{len(zero_use):,} items** in your holdings have ≤ "
+                    f"{threshold:g} use{cutoff_msg}."
+                )
+                if n_unmatched > 0:
+                    st.caption(
+                        f"📌 This list excludes the **{n_unmatched:,} unmatched** "
+                        "items (see the next tab). To merge them in, turn on "
+                        "**Treat unmatched as zero-use** in the sidebar."
+                    )
+            zero_cols = list(display_cols) + ['_matched_via', '_usage_total']
+            zero_cols = [c for c in zero_cols if c in zero_use.columns]
+            display_df = zero_use[zero_cols].rename(columns={
+                '_matched_via': 'Matched Via',
+                '_usage_total': 'Total Use',
+            }).sort_values('Total Use')
+
+            st.dataframe(display_df, use_container_width=True, height=500, hide_index=True)
+
+            _zu_fname = ("zero_use_items_combined.csv" if treat_unmatched_as_zero
+                         else "zero_use_items.csv")
+            _zu_view = ("Zero/Low-Use List (combined with unmatched)"
+                        if treat_unmatched_as_zero else "Zero/Low-Use List")
+            _zu_bytes = _annotate_csv(
+                display_df, notes,
+                extra_meta={'Tool': 'Zero-Use Identifier',
+                            'View': _zu_view,
+                            'Threshold': threshold,
+                            'Pub-year cutoff': pubyear_cutoff or 'none',
+                            'Treat unmatched as zero-use': treat_unmatched_as_zero,
+                            'Holdings rows': total_holdings,
+                            'Usage rows': len(usage_df),
+                            'Match keys': ', '.join(shared_keys)}
+            )
+            st.download_button("📥 Zero/low-use list (CSV)",
+                               _zu_bytes, _zu_fname, "text/csv",
+                               key="zu_dl_main")
+            _add_to_tray("zero_use", _zu_fname, _zu_bytes)
+
+        # --- Unmatched items ---
+        with tab_objs[1]:
+            unmatched_df = matched[matched['_matched_via'] == 'unmatched'].copy()
+            if treat_unmatched_as_zero:
+                st.success(
+                    f"📌 The **{len(unmatched_df):,} unmatched items** below are "
+                    "also included in the Zero/low-use list (combined view is on)."
+                )
+            st.markdown(
+                f"**{len(unmatched_df):,} items** in holdings could not be matched "
+                "to any usage row. These are *probably* zero-use, but they could "
+                "also indicate a coverage gap in the usage report (e.g., a vendor "
+                "that didn't return a row at all for a title with zero use)."
+            )
+            st.caption(
+                "Spot-check a few: if you find titles that *should* have appeared "
+                "in the usage file, your usage report is incomplete and the match "
+                "may be underestimating zero-use."
+            )
+            if not unmatched_df.empty:
+                um_cols = [c for c in display_cols if c in unmatched_df.columns]
+                um_display = unmatched_df[um_cols]
+                st.dataframe(um_display, use_container_width=True, height=400, hide_index=True)
+                _um_bytes = _annotate_csv(
+                    um_display, notes,
+                    extra_meta={'Tool': 'Zero-Use Identifier',
+                                'View': 'Unmatched Items',
+                                'Note': 'Items in holdings with no row in usage file'}
+                )
+                st.download_button("📥 Unmatched items (CSV)",
+                                   _um_bytes, "unmatched_items.csv", "text/csv",
+                                   key="zu_dl_unmatched")
+                _add_to_tray("zero_use", "unmatched_items.csv", _um_bytes)
+
+        # --- LC breakdown ---
+        idx = 2
+        if h_lc:
+            with tab_objs[idx]:
+                lc_summary = matched.groupby('_lc_main').agg(
+                    **{
+                        'Total Holdings': (h_lc, 'count'),
+                        'Total Use': ('_usage_total', 'sum'),
+                    }
+                ).reset_index().rename(columns={'_lc_main': 'LC Class'})
+                low_per_lc = matched[matched['_usage_total'] <= threshold].groupby('_lc_main').size()
+                lc_summary['Zero/Low-Use Items'] = lc_summary['LC Class'].map(low_per_lc).fillna(0).astype(int)
+                lc_summary['% Zero/Low-Use'] = (
+                    lc_summary['Zero/Low-Use Items'] / lc_summary['Total Holdings'] * 100
+                ).round(1)
+                lc_summary['Description'] = lc_summary['LC Class'].map(
+                    lambda c: LC_CLASSES.get(c, '?')
+                )
+                lc_summary = lc_summary[['LC Class', 'Description', 'Total Holdings',
+                                         'Total Use', 'Zero/Low-Use Items', '% Zero/Low-Use']]
+                lc_summary = lc_summary.sort_values('Zero/Low-Use Items', ascending=False)
+
+                st.markdown("**Where is the dead weight concentrated?**")
+                st.dataframe(lc_summary, use_container_width=True, hide_index=True, height=500)
+
+                fig = px.bar(
+                    lc_summary.head(15), x='% Zero/Low-Use', y='LC Class',
+                    orientation='h', color='% Zero/Low-Use',
+                    color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                    hover_data=['Description', 'Total Holdings', 'Zero/Low-Use Items'],
+                    title='% Zero/Low-Use by LC Class (top 15)',
+                )
+                fig.update_layout(yaxis={'categoryorder': 'total ascending'},
+                                  height=500, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+                _lc_bytes = _annotate_csv(
+                    lc_summary, notes,
+                    extra_meta={'Tool': 'Zero-Use Identifier', 'View': 'LC Breakdown',
+                                'Threshold': threshold}
+                )
+                st.download_button("📥 LC breakdown (CSV)",
+                                   _lc_bytes, "zero_use_by_lc.csv", "text/csv",
+                                   key="zu_dl_lc")
+                _add_to_tray("zero_use", "zero_use_by_lc.csv", _lc_bytes)
+            idx += 1
+
+        # --- Format breakdown ---
+        if h_format:
+            with tab_objs[idx]:
+                fmt_summary = matched.groupby(h_format).agg(
+                    **{
+                        'Total Holdings': (h_format, 'count'),
+                        'Total Use': ('_usage_total', 'sum'),
+                    }
+                ).reset_index()
+                low_per_fmt = matched[matched['_usage_total'] <= threshold].groupby(h_format).size()
+                fmt_summary['Zero/Low-Use Items'] = fmt_summary[h_format].map(low_per_fmt).fillna(0).astype(int)
+                fmt_summary['% Zero/Low-Use'] = (
+                    fmt_summary['Zero/Low-Use Items'] / fmt_summary['Total Holdings'] * 100
+                ).round(1)
+                fmt_summary = fmt_summary.sort_values('Zero/Low-Use Items', ascending=False)
+                st.dataframe(fmt_summary, use_container_width=True, hide_index=True)
+                _fmt_bytes = _annotate_csv(
+                    fmt_summary, notes,
+                    extra_meta={'Tool': 'Zero-Use Identifier', 'View': 'Format Breakdown',
+                                'Threshold': threshold}
+                )
+                st.download_button("📥 Format breakdown (CSV)",
+                                   _fmt_bytes, "zero_use_by_format.csv", "text/csv",
+                                   key="zu_dl_fmt")
+                _add_to_tray("zero_use", "zero_use_by_format.csv", _fmt_bytes)
+            idx += 1
+
+        # --- Age distribution ---
+        if h_pubyear:
+            with tab_objs[idx]:
+                # Ensure _pubyear exists (only added when optional cutoff is enabled)
+                if '_pubyear' not in matched.columns:
+                    matched['_pubyear'] = pd.to_numeric(matched[h_pubyear], errors='coerce')
+                age_df = matched.dropna(subset=['_pubyear']).copy()
+                if age_df.empty:
+                    st.info(f"Could not parse any values from `{h_pubyear}` as years.")
+                else:
+                    age_df['_pubyear'] = age_df['_pubyear'].astype(int)
+                    age_df['_is_zero'] = age_df['_usage_total'] <= threshold
+                    age_df['Decade'] = (age_df['_pubyear'] // 10 * 10).astype(int).astype(str) + 's'
+                    decade_summary = age_df.groupby('Decade').agg(
+                        Total=('_pubyear', 'count'),
+                        ZeroLowUse=('_is_zero', 'sum'),
+                    ).reset_index()
+                    decade_summary['% Zero/Low-Use'] = (
+                        decade_summary['ZeroLowUse'] / decade_summary['Total'] * 100
+                    ).round(1)
+                    decade_summary = decade_summary.sort_values('Decade')
+                    st.markdown("**Older items are more likely to sit unused — but how much?**")
+                    fig = px.bar(
+                        decade_summary, x='Decade', y='% Zero/Low-Use',
+                        color='% Zero/Low-Use',
+                        color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                        hover_data=['Total', 'ZeroLowUse'],
+                        title='% Zero/Low-Use by Publication Decade',
+                    )
+                    fig.update_layout(height=400, showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.dataframe(decade_summary, use_container_width=True, hide_index=True)
+
+        # Download tray
+        st.markdown("---")
+        st.subheader("Downloads")
+        _render_download_tray("zero_use", zip_filename="zero_use_results.zip")
+
+    except Exception as e:
+        st.error(f"❌ Error: {e}")
+        st.info("Check that both CSVs have at least a Title column or a shared "
+                "identifier (ISBN/ISSN/DOI/OCLC).")
+
+
 # =====================================================================
 # HOME PAGE & MAIN NAVIGATION
 # =====================================================================
@@ -3813,7 +4624,7 @@ def page_home():
     )
     st.markdown("---")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
 
     with c1:
         st.markdown("""
@@ -3851,7 +4662,27 @@ def page_home():
         </div>
         """, unsafe_allow_html=True)
 
+    c3, c4 = st.columns(2)
+
     with c3:
+        st.markdown("""
+        <div class="tool-card">
+            <h3>🔍 Zero-Use Identifier</h3>
+            <p><em>What do we own that isn't being used?</em></p>
+            <p>Compare a holdings list against a usage report to surface
+            titles, journals, or databases with no use at all.</p>
+            <hr>
+            <p><strong>Use for:</strong></p>
+            <ul>
+                <li>E-journal & database cancellation prep</li>
+                <li>Off-site storage candidates</li>
+                <li>Dead-weight in big-deal packages</li>
+                <li>Renewal evidence for admin/faculty</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with c4:
         st.markdown("""
         <div class="tool-card">
             <h3>📊 Acquisition Recommendation Scorer</h3>
@@ -3877,6 +4708,8 @@ def page_home():
     | Show what the collection covers (or doesn't) | **Collection Profiler** |
     | Decide which databases to renew or cancel | **Usage & Subscription Analyzer** → COUNTER |
     | Pick books to weed from the stacks | **Usage & Subscription Analyzer** → Print |
+    | Find what you own that's never been used | **Zero-Use Identifier** |
+    | Identify e-journal/package titles with no use | **Zero-Use Identifier** (holdings vs. COUNTER) |
     | Prioritize purchases from a vendor list | **Recommendation Scorer** |
     | Match new books to specific faculty research | **Recommendation Scorer** (with faculty file) |
     | Find areas with strong use relative to holdings (or weak) | **Collection Profiler** → Coverage vs. Use |
@@ -3913,6 +4746,7 @@ def main():
             ["🏠 Home",
              "🗺️ Collection Profiler",
              "📈 Usage & Subscription Analyzer",
+             "🔍 Zero-Use Identifier",
              "📊 Acquisition Recommendation Scorer"],
             index=0,
             key="nav"
@@ -3925,6 +4759,8 @@ def main():
         page_collection_profiler()
     elif page == "📈 Usage & Subscription Analyzer":
         page_usage_analyzer()
+    elif page == "🔍 Zero-Use Identifier":
+        page_zero_use_identifier()
     elif page == "📊 Acquisition Recommendation Scorer":
         page_recommendation_scorer()
 
