@@ -1834,9 +1834,9 @@ def page_collection_profiler():
 
     st.header("🗺️ Collection Profiler")
     st.markdown(
-        "**What does our collection look like?** Upload a title list with subject terms "
+        "**What does our collection look like?** Upload a title list from Alma or a vendor with subject terms "
         "and/or LC call numbers to map disciplinary strengths, spot gaps, and explore "
-        "subject coverage."
+        "subject coverage. If usage data is included, you will also be able to analyze Coverage vs.Usage trends"
     )
     with st.expander("ℹ️ When to use this tool"):
         st.markdown(
