@@ -1,14 +1,24 @@
 """
-Library Collection Dashboard v4.0
-================================
-Decision-Support Toolkit for Howard-Tilton Memorial Library
+Library Collection Dashboard
+============================
+A unified Streamlit application combining three collection decision-support tools:
 
-Tools:
-  1. Collection Profiler — LC/subject distribution & coverage vs. use.
-  2. Zero-Use Identifier — Identify low-ROI holdings. (placeholder)
-  3. Acquisition Scorer — Evidence-based purchasing. (placeholder)
+  1. Collection Profiler — "What does our collection look like?"
+     Sunburst, treemap, LC × subject heatmap, subject bars, word cloud, gap analysis.
+     Feeds collection assessment, accreditation, weeding prep, liaison planning.
 
-Updated: 2025 | Contact: Kay P Maye (kmaye@tulane.edu)
+  2. Usage & Subscription Analyzer — "What's being used and what isn't?"
+     Title-level usage analysis for COUNTER 5 e-resource reports and print
+     circulation data. Top titles, cancellation review, publisher rollups,
+     monthly trends. Feeds renewal, cancellation, and weeding decisions.
+
+  3. Acquisition Recommendation Scorer — "What should we buy next?"
+     Scores new candidate books against checkout history using subject
+     similarity, LC fit, author popularity, and faculty research interests.
+     Feeds purchasing, approval-plan review, and faculty request triage.
+
+v2.0 — Consolidated edition
+Contact: Kay P Maye (kmaye@tulane.edu)
 """
 
 import streamlit as st
@@ -16,471 +26,4889 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from collections import Counter, defaultdict
 import re
+import gc
+import unicodedata
+from io import BytesIO
+from difflib import SequenceMatcher
+
+# Conditional imports
+try:
+    from wordcloud import WordCloud
+    import matplotlib.pyplot as plt
+    WORDCLOUD_AVAILABLE = True
+except ImportError:
+    WORDCLOUD_AVAILABLE = False
+
+try:
+    import nltk
+    from nltk.stem import SnowballStemmer
+    from nltk.corpus import wordnet
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
+
 
 # =====================================================================
-# CONFIG & THEMING
+# PAGE CONFIG & GLOBAL CSS (Tulane palette)
 # =====================================================================
 
-st.set_page_config(page_title="Library Collection Dashboard", page_icon="📚", layout="wide")
+st.set_page_config(
+    page_title="Library Collection Dashboard",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 st.markdown("""
 <style>
-    :root { --tulane-green: #285C4D; --tulane-blue: #71C5E8; }
-    .stTabs [data-baseweb="tab-list"] { gap: 24px; }
-    .stTabs [data-baseweb="tab"] { height: 50px; font-weight: bold; font-size: 1.05rem; }
-    .tool-header { color: #285C4D; border-bottom: 2px solid #285C4D; padding-bottom: 5px; margin-bottom: 15px; }
-    .data-source-box { background-color: #f0f2f6; border-radius: 8px; padding: 15px; border-left: 5px solid #71C5E8; margin-bottom: 25px; }
-    .usage-guide { background-color: #eef6f3; border-radius: 8px; padding: 15px; border-left: 5px solid #285C4D; margin-bottom: 10px; }
-    .decision-box { background-color: #fff8e6; border-radius: 8px; padding: 15px; border-left: 5px solid #e6a800; margin-bottom: 20px; }
-    .stButton>button { background-color: #285C4D; color: white; border-radius: 6px; }
+:root {
+    --tulane-green: #285C4D;
+    --tulane-blue: #71C5E8;
+}
+.main > div { padding-top: 1.5rem; }
+.stButton>button {
+    background-color: #285C4D;
+    color: white;
+    font-weight: bold;
+    padding: 0.5rem 1rem;
+    border-radius: 5px;
+    border: none;
+    width: 100%;
+}
+.stButton>button:hover { background-color: #1e4a3c; }
+div[data-testid="metric-container"] {
+    background-color: #eef6f3;
+    border: 1px solid #285C4D;
+    padding: 10px;
+    border-radius: 5px;
+    margin: 5px 0;
+}
+.uploadbox {
+    /* deprecated — formerly wrapped file uploaders; kept only to avoid breaking any cached HTML */
+    display: none;
+}
+.decision-box {
+    background-color: #eef6f3;
+    border-left: 4px solid #285C4D;
+    padding: 15px 20px;
+    border-radius: 4px;
+    margin: 10px 0;
+}
+.tool-card {
+    background-color: #f8faf9;
+    border: 1px solid #d4e4df;
+    border-radius: 8px;
+    padding: 20px;
+    margin: 10px 0;
+    height: 100%;
+}
 </style>
 """, unsafe_allow_html=True)
 
+
 # =====================================================================
-# LC PARSING & NORMALIZATION HELPERS
+# SHARED: LC Classification reference
 # =====================================================================
 
-LC_MAIN_MAP = {
-    "A": "General Works",
-    "B": "Philosophy, Psychology, Religion",
-    "C": "Auxiliary Sciences of History",
-    "D": "World History",
-    "E": "History of the Americas",
-    "F": "History of the Americas (Local)",
-    "G": "Geography, Anthropology, Recreation",
-    "H": "Social Sciences",
-    "J": "Political Science",
-    "K": "Law",
-    "L": "Education",
-    "M": "Music",
-    "N": "Fine Arts",
-    "P": "Language & Literature",
-    "Q": "Science",
-    "R": "Medicine",
-    "S": "Agriculture",
-    "T": "Technology",
-    "U": "Military Science",
-    "V": "Naval Science",
-    "Z": "Bibliography, Library Science, Information Resources"
+LC_CLASSES = {
+    'A': 'General Works', 'B': 'Philosophy, Psychology, Religion',
+    'C': 'Auxiliary Sciences of History', 'D': 'World History',
+    'E': 'US History', 'F': 'History of the Americas',
+    'G': 'Geography, Anthropology, Recreation', 'H': 'Social Sciences',
+    'J': 'Political Science', 'K': 'Law', 'L': 'Education',
+    'M': 'Music & Books on Music', 'N': 'Fine Arts', 'P': 'Language & Literature',
+    'Q': 'Science', 'R': 'Medicine', 'S': 'Agriculture',
+    'T': 'Technology', 'U': 'Military Science', 'V': 'Naval Science',
+    'Z': 'Bibliography & Library Science'
 }
 
-def parse_lc_from_callnumber(callnum: str):
-    """
-    Parse LC main class and subclass from a call number string.
-    Returns (main_class_code, subclass_code, main_desc, subclass_desc).
-    """
-    if not isinstance(callnum, str) or not callnum.strip():
-        return ("Unclassified", "Unclassified", "Unclassified", "Unclassified")
-
-    # Basic LC pattern: 1–3 letters at start
-    m = re.match(r"^([A-Z]{1,3})", callnum.strip().upper())
-    if not m:
-        return ("Unclassified", "Unclassified", "Unclassified", "Unclassified")
-
-    subclass_code = m.group(1)
-    main_code = subclass_code[0]
-
-    main_desc = LC_MAIN_MAP.get(main_code, "Other / Non-LC")
-    # For now, subclass description is just the code; you can map further if desired
-    subclass_desc = f"{subclass_code} – LC Subclass"
-
-    return (main_code, subclass_code, main_desc, subclass_desc)
-
-
-def normalize_bibliographic_file(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize different file types into a common structure for the Collection Profiler.
-
-    Handles:
-    - Alma physical inventory / bib exports (with call numbers)
-    - Alma physical/digital usage exports
-    - ProQuest / LibCentral title lists (like the sample you provided)
-    """
-
-    df_norm = pd.DataFrame(index=df.index)
-
-    # ---------------- SUBJECT / INTELLECTUAL AREA ----------------
-    # Try to capture some subject text for later use
-    subject_col_candidates = [
-        "Subject", "Subjects", "LC Subject", "LC_Subject", "Subject_Heading"
-    ]
-    subj_col = next((c for c in subject_col_candidates if c in df.columns), None)
-    if subj_col:
-        df_norm["Subject_Heading"] = df[subj_col].astype(str)
-    else:
-        df_norm["Subject_Heading"] = "Unspecified"
-
-    # ---------------- CALL NUMBER → LC PARSING ----------------
-    callnum_candidates = [
-        "CallNumber", "Call Number", "Permanent Call Number",
-        "LC_CallNumber", "LC Call Number", "Call_Number"
-    ]
-    call_col = next((c for c in callnum_candidates if c in df.columns), None)
-
-    if call_col:
-        lc_parsed = df[call_col].apply(parse_lc_from_callnumber)
-        df_norm["LC_Main_Code"] = lc_parsed.apply(lambda x: x[0])
-        df_norm["LC_Subclass_Code"] = lc_parsed.apply(lambda x: x[1])
-        df_norm["Main_LC_Desc"] = lc_parsed.apply(lambda x: x[2])
-        df_norm["Subclass_Desc"] = lc_parsed.apply(lambda x: x[3])
-    else:
-        # No call numbers: derive pseudo-LC from subject strings (e.g., ProQuest LibCentral)
-        def derive_main(subject):
-            if pd.isna(subject) or not str(subject).strip():
-                return "Unclassified"
-            # Take first segment before ';' or ':'
-            return str(subject).split(";")[0].split(":")[0].strip()
-
-        def derive_sub(subject):
-            if pd.isna(subject) or not str(subject).strip():
-                return "Unclassified"
-            parts = str(subject).split(";")
-            return parts[1].strip() if len(parts) > 1 else "General"
-
-        df_norm["Main_LC_Desc"] = df_norm["Subject_Heading"].apply(derive_main)
-        df_norm["Subclass_Desc"] = df_norm["Subject_Heading"].apply(derive_sub)
-        df_norm["LC_Main_Code"] = df_norm["Main_LC_Desc"]
-        df_norm["LC_Subclass_Code"] = df_norm["Subclass_Desc"]
-
-    # ---------------- USAGE / DEMAND ----------------
-    usage_candidates = [
-        "Total Book Downloads",
-        "Read Online (post Trigger) Sessions",
-        "Total_Uses",
-        "Total Uses",
-        "Loans",
-        "Checkouts",
-        "Loan Count",
-        "Usage"
-    ]
-    usage_col = next((c for c in usage_candidates if c in df.columns), None)
-    if usage_col:
-        df_norm["Usage_Count"] = pd.to_numeric(df[usage_col], errors="coerce").fillna(0)
-    else:
-        df_norm["Usage_Count"] = 0
-
-    # ---------------- TITLE (OPTIONAL, FOR CONTEXT) ----------------
-    title_candidates = ["Title", "Bib Title", "MMS Title", "title"]
-    title_col = next((c for c in title_candidates if c in df.columns), None)
-    if title_col:
-        df_norm["Title"] = df[title_col].astype(str)
-    else:
-        df_norm["Title"] = ""
-
-    return df_norm
-
-
-def normalize_usage_file(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize a usage-only file so it can be compared to the bibliographic file.
-    We assume it has either call numbers or subjects.
-    """
-    df_norm = normalize_bibliographic_file(df)
-    return df_norm
+# LC subclass map — main letter → {two-letter subclass code → human label}
+# Sourced from the Library of Congress Classification Outline
+# (https://www.loc.gov/aba/cataloging/classification/lcco/) and the LC's
+# free per-class PDF schedules. Covers all 21 main classes.
+#
+# Coverage scope: the two-letter (alpha) subclasses only. The numerical
+# ranges below those (e.g., HQ 1000–1999) are not represented here because
+# the dashboard's matching only inspects the leading letters of a call
+# number — a richer breakdown isn't useful unless we change the parser.
+#
+# A few classes have notable nuances reflected here:
+#   - Class K (Law): the largest schedule, with subclasses spanning regions
+#     and religious/jurisdictional systems (KBM/KBP/KBR/KBU, KD-KDK, KJ-KKZ,
+#     KL-KWX). Three-letter codes like KBM, KDC, KDE, KDK are included where
+#     they're commonly seen in practice.
+#   - Class P (Language & Literature): includes both language subclasses
+#     (P-PM) and literature subclasses (PN-PZ).
+#   - Class E and Class F have no alpha subclasses in the standard schedule
+#     (they use numeric ranges only), so they're omitted from this dict.
+LC_SUBCLASSES = {
+    'A': {
+        'A': 'General Works (General)',
+        'AC': 'Collections, Series, Collected Works',
+        'AE': 'Encyclopedias',
+        'AG': 'Dictionaries & General Reference',
+        'AI': 'Indexes',
+        'AM': 'Museums, Collectors & Collecting',
+        'AN': 'Newspapers',
+        'AP': 'Periodicals',
+        'AS': 'Academies & Learned Societies',
+        'AY': 'Yearbooks, Almanacs, Directories',
+        'AZ': 'History of Scholarship & Learning',
+    },
+    'B': {
+        'B': 'Philosophy (General)',
+        'BC': 'Logic',
+        'BD': 'Speculative Philosophy',
+        'BF': 'Psychology',
+        'BH': 'Aesthetics',
+        'BJ': 'Ethics',
+        'BL': 'Religions, Mythology, Rationalism',
+        'BM': 'Judaism',
+        'BP': 'Islam, Bahai',
+        'BQ': 'Buddhism',
+        'BR': 'Christianity',
+        'BS': 'The Bible',
+        'BT': 'Doctrinal Theology',
+        'BV': 'Practical Theology',
+        'BX': 'Christian Denominations',
+    },
+    'C': {
+        'C': 'Auxiliary Sciences of History (General)',
+        'CB': 'History of Civilization',
+        'CC': 'Archaeology',
+        'CD': 'Diplomatics, Archives, Seals',
+        'CE': 'Technical Chronology, Calendar',
+        'CJ': 'Numismatics',
+        'CN': 'Inscriptions, Epigraphy',
+        'CR': 'Heraldry',
+        'CS': 'Genealogy',
+        'CT': 'Biography',
+    },
+    'D': {
+        'D': 'World History (General)',
+        'DA': 'History of Great Britain',
+        'DAW': 'History of Central Europe',
+        'DB': 'History of Austria, Hungary, Czechia, Slovakia',
+        'DC': 'History of France, Andorra, Monaco',
+        'DD': 'History of Germany',
+        'DE': 'History of the Greco-Roman World',
+        'DF': 'History of Greece',
+        'DG': 'History of Italy, Vatican, Malta',
+        'DH': 'History of Low Countries, Benelux',
+        'DJ': 'History of Netherlands',
+        'DJK': 'History of Eastern Europe (General)',
+        'DK': 'History of Russia, Soviet Union, Former Soviet Republics',
+        'DL': 'History of Northern Europe, Scandinavia',
+        'DP': 'History of Iberian Peninsula, Spain, Portugal',
+        'DQ': 'History of Switzerland',
+        'DR': 'History of Balkan Peninsula',
+        'DS': 'History of Asia',
+        'DT': 'History of Africa',
+        'DU': 'History of Oceania, Pacific Area',
+        'DX': 'History of Romani People',
+    },
+    # E and F have no alpha subclasses in the standard LC schedule —
+    # they use numeric ranges only (e.g., E11–143, F1–975). Not represented.
+    'G': {
+        'G': 'Geography (General), Atlases, Maps',
+        'GA': 'Mathematical Geography, Cartography',
+        'GB': 'Physical Geography',
+        'GC': 'Oceanography',
+        'GE': 'Environmental Sciences',
+        'GF': 'Human Ecology, Anthropogeography',
+        'GN': 'Anthropology',
+        'GR': 'Folklore',
+        'GT': 'Manners & Customs',
+        'GV': 'Recreation, Leisure',
+    },
+    'H': {
+        'H': 'Social Sciences (General)',
+        'HA': 'Statistics',
+        'HB': 'Economic Theory, Demography',
+        'HC': 'Economic History & Conditions',
+        'HD': 'Industries, Land Use, Labor',
+        'HE': 'Transportation & Communications',
+        'HF': 'Commerce',
+        'HG': 'Finance',
+        'HJ': 'Public Finance',
+        'HM': 'Sociology (General)',
+        'HN': 'Social History & Conditions',
+        'HQ': 'The Family, Marriage, Women, Sexuality',
+        'HS': 'Societies, Secret, Benevolent, etc.',
+        'HT': 'Communities, Classes, Races',
+        'HV': 'Social Pathology, Criminology, Welfare',
+        'HX': 'Socialism, Communism, Anarchism',
+    },
+    'J': {
+        'J': 'General Legislative & Executive Papers',
+        'JA': 'Political Science (General)',
+        'JC': 'Political Theory',
+        'JF': 'Political Institutions & Public Administration (General)',
+        'JJ': 'Political Institutions — North America',
+        'JK': 'Political Institutions — United States',
+        'JL': 'Political Institutions — Canada, Latin America',
+        'JN': 'Political Institutions — Europe',
+        'JQ': 'Political Institutions — Asia, Africa, Pacific',
+        'JS': 'Local Government, Municipal Government',
+        'JV': 'Colonies & Colonization, Migration',
+        'JX': 'International Law (obsolete; see JZ & KZ)',
+        'JZ': 'International Relations',
+    },
+    'K': {
+        'K': 'Law in General, Comparative & Uniform Law, Jurisprudence',
+        'KB': 'Religious Law (General), Comparative',
+        'KBM': 'Jewish Law',
+        'KBP': 'Islamic Law',
+        'KBR': 'History of Canon Law',
+        'KBU': 'Law of the Roman Catholic Church, Holy See',
+        'KD': 'Law of the United Kingdom & Ireland',
+        'KDC': 'Law of Scotland',
+        'KDE': 'Law of Northern Ireland',
+        'KDG': 'Law of Isle of Man, Channel Islands',
+        'KDK': 'Law of Ireland (Eire)',
+        'KDZ': 'America, North America (General)',
+        'KE': 'Law of Canada',
+        'KF': 'Law of the United States',
+        'KG': 'Law of Latin America, Mexico, Central America, West Indies',
+        'KH': 'Law of South America',
+        'KJ': 'Law of Europe (General)',
+        'KJA': 'Roman Law',
+        'KJC': 'Regional Comparative Law (Europe)',
+        'KJE': 'Regional Organization & Integration (Europe)',
+        'KJV': 'Law of France',
+        'KK': 'Law of Germany',
+        'KL': 'History of Law, Ancient Orient',
+        'KLA': 'Law of Russia, Soviet Union',
+        'KM': 'Law of Asia, Middle East, Southwest Asia',
+        'KN': 'Law of South, Southeast & East Asia',
+        'KP': 'Law of South, Southeast & East Asia (continued)',
+        'KQ': 'Law of Africa',
+        'KR': 'Law of Africa (continued)',
+        'KS': 'Law of Africa (continued)',
+        'KT': 'Law of Africa (continued)',
+        'KU': 'Law of Pacific Area',
+        'KV': 'Law of Pacific Area (continued)',
+        'KW': 'Law of Pacific Area, Antarctica',
+        'KZ': 'Law of Nations, International Law',
+    },
+    'L': {
+        'L': 'Education (General)',
+        'LA': 'History of Education',
+        'LB': 'Theory & Practice of Education',
+        'LC': 'Social Aspects of Education',
+        'LD': 'Individual Educational Institutions — United States',
+        'LE': 'Individual Educational Institutions — America (excluding US)',
+        'LF': 'Individual Educational Institutions — Europe',
+        'LG': 'Individual Educational Institutions — Asia, Africa, Oceania',
+        'LH': 'College & School Magazines & Papers',
+        'LJ': 'Student Fraternities & Societies, US',
+        'LT': 'Textbooks',
+    },
+    'M': {
+        'M': 'Music (Scores, Performance)',
+        'ML': 'Literature on Music',
+        'MT': 'Musical Instruction & Study',
+    },
+    'N': {
+        'N': 'Visual Arts (General)',
+        'NA': 'Architecture',
+        'NB': 'Sculpture',
+        'NC': 'Drawing, Design, Illustration',
+        'ND': 'Painting',
+        'NE': 'Print Media',
+        'NK': 'Decorative Arts',
+        'NX': 'Arts in General',
+    },
+    'P': {
+        'P': 'Philology & Linguistics (General)',
+        'PA': 'Greek & Latin Language & Literature',
+        'PB': 'Modern Languages, Celtic Languages',
+        'PC': 'Romance Languages',
+        'PD': 'Germanic & Scandinavian Languages',
+        'PE': 'English Language',
+        'PF': 'West Germanic Languages',
+        'PG': 'Slavic, Baltic, Albanian Languages',
+        'PH': 'Uralic & Basque Languages',
+        'PJ': 'Oriental Languages & Literatures',
+        'PK': 'Indo-Iranian Languages & Literatures',
+        'PL': 'Languages & Literatures of East Asia, Africa, Oceania',
+        'PM': 'Hyperborean, Indigenous American & Artificial Languages',
+        'PN': 'Literature (General)',
+        'PQ': 'French, Italian, Spanish, Portuguese Literatures',
+        'PR': 'English Literature',
+        'PS': 'American Literature',
+        'PT': 'German, Dutch, Scandinavian Literatures',
+        'PZ': 'Fiction & Juvenile Belles Lettres',
+    },
+    'Q': {
+        'Q': 'Science (General)',
+        'QA': 'Mathematics (incl. Computer Science)',
+        'QB': 'Astronomy',
+        'QC': 'Physics',
+        'QD': 'Chemistry',
+        'QE': 'Geology',
+        'QH': 'Natural History, Biology (General)',
+        'QK': 'Botany',
+        'QL': 'Zoology',
+        'QM': 'Human Anatomy',
+        'QP': 'Physiology',
+        'QR': 'Microbiology',
+    },
+    'R': {
+        'R': 'Medicine (General)',
+        'RA': 'Public Aspects of Medicine',
+        'RB': 'Pathology',
+        'RC': 'Internal Medicine',
+        'RD': 'Surgery',
+        'RE': 'Ophthalmology',
+        'RF': 'Otorhinolaryngology',
+        'RG': 'Gynecology & Obstetrics',
+        'RJ': 'Pediatrics',
+        'RK': 'Dentistry',
+        'RL': 'Dermatology',
+        'RM': 'Therapeutics, Pharmacology',
+        'RS': 'Pharmacy & Materia Medica',
+        'RT': 'Nursing',
+        'RV': 'Botanic, Thomsonian & Eclectic Medicine',
+        'RX': 'Homeopathy',
+        'RZ': 'Other Systems of Medicine (incl. Chiropractic)',
+    },
+    'S': {
+        'S': 'Agriculture (General)',
+        'SB': 'Plant Culture, Horticulture',
+        'SD': 'Forestry',
+        'SF': 'Animal Culture, Veterinary Medicine',
+        'SH': 'Aquaculture, Fisheries, Angling',
+        'SK': 'Hunting Sports',
+    },
+    'T': {
+        'T': 'Technology (General)',
+        'TA': 'Engineering (General), Civil Engineering',
+        'TC': 'Hydraulic & Ocean Engineering',
+        'TD': 'Environmental Technology, Sanitary Engineering',
+        'TE': 'Highway Engineering, Roads & Pavements',
+        'TF': 'Railroad Engineering & Operation',
+        'TG': 'Bridge Engineering',
+        'TH': 'Building Construction',
+        'TJ': 'Mechanical Engineering & Machinery',
+        'TK': 'Electrical & Nuclear Engineering, Electronics',
+        'TL': 'Motor Vehicles, Aeronautics, Astronautics',
+        'TN': 'Mining Engineering, Metallurgy',
+        'TP': 'Chemical Technology',
+        'TR': 'Photography',
+        'TS': 'Manufactures',
+        'TT': 'Handicrafts, Arts & Crafts',
+        'TX': 'Home Economics',
+    },
+    'U': {
+        'U': 'Military Science (General)',
+        'UA': 'Armies: Organization, Description, Facilities',
+        'UB': 'Military Administration',
+        'UC': 'Maintenance & Transportation',
+        'UD': 'Infantry',
+        'UE': 'Cavalry, Armor',
+        'UF': 'Artillery',
+        'UG': 'Military Engineering, Air Forces, Air Warfare',
+        'UH': 'Other Military Services (Medical, Welfare, etc.)',
+    },
+    'V': {
+        'V': 'Naval Science (General)',
+        'VA': 'Navies: Organization, Description, Facilities',
+        'VB': 'Naval Administration',
+        'VC': 'Naval Maintenance',
+        'VD': 'Naval Seamen',
+        'VE': 'Marines',
+        'VF': 'Naval Ordnance',
+        'VG': 'Minor Naval Services',
+        'VK': 'Navigation, Merchant Marine',
+        'VM': 'Naval Architecture, Shipbuilding, Marine Engineering',
+    },
+    'Z': {
+        'Z': 'Bibliography, Library Science, Information Resources (General)',
+        'ZA': 'Information Resources, Information Science',
+    },
+}
 
 
 # =====================================================================
-# HOME PAGE
+# SHARED: Text normalization & LC utilities
 # =====================================================================
 
-def page_home():
-    st.title("🏛️ Library Collection Decision Support Dashboard")
+_RE_DATE_PAREN = re.compile(r'\s*\([0-9\-]+\)')
+_RE_MULTI_SPACE = re.compile(r'\s+')
+_RE_DASH_SPACE = re.compile(r'\s*-\s*')
 
+
+def normalize_text(text):
+    """Lowercase → strip accents → clean punctuation → collapse whitespace."""
+    if pd.isna(text) or not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def clean_subject_term(term):
+    """Clean and standardize a single subject term."""
+    if pd.isna(term) or not isinstance(term, str) or term.strip() == '':
+        return None
+    s = term.strip().rstrip('.;- ')
+    s = _RE_DATE_PAREN.sub('', s)
+    s = s.replace('--', ' - ')
+    s = _RE_DASH_SPACE.sub(' - ', s)
+    s = _RE_MULTI_SPACE.sub(' ', s).strip()
+    return s.lower() if s else None
+
+
+def split_subjects(raw_subjects):
+    """Split on ; | , newline and normalize each piece."""
+    if pd.isna(raw_subjects) or not isinstance(raw_subjects, str):
+        return []
+    parts = re.split(r"[;|,\n]", raw_subjects)
+    return [normalize_text(p) for p in parts if normalize_text(p)]
+
+
+def extract_lc_prefix(lc_class):
+    """Extract LC letter prefix from a call number string."""
+    if pd.isna(lc_class):
+        return None
+    match = re.match(r"^([A-Z]{1,3})", str(lc_class).strip().upper())
+    return match.group(1) if match else None
+
+
+def _extract_lc_vectorized(series):
+    """Vectorized LC class extraction — returns (main_class, subclass) Series."""
+    cleaned = series.astype(str).str.strip().str.upper()
+    letters = cleaned.str.extract(r'^([A-Z]{1,3})', expand=False)
+    main_class = letters.str[0]
+    mask = series.isna() | (series.astype(str).str.strip() == '')
+    main_class = main_class.where(~mask, other=None)
+    letters = letters.where(~mask, other=None)
+    return main_class, letters
+
+
+# Title-keyword analysis ------------------------------------------------------
+# A separate lens from subject headings: titles are uncontrolled vocabulary, so
+# we strip a generous stopword list (English + publishing/library noise) before
+# counting. This view is supplementary — it surfaces vocabulary that subject
+# headings missed (newer concepts, methodological terms, interdisciplinary
+# phrases) without diluting the controlled-vocabulary subject analysis.
+TITLE_STOPWORDS = frozenset({
+    # Articles, conjunctions, prepositions, pronouns, common verbs
+    'a', 'an', 'the', 'and', 'or', 'but', 'nor', 'so', 'yet', 'for',
+    'of', 'in', 'on', 'at', 'to', 'from', 'by', 'with', 'without', 'about',
+    'as', 'into', 'onto', 'upon', 'over', 'under', 'through', 'across',
+    'after', 'before', 'between', 'among', 'against', 'during', 'until',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+    'has', 'have', 'had', 'having', 'do', 'does', 'did', 'doing',
+    'this', 'that', 'these', 'those', 'it', 'its', "it's",
+    'i', 'you', 'he', 'she', 'we', 'they', 'them', 'us', 'our', 'their',
+    'his', 'her', 'my', 'your',
+    'not', 'no', 'yes', 'if', 'then', 'than', 'when', 'where', 'why', 'how',
+    'what', 'which', 'who', 'whom', 'whose',
+    'all', 'any', 'some', 'each', 'every', 'other', 'another', 'such',
+    'will', 'would', 'can', 'could', 'should', 'may', 'might', 'must',
+    'shall', 'one', 'two', 'three', 'first', 'second', 'third',
+    # Generic publishing / book-title noise
+    'introduction', 'introductory', 'guide', 'handbook', 'companion',
+    'reader', 'manual', 'primer', 'textbook', 'workbook', 'casebook',
+    'overview', 'survey', 'review', 'reviews', 'essays', 'essay',
+    'studies', 'study', 'research', 'researches', 'analysis', 'analyses',
+    'approach', 'approaches', 'perspective', 'perspectives',
+    'edition', 'ed', 'eds', 'editor', 'editors', 'edited', 'rev', 'revised',
+    'volume', 'vol', 'vols', 'series', 'collection', 'selected', 'works',
+    'new', 'newer', 'newest', 'modern', 'contemporary', 'recent',
+    'practical', 'theoretical', 'theory', 'theories',
+    'principles', 'principle', 'fundamentals', 'fundamental', 'basics', 'basic',
+    'concepts', 'concept', 'topics', 'topic', 'issues', 'issue',
+    'history', 'introduction', 'making', 'understanding',
+    # Single letters (strays from initials, "u s" from "U.S.", roman numerals)
+    'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    'ii', 'iii', 'iv', 'vi', 'vii', 'viii', 'ix', 'xi', 'xii',
+    # Subtitle / format words common in book titles
+    'using', 'use', 'used', 'within', 'across', 'toward', 'towards',
+    'more', 'most', 'less', 'least', 'much', 'many', 'few', 'fewer',
+    'years', 'year', 'century', 'centuries', 'decade', 'decades',
+    'today', 'tomorrow', 'yesterday',
+    'also', 'just', 'only', 'even', 'still', 'already', 'always', 'never',
+    'really', 'actually', 'simply', 'indeed', 'thus', 'hence',
+    'beyond', 'around', 'something', 'someone', 'anything', 'nothing',
+})
+
+_RE_TITLE_TOKEN = re.compile(r"[A-Za-z][A-Za-z'\-]+")
+# Split a title into segments at subtitle/clause boundaries so n-grams don't
+# cross conceptual breaks (e.g., "Insurgent Cuba: Race, Nation, and Revolution"
+# should not produce the bigram "cuba race"). Splits on : ; — – and commas.
+_RE_TITLE_SEGMENT = re.compile(r"[:;,()\[\]\u2013\u2014/\\]+|\s-\s")
+
+
+def _tokenize_title_segments(title, min_len=4, extra_stopwords=None):
+    """Return a list of token-lists, one per subtitle/clause segment.
+
+    N-gram extraction respects segment boundaries, so phrases like 'race nation'
+    won't be formed across a colon or comma. Within each segment, stopwords
+    and short tokens are dropped.
+    """
+    if not isinstance(title, str) or not title.strip():
+        return []
+    stops = TITLE_STOPWORDS if not extra_stopwords else (TITLE_STOPWORDS | extra_stopwords)
+    segments_raw = _RE_TITLE_SEGMENT.split(title.lower())
+    segments = []
+    for seg in segments_raw:
+        raw_tokens = _RE_TITLE_TOKEN.findall(seg)
+        kept = []
+        for tok in raw_tokens:
+            tok = tok.strip("'-")
+            if len(tok) < min_len:
+                continue
+            if tok in stops:
+                continue
+            if tok.isdigit():
+                continue
+            kept.append(tok)
+        if kept:
+            segments.append(kept)
+    return segments
+
+
+def _tokenize_title(title, min_len=4, extra_stopwords=None):
+    """Flat token list (preserves segment-aware filtering). Kept for callers
+    that just want unigrams without segment structure."""
+    return [tok for seg in _tokenize_title_segments(title, min_len, extra_stopwords)
+            for tok in seg]
+
+
+def _extract_ngrams(segments, n_values=(1,)):
+    """Yield (n, ngram_string) tuples from segment-aware token lists.
+
+    n_values controls which sizes to extract. N-grams of size n require a
+    segment of length ≥ n; they never cross segment boundaries.
+    """
+    for seg in segments:
+        for n in n_values:
+            if n < 1 or len(seg) < n:
+                continue
+            for i in range(len(seg) - n + 1):
+                yield n, ' '.join(seg[i:i + n])
+
+
+# =====================================================================
+# SHARED: Column detection & CSV loading
+# =====================================================================
+
+SUBJECT_ALIASES = ['Subjects', 'Subject', 'Subject Terms', 'Subject Headings',
+                   'SUBJECT', 'subject_terms', 'Topics']
+LC_ALIASES = ['LC Classification Code', 'LC Classification', 'LC Class',
+              'Call Number', 'CallNumber', 'call_number', 'Call #',
+              'LC Call Number', 'LCC', 'Classification', 'lc_classification']
+TITLE_ALIASES = ['Title', 'title', 'TITLE', 'Book Title', 'Item Title']
+WEIGHT_ALIASES = ['Loans', 'Loans (Total)', 'Checkouts', 'Circulation',
+                  'Total_Item_Requests', 'Unique_Item_Requests',
+                  'Total_Item_Investigations', 'Usage', 'Uses', 'Count',
+                  'Digital File Downloads', 'Digital File Views', 'checkouts',
+                  # ProQuest / Ebook Central title reports
+                  'Total Book Downloads', 'Book Downloads', 'Downloads',
+                  'Read Online (post Trigger) Sessions',
+                  'Read Online Sessions', 'Sessions',
+                  # Other vendor variants
+                  'Views', 'Requests', 'Hits', 'Total Uses']
+
+# Identifier columns for cross-file matching (used by Zero-Use Identifier).
+# ISBN/ISSN/DOI/OCLC are reliable join keys; title+author is the fallback
+# when identifiers are absent.
+ISBN_ALIASES = ['ISBN', 'isbn', 'ISBN-13', 'ISBN13', 'ISBN-10', 'ISBN10',
+                'eISBN', 'Print ISBN', 'Online ISBN', 'Print_ISBN', 'Online_ISBN']
+ISSN_ALIASES = ['ISSN', 'issn', 'eISSN', 'Print ISSN', 'Online ISSN',
+                'Print_ISSN', 'Online_ISSN']
+DOI_ALIASES = ['DOI', 'doi', 'DOI Link']
+OCLC_ALIASES = ['OCLC', 'OCLC Number', 'OCLC #', 'OCLC_Number',
+                'WorldCat Number', 'OCN']
+AUTHOR_ALIASES = ['Author', 'author', 'AUTHOR', 'Creator', 'Authors',
+                  'Primary Author', 'Main Author']
+
+
+def find_column(df_or_cols, aliases, partial=True):
+    """Find a column matching any alias. Accepts a DataFrame or list of column names."""
+    cols = list(df_or_cols.columns) if isinstance(df_or_cols, pd.DataFrame) else list(df_or_cols)
+    for alias in aliases:
+        if alias in cols:
+            return alias
+        if partial:
+            for col in cols:
+                if alias.lower() in col.lower():
+                    return col
+    return None
+
+
+def _detect_columns_from_header(file_bytes):
+    """Read only the header row to detect column names without loading all data."""
+    try:
+        header = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', nrows=0)
+    except Exception:
+        header = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', nrows=0)
+    return [c.strip() for c in header.columns]
+
+
+@st.cache_data(show_spinner=False)
+def _load_csv_chunked(file_bytes, filename, cols_to_keep=None):
+    """Load CSV with minimal memory footprint."""
+    try:
+        df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False,
+                         usecols=cols_to_keep)
+    except Exception:
+        try:
+            df = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', low_memory=False,
+                             usecols=cols_to_keep)
+        except Exception:
+            try:
+                df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False)
+            except Exception:
+                df = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', low_memory=False)
+    df.columns = df.columns.str.strip()
+    return df
+
+
+# =====================================================================
+# SHARED: Footer & decision-box helper
+# =====================================================================
+
+def _footer():
+    st.markdown("---")
     st.markdown("""
-    This dashboard consolidates three tools to support **collection development, weeding, and strategic purchasing**.
-    Use the sidebar to navigate between tools.
-    """)
-
-    st.divider()
-
-    tools = [
-        ("🗺️", "Collection Profiler",
-         "Analyze LC/subject distribution and compare coverage vs. use.",
-         [
-             "Where are we over- or under-collecting?",
-             "Which LC/subject areas show unmet demand?",
-             "Which subjects need liaison or programmatic attention?"
-         ]),
-        ("🔍", "Zero-Use Identifier",
-         "Identify holdings with no recorded use to support deselection or storage decisions.",
-         [
-             "Which items are candidates for off-site storage?",
-             "Which areas show persistent non-use?",
-             "What is the ROI of specific donor or package collections?"
-         ]),
-        ("📊", "Acquisition Scorer",
-         "Score candidate titles using local usage patterns and subject trends.",
-         [
-             "Which titles should we prioritize?",
-             "How do vendor lists align with local needs?",
-             "Where should end-of-year funds be focused?"
-         ])
-    ]
-
-    for icon, title, desc, decisions in tools:
-        st.markdown(f"<h3 class='tool-header'>{icon} {title}</h3>", unsafe_allow_html=True)
-        col1, col2 = st.columns([1.2, 1])
-        with col1:
-            st.markdown(
-                f"<div class='usage-guide'><strong>What it does:</strong><br>{desc}</div>",
-                unsafe_allow_html=True
-            )
-        with col2:
-            st.markdown(
-                "<div class='decision-box'><strong>Supports decisions such as:</strong><ul>" +
-                "".join([f"<li>{d}</li>" for d in decisions]) +
-                "</ul></div>",
-                unsafe_allow_html=True
-            )
-        st.divider()
+    <div style='text-align: center; color: #666;'>
+        <p>Library Collection Dashboard v2.0  built with Claude| Howard-Tilton Memorial Library, Tulane University</p>
+        <p>For support, contact Kay P Maye at kmaye@tulane.edu</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 
+def _decision_box(title, body_md):
+    """Render a styled 'when to use this' callout using native Streamlit.
+
+    Uses st.container with a border and markdown inside, which renders reliably
+    regardless of indentation quirks in HTML-in-markdown.
+    """
+    with st.container(border=True):
+        st.markdown(f"**📌 {title}**")
+        st.markdown(body_md)
+
+
+# =====================================================================
+# SHARED: Session caching (across tool switches)
+# =====================================================================
+# Streamlit's @st.cache_data handles the raw CSV parse, but we also want to
+# cache the post-processing work (LC extraction, weight coercion, etc.) so
+# switching between tools and coming back doesn't force a re-setup.
+# Key scheme: one cache slot per tool, keyed by (filename, filesize).
+
+def _make_file_key(uploaded_file):
+    """Build a stable cache key from an uploaded file object."""
+    if uploaded_file is None:
+        return None
+    try:
+        return (uploaded_file.name, uploaded_file.size)
+    except AttributeError:
+        # Fallback for file-like objects without .size
+        return (uploaded_file.name, None)
+
+
+def _cached_df_for_tool(tool_key, uploaded_file):
+    """Retrieve a cached processed DataFrame for this tool+file, if it exists.
+
+    Returns the cached df, or None if nothing matches (caller should do the load).
+    """
+    cache_key = f"_df_cache_{tool_key}"
+    file_key = _make_file_key(uploaded_file)
+    cached = st.session_state.get(cache_key)
+    if cached and cached.get('file_key') == file_key:
+        return cached.get('df')
+    return None
+
+
+def _store_cached_df(tool_key, uploaded_file, df):
+    """Store a processed DataFrame in session state for this tool+file."""
+    cache_key = f"_df_cache_{tool_key}"
+    st.session_state[cache_key] = {
+        'file_key': _make_file_key(uploaded_file),
+        'df': df,
+    }
+
+
+# =====================================================================
+# SHARED: Analysis notes
+# =====================================================================
+# Users can attach free-text notes to any analysis; these travel with downloads
+# as a header comment and can be reviewed later. Notes persist per tool in
+# session state, keyed by tool so switching tools doesn't lose them.
+
+def _notes_widget(tool_key, label="📝 Analysis notes", placeholder=None):
+    """Render a notes text area and return its current value.
+
+    The value persists in session_state so it survives reruns and tool switches.
+    Intended to be called near the top of each tool's analysis output so users
+    can annotate *before* downloading.
+    """
+    note_key = f"_notes_{tool_key}"
+    if note_key not in st.session_state:
+        st.session_state[note_key] = ""
+
+    placeholder = placeholder or (
+        "e.g., Prepared for sociology liaison meeting, Nov 2025. "
+        "Follow-up: discuss HQ underperformance with Dr. Chen."
+    )
+
+    with st.expander(label, expanded=False):
+        st.caption("Notes are saved in this session and included as a header comment "
+                   "in any CSV you download below. They won't persist if you close "
+                   "the browser tab.")
+        notes = st.text_area(
+            "Add context, rationale, or follow-up items:",
+            value=st.session_state[note_key],
+            placeholder=placeholder,
+            key=f"{note_key}_widget",
+            height=100,
+        )
+        st.session_state[note_key] = notes
+    return notes
+
+
+def _annotate_csv(df, notes, extra_meta=None):
+    """Return CSV bytes with an optional notes header block prepended.
+
+    The notes appear as CSV comment lines (prefixed with #) which Excel reads
+    as a single first row but most CSV libraries skip. Kept simple and portable.
+    """
+    from io import StringIO
+    from datetime import datetime
+
+    lines = []
+    lines.append(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    if extra_meta:
+        for k, v in extra_meta.items():
+            lines.append(f"# {k}: {v}")
+    if notes and notes.strip():
+        lines.append("# Notes:")
+        for ln in notes.strip().splitlines():
+            lines.append(f"#   {ln}")
+    lines.append("")  # blank line before CSV body
+
+    buf = StringIO()
+    if lines:
+        buf.write("\n".join(lines) + "\n")
+    df.to_csv(buf, index=False)
+    return buf.getvalue()
+
+
+# =====================================================================
+# SHARED: Download tray
+# =====================================================================
+# Collects every downloadable artifact produced during a single tool run
+# so users can grab everything as one ZIP at the end of the page instead
+# of hunting for individual buttons.
+#
+# Usage: alongside an existing st.download_button, call
+#     _add_to_tray(tool_key, filename, data)
+# Then at the end of the tool's output, call
+#     _render_download_tray(tool_key)
+# to render a "Download all (ZIP)" button.
+
+def _reset_tray(tool_key):
+    """Clear the tray for this tool. Call at the start of a fresh render pass
+    so stale artifacts from a previous run don't leak into the ZIP."""
+    st.session_state[f"_tray_{tool_key}"] = []
+
+
+def _add_to_tray(tool_key, filename, data):
+    """Register a downloadable artifact (CSV string or bytes) for this tool."""
+    tray_key = f"_tray_{tool_key}"
+    if tray_key not in st.session_state:
+        st.session_state[tray_key] = []
+    # De-dup: if this filename is already in the tray, overwrite it
+    tray = st.session_state[tray_key]
+    tray[:] = [item for item in tray if item[0] != filename]
+    tray.append((filename, data))
+
+
+def _render_download_tray(tool_key, zip_filename="results.zip"):
+    """Render a 'Download all' button that bundles everything in the tray."""
+    tray = st.session_state.get(f"_tray_{tool_key}", [])
+    if not tray:
+        return
+    import zipfile
+    from io import BytesIO as _BIO
+    buf = _BIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, data in tray:
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            zf.writestr(filename, data)
+    buf.seek(0)
+    count = len(tray)
+    st.download_button(
+        f"📦 Download all ({count} file{'s' if count != 1 else ''}) as ZIP",
+        buf.getvalue(),
+        zip_filename,
+        "application/zip",
+        key=f"_tray_dl_{tool_key}",
+        use_container_width=True,
+        type="primary",
+    )
+    with st.expander(f"Files included ({count})", expanded=False):
+        for filename, _ in tray:
+            st.caption(f"• {filename}")
+
+
+def _dl(label, data, filename, mime, key, tool_key=None):
+    """Render a download button AND stash it in the tool's tray.
+
+    Thin wrapper over st.download_button so existing call sites can be
+    converted with minimal change.
+    """
+    st.download_button(label, data, filename, mime, key=key)
+    if tool_key is not None:
+        _add_to_tray(tool_key, filename, data)
+
+
+# =====================================================================
 # =====================================================================
 # TOOL 1: COLLECTION PROFILER
 # =====================================================================
+# "What does our collection look like?"
+# Merged from: Collection Strengths Tool + Use Analysis Tool (word cloud)
+# =====================================================================
+# =====================================================================
 
-def page_collection_profiler():
-    st.title("🗺️ Collection Profiler & Subject Analysis")
+CHUNK_SIZE = 50_000
 
-    st.markdown("""
-    Use this tool to understand the **shape of your collection** and how it aligns with **actual use**.
 
-    It can work with:
-    - Alma physical inventory / bib exports (with call numbers)
-    - Alma physical or digital usage exports
-    - ProQuest / LibCentral title lists (like the sample you provided)
-    """)
+def _profiler_process_subjects_chunk(subj_series, weight_series, lc_series,
+                                     subject_counter, subject_by_lc):
+    """Build subject frequency tables in one pass, optionally broken down by LC."""
+    subj_arr = subj_series.values
+    weight_arr = weight_series.values
+    lc_arr = lc_series.values
+    for i in range(len(subj_arr)):
+        raw = subj_arr[i]
+        if not isinstance(raw, str) or raw == '':
+            continue
+        w = weight_arr[i]
+        lc = lc_arr[i]
+        parts = raw.split(';')
+        for part in parts:
+            cleaned = clean_subject_term(part)
+            if cleaned:
+                subject_counter[cleaned] += w
+                # Also count subclass components for deeper word cloud richness
+                if ' - ' in cleaned:
+                    for comp in cleaned.split(' - '):
+                        comp = comp.strip()
+                        if comp:
+                            subject_counter[comp] += w
+                if lc is not None and isinstance(lc, str):
+                    subject_by_lc[lc][cleaned] += w
 
-    st.divider()
 
-    # Sidebar controls
-    with st.sidebar:
-        st.header("⚙️ Display Settings")
-        chart_height = st.slider("Chart Height", 400, 1400, 800)
-        show_table = st.checkbox("Show Data Tables", True)
+def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
+                           selected_classes, progress_bar,
+                           has_usage_col=False, ngram_sizes=(1, 2, 3)):
+    """Single pass that builds everything: LC counts, subject counter, subject-by-LC, gaps.
 
-        st.header("📁 Data Files")
-        st.caption("Upload at least one bibliographic or title list file.")
-        bib_file = st.file_uploader("Title / Inventory / Vendor List CSV", type="csv")
-        use_file = st.file_uploader("Usage / Circulation CSV (Optional)", type="csv")
+    When a usage column is present in the dataframe (indicated by `has_usage_col=True`),
+    also computes a second set of LC counts using usage weighting — this is what powers
+    the Coverage-vs-Use view. The weight_col parameter controls the primary analysis;
+    the secondary pass always uses the '_weight' column (which holds usage values).
 
-    if not bib_file:
-        st.info("Upload a bibliographic or title list file to begin (e.g., Alma inventory, ProQuest LibCentral).")
+    `ngram_sizes` controls which title-keyword n-gram sizes are extracted
+    (1=words, 2=bigrams, 3=trigrams). All sizes are stored together in a single
+    counter keyed by (size, phrase); the renderer filters by size.
+    """
+    n_total = len(df)
+    if selected_classes is not None and lc_col:
+        mask = df['_lc_main'].isin(selected_classes) | df['_lc_main'].isna()
+        idx = df.index[mask]
+    else:
+        idx = df.index
+    n_records = len(idx)
+    if weight_col:
+        weight_all = df.loc[idx, weight_col]
+    else:
+        weight_all = pd.Series(1.0, index=idx)
+    total_weight = weight_all.sum()
+    results = {'n_records': n_records, 'total_weight': total_weight}
+    progress_bar.progress(5, "Analyzing LC classifications...")
+
+    if lc_col:
+        lc_main = df.loc[idx, '_lc_main'].dropna()
+        lc_sub = df.loc[idx, '_lc_sub'].dropna()
+        lc_main_w = weight_all.reindex(lc_main.index)
+        lc_sub_w = weight_all.reindex(lc_sub.index)
+        lc_main_counts = lc_main_w.groupby(lc_main).sum().to_dict()
+        lc_sub_counts = lc_sub_w.groupby(lc_sub).sum().to_dict()
+
+        sunburst_rows = []
+        for mc, mcount in sorted(lc_main_counts.items(), key=lambda x: -x[1]):
+            label = LC_CLASSES.get(mc, mc)
+            sunburst_rows.append({'id': mc, 'parent': '', 'label': f"{mc} – {label}", 'value': mcount})
+            sub_dict = LC_SUBCLASSES.get(mc, {})
+            for sc, scount in sorted(lc_sub_counts.items(), key=lambda x: -x[1]):
+                if sc.startswith(mc) and sc != mc:
+                    sl = sub_dict.get(sc, sc)
+                    sunburst_rows.append({'id': sc, 'parent': mc, 'label': f"{sc} – {sl}", 'value': scount})
+        results['lc_main_counts'] = lc_main_counts
+        results['lc_sub_counts'] = lc_sub_counts
+        results['sunburst_data'] = sunburst_rows
+
+        # Coverage vs. Use: compute BOTH title-count and usage-weighted distributions
+        # (regardless of primary weight_col) when a usage column is present
+        if has_usage_col:
+            # Title counts (always weight=1)
+            titles_main = pd.Series(1.0, index=lc_main.index).groupby(lc_main).sum().to_dict()
+            titles_sub = pd.Series(1.0, index=lc_sub.index).groupby(lc_sub).sum().to_dict()
+            # Usage counts (always from _weight column, which holds the actual usage values)
+            usage_series = df.loc[idx, '_weight']
+            usage_main_w = usage_series.reindex(lc_main.index)
+            usage_sub_w = usage_series.reindex(lc_sub.index)
+            usage_main = usage_main_w.groupby(lc_main).sum().to_dict()
+            usage_sub = usage_sub_w.groupby(lc_sub).sum().to_dict()
+            results['cvu_available'] = True
+            results['cvu_titles_main'] = titles_main
+            results['cvu_titles_sub'] = titles_sub
+            results['cvu_usage_main'] = usage_main
+            results['cvu_usage_sub'] = usage_sub
+            results['cvu_total_titles'] = sum(titles_main.values())
+            results['cvu_total_usage'] = sum(usage_main.values())
+        else:
+            results['cvu_available'] = False
+    else:
+        results['lc_main_counts'] = {}
+        results['lc_sub_counts'] = {}
+        results['sunburst_data'] = []
+        results['cvu_available'] = False
+
+    progress_bar.progress(15, "Processing subject terms...")
+
+    if subj_col:
+        subject_counter = Counter()
+        subject_by_lc = defaultdict(Counter)
+        subj_full = df.loc[idx, subj_col]
+        lc_full = df.loc[idx, '_lc_main'] if lc_col else pd.Series(None, index=idx)
+        n_chunks = (n_records // CHUNK_SIZE) + 1
+        for ci in range(n_chunks):
+            start = ci * CHUNK_SIZE
+            end = min(start + CHUNK_SIZE, n_records)
+            if start >= n_records:
+                break
+            cidx = idx[start:end]
+            _profiler_process_subjects_chunk(
+                subj_full.loc[cidx], weight_all.loc[cidx], lc_full.loc[cidx],
+                subject_counter, subject_by_lc
+            )
+            pct = 15 + int(65 * (end / n_records))
+            progress_bar.progress(pct, f"Processed {end:,} of {n_records:,} records...")
+        results['subject_counts'] = subject_counter
+        results['subject_by_lc'] = dict(subject_by_lc)
+
+        # When a usage column is present, build BOTH title-count and usage-weighted
+        # subject distributions so we can render Coverage-vs-Use by subject (this
+        # is the analog of the LC version, and it's what makes use metrics visible
+        # for vendor reports that have Subject but no LC/call number column —
+        # e.g., ProQuest Ebook Central title reports).
+        if has_usage_col:
+            subj_titles = Counter()      # one count per title-subject occurrence
+            subj_usage = Counter()       # weighted by '_weight' (the usage column)
+            usage_series = df.loc[idx, '_weight']
+            ones_series = pd.Series(1.0, index=idx)
+            for ci in range(n_chunks):
+                start = ci * CHUNK_SIZE
+                end = min(start + CHUNK_SIZE, n_records)
+                if start >= n_records:
+                    break
+                cidx = idx[start:end]
+                _profiler_process_subjects_chunk(
+                    subj_full.loc[cidx], ones_series.loc[cidx], lc_full.loc[cidx],
+                    subj_titles, defaultdict(Counter)
+                )
+                _profiler_process_subjects_chunk(
+                    subj_full.loc[cidx], usage_series.loc[cidx], lc_full.loc[cidx],
+                    subj_usage, defaultdict(Counter)
+                )
+            results['subj_titles'] = subj_titles
+            results['subj_usage'] = subj_usage
+            results['subj_total_titles'] = sum(subj_titles.values())
+            results['subj_total_usage'] = sum(subj_usage.values())
+            results['cvu_by_subject_available'] = True
+        else:
+            results['cvu_by_subject_available'] = False
+    else:
+        results['subject_counts'] = Counter()
+        results['subject_by_lc'] = {}
+        results['cvu_by_subject_available'] = False
+
+    progress_bar.progress(80, "Tokenizing titles...")
+
+    # Title-keyword analysis — supplementary lens, NOT merged into subject_counts.
+    # Uses uncontrolled vocabulary (title text), so it can surface terminology
+    # the controlled subject headings missed. Always built when title column is
+    # present; cheap to compute even on large datasets.
+    #
+    # N-grams: we tokenize each title into segments (split at colons/commas/semis
+    # so phrases don't cross subtitle boundaries), drop stopwords, then build
+    # all configured n-gram sizes. Each n-gram is stored as a (size, phrase)
+    # tuple so the renderer can show separate top-N lists per size.
+    if title_col:
+        title_keyword_counter = Counter()        # keys: (n, phrase) -> occurrences
+        title_keyword_usage = Counter()          # keys: (n, phrase) -> usage sum
+        title_unique_titles = Counter()          # keys: (n, phrase) -> distinct titles
+        title_series = df.loc[idx, title_col]
+        if has_usage_col:
+            usage_series = df.loc[idx, '_weight']
+        else:
+            usage_series = pd.Series(1.0, index=idx)
+        ngram_sizes = tuple(sorted(set(int(n) for n in ngram_sizes if int(n) >= 1))) or (1,)
+        for ti, raw_title in title_series.items():
+            segments = _tokenize_title_segments(raw_title)
+            if not segments:
+                continue
+            u = usage_series.at[ti] if ti in usage_series.index else 0
+            seen_in_title = set()
+            for n, phrase in _extract_ngrams(segments, n_values=ngram_sizes):
+                key = (n, phrase)
+                title_keyword_counter[key] += 1
+                if has_usage_col:
+                    title_keyword_usage[key] += u
+                if key not in seen_in_title:
+                    title_unique_titles[key] += 1
+                    seen_in_title.add(key)
+        results['title_keyword_counts'] = title_keyword_counter
+        results['title_keyword_usage'] = title_keyword_usage
+        results['title_keyword_unique_titles'] = title_unique_titles
+        results['title_keyword_available'] = len(title_keyword_counter) > 0
+        results['title_keyword_ngram_sizes'] = tuple(ngram_sizes)
+    else:
+        results['title_keyword_counts'] = Counter()
+        results['title_keyword_usage'] = Counter()
+        results['title_keyword_unique_titles'] = Counter()
+        results['title_keyword_available'] = False
+        results['title_keyword_ngram_sizes'] = ()
+
+    progress_bar.progress(85, "Running gap analysis...")
+
+    if lc_col:
+        all_classes = set(LC_CLASSES.keys())
+        present = set(results['lc_main_counts'].keys())
+        results['missing_lc_classes'] = sorted(all_classes - present)
+        thin_t = total_weight * 0.01 if total_weight > 0 else 0
+        results['thin_lc_classes'] = {c: v for c, v in results['lc_main_counts'].items() if v < thin_t}
+    else:
+        results['missing_lc_classes'] = []
+        results['thin_lc_classes'] = {}
+
+    results['detail_available'] = bool(title_col or lc_col or subj_col)
+    results['detail_cols'] = [c for c in [title_col, lc_col, subj_col] if c]
+    results['detail_total'] = n_records
+    progress_bar.progress(100, "Done!")
+    gc.collect()
+    return results
+
+
+def _classify_signal(ratio, over_thresh, under_thresh, n_titles, min_titles):
+    """Return (label, color_hint) for a coverage-vs-use ratio."""
+    if n_titles < min_titles:
+        return ("—", "gray")
+    if ratio >= over_thresh:
+        return ("🟢 Overperforming", "green")
+    if ratio <= under_thresh:
+        return ("🔴 Underperforming", "red")
+    return ("✅ Proportional", "neutral")
+
+
+def _build_cvu_table(titles_dict, usage_dict, total_titles, total_usage,
+                     over, under, min_titles, label_lookup, level_col_name):
+    """Build the coverage-vs-use dataframe for a given level (main or sub)."""
+    all_keys = sorted(set(titles_dict.keys()) | set(usage_dict.keys()))
+    rows = []
+    for key in all_keys:
+        n_titles = titles_dict.get(key, 0)
+        n_usage = usage_dict.get(key, 0)
+        if n_titles == 0 and n_usage == 0:
+            continue
+        pct_titles = (n_titles / total_titles * 100) if total_titles > 0 else 0
+        pct_usage = (n_usage / total_usage * 100) if total_usage > 0 else 0
+        ratio = (pct_usage / pct_titles) if pct_titles > 0 else float('inf') if pct_usage > 0 else 0
+        use_per_title = (n_usage / n_titles) if n_titles > 0 else 0
+        signal, _ = _classify_signal(ratio, over, under, n_titles, min_titles)
+        rows.append({
+            level_col_name: key,
+            'Description': label_lookup.get(key, '—'),
+            'Titles Held': int(n_titles),
+            '% of Collection': round(pct_titles, 2),
+            'Total Use': int(n_usage),
+            '% of Use': round(pct_usage, 2),
+            'Use/Title Ratio': round(use_per_title, 2),
+            'Use/Holdings Signal': round(ratio, 2) if ratio != float('inf') else None,
+            'Assessment': signal,
+        })
+    return pd.DataFrame(rows)
+
+
+def _render_coverage_vs_use_by_subject(results, settings, notes=""):
+    """Coverage vs. Use broken down by Subject term.
+
+    Used when the file has a usage column but no LC/call number (e.g., ProQuest
+    Ebook Central title reports). Mirrors the LC version's logic and thresholds.
+    """
+    st.markdown("---")
+    st.subheader("Coverage vs. use — by subject")
+    st.markdown(
+        "Compares **% of titles** carrying each subject against **% of use** those titles drive. "
+        "Useful when your file has subject headings but no LC/call number column."
+    )
+    st.markdown(
+        f"- 🟢 **Overperforming** — ratio ≥ **{settings['cvu_over']}** (subject area pulling heavy use; consider expanding)\n"
+        f"- 🔴 **Underperforming** — ratio ≤ **{settings['cvu_under']}** (well-represented but lightly used; review or weed)\n"
+        f"- ✅ **Proportional** — use roughly matches representation\n"
+        f"- — **Insufficient data** — fewer than **{settings['cvu_min_titles']}** title-tags in that subject"
+    )
+    st.caption(
+        "Note: a single title with multiple subjects contributes to each. "
+        "Totals here count *title-subject pairs*, not unique titles."
+    )
+
+    usage_label = settings.get('usage_col_label', 'Usage')
+    titles_dict = results['subj_titles']
+    usage_dict = results['subj_usage']
+    total_titles = results['subj_total_titles']
+    total_usage = results['subj_total_usage']
+    top_n = settings.get('top_n_subjects', 30)
+
+    # KPI summary
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Subject-Title Tags", f"{int(total_titles):,}")
+    k2.metric(f"Total {usage_label}", f"{int(total_usage):,}")
+    k3.metric(f"Overall {usage_label} / Tag",
+              f"{total_usage / max(1, total_titles):.2f}")
+
+    if total_usage == 0:
+        st.warning(
+            f"⚠️ The selected usage column has **zero total {usage_label.lower()}** across "
+            "all titles in this file. Coverage-vs-Use analysis needs at least some non-zero "
+            "values. Double-check that you mapped the right column above."
+        )
         return
 
-    # Load and normalize bibliographic/title data
-    df_raw_bib = pd.read_csv(bib_file)
-    df_bib = normalize_bibliographic_file(df_raw_bib)
-    st.success(f"Loaded {len(df_bib):,} records (auto-normalized).")
+    subj_df = _build_cvu_table(
+        titles_dict, usage_dict,
+        total_titles, total_usage,
+        settings['cvu_over'], settings['cvu_under'], settings['cvu_min_titles'],
+        {}, 'Subject'
+    )
+    if subj_df.empty:
+        st.info("No subject data to display.")
+        return
 
-    # Optional usage file
-    df_use = None
-    if use_file:
-        df_raw_use = pd.read_csv(use_file)
-        df_use = normalize_usage_file(df_raw_use)
-        st.info(f"Loaded {len(df_use):,} usage records (auto-normalized).")
+    # Drop the 'Description' column — not meaningful for subject terms
+    if 'Description' in subj_df.columns:
+        subj_df = subj_df.drop(columns='Description')
 
-    tab1, tab2, tab3 = st.tabs([
-        "🏛️ LC / Subject Distribution",
-        "🏷️ Subject Concentration",
-        "📈 Coverage vs Use"
-    ])
+    # Sort by Total Use descending so the heaviest-used subjects lead, then trim
+    subj_df = subj_df.sort_values('Total Use', ascending=False).head(top_n)
 
-    # ---------------- TAB 1: LC / SUBJECT DISTRIBUTION ----------------
-    with tab1:
-        st.subheader("LC / Subject Distribution")
+    st.dataframe(
+        subj_df, use_container_width=True, hide_index=True, height=min(450, 50 + 35 * len(subj_df)),
+        column_config={
+            '% of Collection': st.column_config.NumberColumn(format="%.2f%%"),
+            '% of Use': st.column_config.NumberColumn(format="%.2f%%"),
+            'Use/Holdings Signal': st.column_config.NumberColumn(
+                format="%.2f",
+                help="(% of use) ÷ (% of representation). 1.0 = proportional."
+            ),
+        }
+    )
 
-        st.markdown("""
-        This view shows how your collection is distributed across **LC classes or subject groupings**.
+    _bytes = _annotate_csv(subj_df, notes,
+                           extra_meta={'Tool': 'Collection Profiler',
+                                       'View': 'Coverage vs. Use by Subject',
+                                       'Usage column': usage_label,
+                                       'Over threshold': settings['cvu_over'],
+                                       'Under threshold': settings['cvu_under']})
+    st.download_button(f"📥 Coverage-vs-Use by Subject (top {top_n}) CSV",
+                       _bytes,
+                       "coverage_vs_use_by_subject.csv",
+                       "text/csv", key='prof_dl_cvu_subj')
+    _add_to_tray("profiler", "coverage_vs_use_by_subject.csv", _bytes)
 
-        Use it to:
-        - Spot **overbuilt** or **underbuilt** areas
-        - Check alignment with **programs and curricula**
-        - Identify areas for **liaison outreach** or **accreditation support**
-        """)
 
-        required_cols = ["Main_LC_Desc", "Subclass_Desc"]
+def _render_coverage_vs_use(results, settings, notes=""):
+    """Render the Coverage vs. Use section — the core 'what we have vs what's used' view."""
+    st.markdown("---")
+    st.subheader("Coverage vs. use")
+    st.markdown(
+        "Compares **% of your collection** in each LC area against **% of use** it drives. "
+        "The *Assessment* column uses ratios you can tune in the sidebar:"
+    )
+    st.markdown(
+        f"- 🟢 **Overperforming** — ratio ≥ **{settings['cvu_over']}** (small areas pulling heavy use; candidates for expansion)\n"
+        f"- 🔴 **Underperforming** — ratio ≤ **{settings['cvu_under']}** (large areas with thin use; candidates for weeding or reassessment)\n"
+        f"- ✅ **Proportional** — use roughly matches holdings\n"
+        f"- — **Insufficient data** — fewer than **{settings['cvu_min_titles']}** titles in that area"
+    )
 
-        if not all(col in df_bib.columns for col in required_cols):
-            st.error("Unable to generate LC/Subject distribution — required fields are missing after normalization.")
+    usage_label = settings.get('usage_col_label', 'Usage')
+    total_titles = results['cvu_total_titles']
+    total_usage = results['cvu_total_usage']
+
+    over = settings['cvu_over']
+    under = settings['cvu_under']
+    min_titles = settings['cvu_min_titles']
+
+    # KPI summary
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Total Titles", f"{int(total_titles):,}")
+    k2.metric(f"Total {usage_label}", f"{int(total_usage):,}")
+    k3.metric("Overall Use / Title",
+              f"{total_usage / max(1, total_titles):.2f}")
+
+    # ---- LC main class table & chart ----
+    st.markdown("#### LC Main Class")
+    main_df = _build_cvu_table(
+        results['cvu_titles_main'], results['cvu_usage_main'],
+        total_titles, total_usage,
+        over, under, min_titles,
+        LC_CLASSES, 'LC Class'
+    )
+    if main_df.empty:
+        st.info("No LC data to display.")
+        return
+
+    # Sort by signal ratio descending (so overperformers appear first)
+    # But put "—" (insufficient data) at the bottom
+    main_df['_sort_key'] = main_df['Use/Holdings Signal'].fillna(-1)
+    main_df = main_df.sort_values('_sort_key', ascending=False).drop(columns='_sort_key')
+
+    st.dataframe(
+        main_df, use_container_width=True, hide_index=True, height=400,
+        column_config={
+            '% of Collection': st.column_config.NumberColumn(format="%.2f%%"),
+            '% of Use': st.column_config.NumberColumn(format="%.2f%%"),
+            'Use/Holdings Signal': st.column_config.NumberColumn(
+                format="%.2f",
+                help="(% of use) ÷ (% of holdings). 1.0 = proportional."
+            ),
+        }
+    )
+
+    _cvu_main_bytes = _annotate_csv(main_df, notes,
+                                    extra_meta={'Tool': 'Collection Profiler',
+                                                'View': 'Coverage vs. Use (main)',
+                                                'Over threshold': settings['cvu_over'],
+                                                'Under threshold': settings['cvu_under']})
+    st.download_button("📥 Coverage-vs-Use (Main Class) CSV",
+                       _cvu_main_bytes,
+                       "coverage_vs_use_main.csv", "text/csv",
+                       key='prof_dl_cvu_main')
+    _add_to_tray("profiler", "coverage_vs_use_main.csv", _cvu_main_bytes)
+
+    # Scatter plot: % titles vs % use, with diagonal reference line
+    plot_df = main_df[main_df['Assessment'] != "—"].copy()
+    if not plot_df.empty:
+        fig = px.scatter(
+            plot_df, x='% of Collection', y='% of Use',
+            size='Titles Held', color='Assessment',
+            color_discrete_map={
+                "🟢 Overperforming": "#2ecc71",
+                "🔴 Underperforming": "#e74c3c",
+                "✅ Proportional": "#71C5E8",
+            },
+            hover_data=['LC Class', 'Description', 'Total Use', 'Use/Title Ratio'],
+            text='LC Class',
+            title="Collection Coverage vs. Use (by LC Main Class)",
+        )
+        # Diagonal reference: if use were perfectly proportional to holdings
+        max_val = max(plot_df['% of Collection'].max(), plot_df['% of Use'].max()) * 1.1
+        fig.add_shape(
+            type='line', line=dict(color='gray', dash='dash', width=1),
+            x0=0, y0=0, x1=max_val, y1=max_val,
+        )
+        fig.add_annotation(
+            x=max_val * 0.9, y=max_val * 0.95,
+            text="Proportional line", showarrow=False,
+            font=dict(size=10, color="gray"),
+        )
+        fig.update_traces(textposition='top center')
+        fig.update_layout(height=500, xaxis_title="% of Collection",
+                          yaxis_title=f"% of {usage_label}")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ---- LC subclass table (optional) ----
+    if settings.get('cvu_show_sub') and results.get('cvu_titles_sub'):
+        st.markdown("#### LC Subclass")
+        st.caption("Drill into the same comparison at the subclass level "
+                   "(e.g., HQ1000s vs. HQ750s).")
+
+        # Build a flat subclass lookup from LC_SUBCLASSES dict
+        sub_lookup = {}
+        for main_class, subs in LC_SUBCLASSES.items():
+            sub_lookup.update(subs)
+
+        sub_df = _build_cvu_table(
+            results['cvu_titles_sub'], results['cvu_usage_sub'],
+            total_titles, total_usage,
+            over, under, min_titles,
+            sub_lookup, 'LC Subclass'
+        )
+        if sub_df.empty:
+            st.info("No LC subclass data to display.")
         else:
-            df_bib_clean = df_bib[required_cols].fillna("Unclassified")
-
-            fig = px.sunburst(
-                df_bib_clean,
-                path=["Main_LC_Desc", "Subclass_Desc"],
-                height=chart_height,
-                template="plotly_white",
-                color_discrete_sequence=px.colors.qualitative.Prism
+            # Allow filtering to just one main class for readability
+            main_classes_present = sorted(set(
+                sc[0] for sc in sub_df['LC Subclass'] if isinstance(sc, str) and sc
+            ))
+            filter_main = st.selectbox(
+                "Filter subclass view by main class (optional)",
+                options=["All"] + [f"{c} – {LC_CLASSES.get(c, '?')}"
+                                    for c in main_classes_present],
+                key='prof_cvu_sub_filter'
             )
-            st.plotly_chart(fig, use_container_width=True)
-
-            if show_table:
-                with st.expander("📋 LC / Subject Summary Table"):
-                    summary = (
-                        df_bib_clean
-                        .groupby("Main_LC_Desc")
-                        .size()
-                        .reset_index(name="Title_Count")
-                        .sort_values("Title_Count", ascending=False)
-                    )
-                    st.dataframe(summary, use_container_width=True)
-
-    # ---------------- TAB 2: SUBJECT CONCENTRATION ----------------
-    with tab2:
-        st.subheader("Subject Heading Concentration")
-
-        st.markdown("""
-        This view highlights the **intellectual shape** of the collection:
-
-        - Which subjects dominate?
-        - Are there emerging or neglected areas?
-        - Do subject patterns align with **academic programs** and **research strengths**?
-        """)
-
-        if "Subject_Heading" not in df_bib.columns:
-            st.warning("No subject heading field was detected after normalization.")
-        else:
-            df_sub = df_bib.copy()
-            df_sub["Subject_Heading"] = df_sub["Subject_Heading"].fillna("Unspecified")
-
-            fig_sub = px.treemap(
-                df_sub,
-                path=["Subject_Heading"],
-                height=chart_height,
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            st.plotly_chart(fig_sub, use_container_width=True)
-
-            if show_table:
-                with st.expander("📋 Top Subjects by Title Count"):
-                    subj_summary = (
-                        df_sub["Subject_Heading"]
-                        .value_counts()
-                        .reset_index()
-                        .rename(columns={"index": "Subject_Heading", "Subject_Heading": "Title_Count"})
-                    )
-                    st.dataframe(subj_summary.head(50), use_container_width=True)
-
-    # ---------------- TAB 3: COVERAGE VS USE ----------------
-    with tab3:
-        st.subheader("Coverage vs Use (Supply vs Demand)")
-
-        st.markdown("""
-        Compare what the library **owns** (or has access to) vs. what users **actually use**.
-
-        This helps identify:
-        - **Overbuilt** areas with low demand
-        - **High-demand** areas needing investment
-        - Subjects where **digital** may outperform **print**
-        """)
-
-        if df_use is None:
-            st.warning("Upload a usage file to enable Coverage vs Use comparisons.")
-        else:
-            # Aggregate holdings by Main_LC_Desc
-            holdings = (
-                df_bib
-                .groupby("Main_LC_Desc")
-                .size()
-                .reset_index(name="Holdings_Count")
-            )
-
-            # Aggregate usage by Main_LC_Desc
-            usage = (
-                df_use
-                .groupby("Main_LC_Desc")["Usage_Count"]
-                .sum()
-                .reset_index(name="Usage_Count")
-            )
-
-            merged = pd.merge(holdings, usage, on="Main_LC_Desc", how="outer").fillna(0)
-
-            # Convert to percentages for comparison
-            if merged["Holdings_Count"].sum() > 0:
-                merged["Holdings_%"] = merged["Holdings_Count"] / merged["Holdings_Count"].sum() * 100
+            if filter_main != "All":
+                prefix = filter_main.split(' –')[0]
+                sub_df_display = sub_df[
+                    sub_df['LC Subclass'].str.startswith(prefix, na=False)
+                ].copy()
             else:
-                merged["Holdings_%"] = 0
+                sub_df_display = sub_df.copy()
 
-            if merged["Usage_Count"].sum() > 0:
-                merged["Usage_%"] = merged["Usage_Count"] / merged["Usage_Count"].sum() * 100
-            else:
-                merged["Usage_%"] = 0
+            sub_df_display['_sort_key'] = sub_df_display['Use/Holdings Signal'].fillna(-1)
+            sub_df_display = sub_df_display.sort_values(
+                '_sort_key', ascending=False
+            ).drop(columns='_sort_key')
 
-            merged = merged.sort_values("Usage_%", ascending=False)
+            st.dataframe(
+                sub_df_display, use_container_width=True,
+                hide_index=True, height=400,
+                column_config={
+                    '% of Collection': st.column_config.NumberColumn(format="%.2f%%"),
+                    '% of Use': st.column_config.NumberColumn(format="%.2f%%"),
+                    'Use/Holdings Signal': st.column_config.NumberColumn(format="%.2f"),
+                }
+            )
+            _cvu_sub_bytes = _annotate_csv(sub_df, notes,
+                                           extra_meta={'Tool': 'Collection Profiler',
+                                                       'View': 'Coverage vs. Use (subclass)'})
+            st.download_button("📥 Coverage-vs-Use (Subclass) CSV",
+                               _cvu_sub_bytes,
+                               "coverage_vs_use_subclass.csv", "text/csv",
+                               key='prof_dl_cvu_sub')
+            _add_to_tray("profiler", "coverage_vs_use_subclass.csv", _cvu_sub_bytes)
 
-            fig_gap = go.Figure(data=[
-                go.Bar(
-                    name="Collection %",
-                    x=merged["Main_LC_Desc"],
-                    y=merged["Holdings_%"],
-                    marker_color="#71C5E8"
-                ),
-                go.Bar(
-                    name="Usage %",
-                    x=merged["Main_LC_Desc"],
-                    y=merged["Usage_%"],
-                    marker_color="#285C4D"
+    # Interpretive callout
+    over_count = (main_df['Assessment'] == "🟢 Overperforming").sum()
+    under_count = (main_df['Assessment'] == "🔴 Underperforming").sum()
+    if over_count or under_count:
+        st.markdown("**What to do with this:**")
+        bullets = []
+        if over_count:
+            bullets.append(
+                f"- **{over_count} overperforming area(s)** are candidates for "
+                "deeper investment — strong use suggests demand you could grow into."
+            )
+        if under_count:
+            bullets.append(
+                f"- **{under_count} underperforming area(s)** are candidates for "
+                "weeding review or reassessment. Use the **Usage Analyzer → Print "
+                "Circulation** tool to see the specific low-use titles driving "
+                "those numbers."
+            )
+        st.markdown("\n".join(bullets))
+
+
+def _render_title_keywords(results, settings, notes=""):
+    """Render the title-keyword view: bar chart + optional word cloud + table.
+
+    This is a SEPARATE lens from the subject view. It tokenizes title text
+    (uncontrolled vocabulary) with stopwords stripped, so it surfaces
+    terminology that subject headings might have missed — newer concepts,
+    methodological terms, interdisciplinary phrases. Distinct from subject
+    analysis on purpose: titles are not curated metadata.
+    """
+    if not results.get('title_keyword_available'):
+        return
+
+    counter = results['title_keyword_counts']
+    usage_counter = results.get('title_keyword_usage', Counter())
+    unique_titles = results.get('title_keyword_unique_titles', Counter())
+    available_sizes = results.get('title_keyword_ngram_sizes', (1,))
+
+    # Apply user-tunable extra stopwords. Stopwords are applied per-token so
+    # bigrams/trigrams containing any user-flagged word also get filtered.
+    extra_stops = settings.get('tk_extra_stopwords') or set()
+
+    def _key_passes_stops(key):
+        # key is (n, phrase). Drop the whole n-gram if any token is in extra_stops.
+        if not extra_stops:
+            return True
+        _, phrase = key
+        return not any(tok in extra_stops for tok in phrase.split())
+
+    if extra_stops:
+        counter = Counter({k: v for k, v in counter.items() if _key_passes_stops(k)})
+        usage_counter = Counter({k: v for k, v in usage_counter.items() if _key_passes_stops(k)})
+        unique_titles = Counter({k: v for k, v in unique_titles.items() if _key_passes_stops(k)})
+
+    if not counter:
+        return
+
+    top_n = settings.get('tk_top_n', 30)
+    has_usage = bool(settings.get('has_usage_col'))
+    usage_label = settings.get('usage_col_label', 'Usage')
+    selected_sizes = tuple(settings.get('tk_ngram_sizes', (1, 2, 3)))
+    min_freq = settings.get('tk_min_freq', 2)
+
+    # Restrict to sizes the user actually selected AND that we built
+    sizes_to_show = tuple(n for n in selected_sizes if n in available_sizes)
+    if not sizes_to_show:
+        sizes_to_show = available_sizes
+
+    st.markdown("---")
+    st.subheader("Title keywords & phrases")
+    st.caption(
+        "A supplementary lens on the collection. Unlike the subject view above "
+        "(which uses curated subject headings), this counts words and phrases "
+        "appearing in **title text** with English stopwords and common "
+        "publishing-noise words removed. N-grams are built from tokens that "
+        "survive stopword removal and never cross subtitle punctuation. "
+        "Use this view to spot terminology that controlled subject vocabularies "
+        "may have missed — newer concepts, methodological terms, "
+        "interdisciplinary phrases. Treat findings as exploratory."
+    )
+
+    _SIZE_LABELS = {
+        1: "Single words",
+        2: "Two-word phrases",
+        3: "Three-word phrases",
+    }
+    tab_labels = [f"{_SIZE_LABELS.get(n, f'{n}-grams')} (top {top_n})"
+                  for n in sizes_to_show]
+    tabs = st.tabs(tab_labels) if len(sizes_to_show) > 1 else [None]
+
+    all_export_rows = []  # for combined CSV export at end
+
+    for tab, n in zip(tabs, sizes_to_show):
+        ctx = tab if tab is not None else st.container()
+        with ctx:
+            # Filter: for n>1, require the phrase to appear in at least `min_freq`
+            # distinct titles (not just total occurrences — this filters out
+            # duplicate-title noise like a book listed under multiple ISBNs).
+            # Unigrams always passed (they're already filtered by min word length).
+            this_min = 1 if n == 1 else min_freq
+            sub_items = []
+            for key, cnt in counter.items():
+                if key[0] != n:
+                    continue
+                ut = unique_titles.get(key, 0)
+                if n > 1 and ut < this_min:
+                    continue
+                sub_items.append((key[1], cnt))
+            if not sub_items:
+                st.info(
+                    f"No {_SIZE_LABELS.get(n, str(n)+'-gram').lower()} appeared in "
+                    f"at least {this_min} distinct title{'s' if this_min != 1 else ''}. "
+                    "Try lowering **Min occurrences** in the title-keyword options "
+                    "(it filters by distinct titles for multi-word phrases)."
                 )
-            ])
-            fig_gap.update_layout(
-                height=chart_height,
-                barmode="group",
-                xaxis_title="LC / Subject Area",
-                yaxis_title="Percent of Total"
+                continue
+            sub_items.sort(key=lambda x: -x[1])
+            top_items = sub_items[:top_n]
+
+            rows = []
+            for phrase, occurrences in top_items:
+                key = (n, phrase)
+                row = {
+                    'Phrase' if n > 1 else 'Keyword': phrase,
+                    'Title Occurrences': int(occurrences),
+                    'Distinct Titles': int(unique_titles.get(key, 0)),
+                }
+                if has_usage:
+                    row[f'Total {usage_label}'] = int(usage_counter.get(key, 0))
+                rows.append(row)
+                all_export_rows.append({
+                    'N-gram Size': n,
+                    'Phrase': phrase,
+                    'Title Occurrences': int(occurrences),
+                    'Distinct Titles': int(unique_titles.get(key, 0)),
+                    f'Total {usage_label}': int(usage_counter.get(key, 0)) if has_usage else None,
+                })
+            kw_df = pd.DataFrame(rows)
+            label_col = 'Phrase' if n > 1 else 'Keyword'
+
+            fig = px.bar(
+                kw_df, x='Title Occurrences', y=label_col,
+                orientation='h', color='Title Occurrences',
+                color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                hover_data=[c for c in ['Distinct Titles', f'Total {usage_label}']
+                            if c in kw_df.columns],
             )
-            st.plotly_chart(fig_gap, use_container_width=True)
+            fig.update_layout(
+                yaxis={'categoryorder': 'total ascending'},
+                height=max(450, len(kw_df) * 24),
+                showlegend=False,
+                margin=dict(t=30, l=0, r=0, b=30),
+            )
+            st.plotly_chart(fig, use_container_width=True, key=f"prof_tk_chart_{n}")
 
-            if show_table:
-                with st.expander("📋 Coverage vs Use Table"):
-                    st.dataframe(
-                        merged[["Main_LC_Desc", "Holdings_Count", "Usage_Count", "Holdings_%", "Usage_%"]],
-                        use_container_width=True
+            with st.expander(f"📋 Full {label_col.lower()} table (sortable)"):
+                st.dataframe(
+                    kw_df, use_container_width=True, hide_index=True,
+                    height=min(450, 50 + 35 * len(kw_df)),
+                )
+
+    # Single combined CSV export covering all selected sizes
+    if all_export_rows:
+        export_df = pd.DataFrame(all_export_rows)
+        if not has_usage and f'Total {usage_label}' in export_df.columns:
+            export_df = export_df.drop(columns=[f'Total {usage_label}'])
+        _kw_bytes = _annotate_csv(
+            export_df, notes,
+            extra_meta={'Tool': 'Collection Profiler',
+                        'View': 'Title Keywords (n-grams)',
+                        'Top N (per size)': top_n,
+                        'N-gram sizes': ', '.join(str(n) for n in sizes_to_show),
+                        'Min occurrences (n>1)': min_freq,
+                        'Stopwords': 'Built-in English + library/publishing noise'
+                                     + (f' + {len(extra_stops)} custom' if extra_stops else '')}
+        )
+        st.download_button(
+            "📥 Title keywords & phrases (CSV)", _kw_bytes,
+            "title_keywords.csv", "text/csv", key='prof_dl_tk',
+        )
+        _add_to_tray("profiler", "title_keywords.csv", _kw_bytes)
+
+    # Word cloud — unigrams only (clouds don't render multi-word phrases well).
+    if settings.get('tk_show_wordcloud') and WORDCLOUD_AVAILABLE:
+        unigram_counter = Counter({key[1]: cnt for key, cnt in counter.items()
+                                   if key[0] == 1})
+        if not unigram_counter:
+            return
+        st.markdown("##### Title keyword cloud (single words)")
+        max_words = settings.get('tk_wc_max_words', 100)
+        color_scheme = settings.get('tk_wc_color', 'plasma')
+        cloud_data = dict(unigram_counter.most_common(max_words))
+        if cloud_data:
+            wc = WordCloud(
+                width=1200, height=500, background_color='white',
+                colormap=color_scheme, max_words=max_words,
+                relative_scaling=0.5, min_font_size=10, prefer_horizontal=0.7,
+            ).generate_from_frequencies(cloud_data)
+            fig_wc, ax_wc = plt.subplots(figsize=(14, 6))
+            ax_wc.imshow(wc, interpolation='bilinear')
+            ax_wc.axis('off')
+            st.pyplot(fig_wc, use_container_width=True)
+            buf = BytesIO()
+            fig_wc.savefig(buf, format='png', dpi=200, bbox_inches='tight',
+                           facecolor='white', edgecolor='none')
+            buf.seek(0)
+            _tk_wc_bytes = buf.getvalue()
+            st.download_button(
+                "📥 Title keyword cloud (PNG)", _tk_wc_bytes,
+                "title_keywords_wordcloud.png", "image/png",
+                key='prof_dl_tk_wc',
+            )
+            _add_to_tray("profiler", "title_keywords_wordcloud.png", _tk_wc_bytes)
+            plt.close(fig_wc)
+    elif settings.get('tk_show_wordcloud') and not WORDCLOUD_AVAILABLE:
+        st.info("Install `wordcloud` and `matplotlib` to enable the keyword cloud.")
+
+
+def _profiler_display_results(results, settings, df, idx):
+    """Render all enabled visualizations in a sensible narrative order."""
+    wl = settings['weight_label']
+    top_n = settings['top_n_subjects']
+
+    # Fresh tray for this render pass
+    _reset_tray("profiler")
+
+    st.markdown("---")
+    st.subheader("Collection overview")
+    # Top KPIs — when a usage column is mapped, always show total use up here,
+    # regardless of weighting mode, so the metric is visible even when the
+    # primary analysis weights titles by 1.
+    usage_col_label = settings.get('usage_col_label', 'Usage')
+    has_usage = bool(settings.get('has_usage_col'))
+    total_use = 0
+    if has_usage:
+        if results.get('cvu_available'):
+            total_use = results.get('cvu_total_usage', 0)
+        elif results.get('cvu_by_subject_available'):
+            total_use = results.get('subj_total_usage', 0)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Records Analyzed", f"{results['n_records']:,}")
+    c2.metric(f"Total {wl}", f"{results['total_weight']:,.0f}")
+    if has_usage and wl != usage_col_label:
+        # Replace "LC Classes Present" with total use when more informative
+        # (i.e., when weighting mode is Title Count, so total_weight == n_records)
+        c3.metric(f"Total {usage_col_label}", f"{int(total_use):,}")
+        c4.metric("Unique Subjects", f"{len(results['subject_counts']):,}")
+    else:
+        c3.metric("LC Classes Present", f"{len(results['lc_main_counts'])}")
+        c4.metric("Unique Subjects", f"{len(results['subject_counts']):,}")
+
+    # Notes — shown above results so users annotate *before* downloading
+    notes = _notes_widget(
+        "profiler",
+        placeholder="e.g., Prepared for sociology accreditation report, Nov 2025. "
+                    "Follow-up: discuss HQ underperformance with Dr. Chen."
+    )
+
+    # Word cloud (formerly its own tool — now a view option here)
+    if settings['show_wordcloud'] and results['subject_counts']:
+        st.markdown("---")
+        st.subheader(f"Subject word cloud ({wl}-weighted)")
+        if not WORDCLOUD_AVAILABLE:
+            st.warning("Install `wordcloud` and `matplotlib` to enable this view: "
+                       "`pip install wordcloud matplotlib`")
+        else:
+            min_len = settings.get('wc_min_len', 3)
+            max_words = settings.get('wc_max_words', 100)
+            color_scheme = settings.get('wc_color', 'viridis')
+            filtered = {t: c for t, c in results['subject_counts'].items()
+                        if t and len(t) >= min_len}
+            if filtered:
+                wc = WordCloud(
+                    width=1200, height=500, background_color='white',
+                    colormap=color_scheme, max_words=max_words,
+                    relative_scaling=0.5, min_font_size=10, prefer_horizontal=0.7,
+                ).generate_from_frequencies(filtered)
+                fig, ax = plt.subplots(figsize=(14, 6))
+                ax.imshow(wc, interpolation='bilinear')
+                ax.axis('off')
+                st.pyplot(fig, use_container_width=True)
+                # Save word cloud image for download
+                buf = BytesIO()
+                fig.savefig(buf, format='png', dpi=200, bbox_inches='tight',
+                            facecolor='white', edgecolor='none')
+                buf.seek(0)
+                _wc_png_bytes = buf.getvalue()
+                st.download_button("📥 Word cloud (PNG)", _wc_png_bytes,
+                                   "collection_wordcloud.png", "image/png",
+                                   key='prof_dl_wc')
+                _add_to_tray("profiler", "collection_wordcloud.png", _wc_png_bytes)
+                plt.close(fig)
+            else:
+                st.info(f"No subjects meet the minimum length of {min_len} characters.")
+
+    if settings['show_sunburst'] and results['sunburst_data']:
+        st.markdown("---")
+        st.subheader("LC classification sunburst")
+        sb = results['sunburst_data']
+        fig = go.Figure(go.Sunburst(
+            ids=[r['id'] for r in sb], labels=[r['label'] for r in sb],
+            parents=[r['parent'] for r in sb], values=[r['value'] for r in sb],
+            branchvalues='total',
+            marker=dict(colors=[r['value'] for r in sb],
+                        colorscale=[[0, '#71C5E8'], [0.5, '#285C4D'], [1, '#1a3d33']]),
+            maxdepth=2
+        ))
+        fig.update_layout(height=600, margin=dict(t=30, l=0, r=0, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+    if settings['show_treemap'] and results['lc_main_counts']:
+        st.markdown("---")
+        st.subheader("LC classification treemap")
+        tm_data = [{'Class': f"{c} – {LC_CLASSES.get(c, c)}", 'Count': ct,
+                    'Pct': ct / results['total_weight'] * 100}
+                   for c, ct in sorted(results['lc_main_counts'].items(), key=lambda x: -x[1])]
+        tm_df = pd.DataFrame(tm_data)
+        fig = px.treemap(tm_df, path=['Class'], values='Count', color='Count',
+                         color_continuous_scale=[[0, '#71C5E8'], [0.5, '#285C4D'], [1, '#1a3d33']],
+                         hover_data={'Pct': ':.1f'})
+        fig.update_layout(height=500, margin=dict(t=30, l=0, r=0, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+    if settings['show_subject_bars'] and results['subject_counts']:
+        st.markdown("---")
+        st.subheader(f"Top {top_n} subject terms")
+        top_subjects = results['subject_counts'].most_common(top_n)
+        sdf = pd.DataFrame(top_subjects, columns=['Subject', 'Count'])
+        fig = px.bar(sdf, x='Count', y='Subject', orientation='h', color='Count',
+                     color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']])
+        fig.update_layout(yaxis={'categoryorder': 'total ascending'},
+                          height=max(450, top_n * 24), showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+        _subj_bytes = _annotate_csv(sdf, notes,
+                                    extra_meta={'Tool': 'Collection Profiler',
+                                                'View': 'Top Subjects',
+                                                'Weighting': wl})
+        st.download_button("📥 Subject frequencies (CSV)",
+                           _subj_bytes,
+                           "subject_frequencies.csv",
+                           "text/csv", key='prof_dl_subj')
+        _add_to_tray("profiler", "subject_frequencies.csv", _subj_bytes)
+
+    if settings['show_heatmap'] and results['subject_by_lc']:
+        st.markdown("---")
+        st.subheader("LC class × top subjects heatmap")
+        global_top = [s for s, _ in results['subject_counts'].most_common(min(top_n, 25))]
+        lc_present = sorted(results['subject_by_lc'].keys())
+        matrix = [[results['subject_by_lc'][c].get(s, 0) for s in global_top] for c in lc_present]
+        labels_y = [f"{c} – {LC_CLASSES.get(c, c)}" for c in lc_present]
+        fig = go.Figure(data=go.Heatmap(
+            z=matrix, x=global_top, y=labels_y,
+            colorscale=[[0, '#ffffff'], [0.3, '#71C5E8'], [1, '#285C4D']],
+        ))
+        fig.update_layout(height=max(400, len(lc_present) * 35), xaxis=dict(tickangle=45))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ==== Title keywords (supplementary lens — uncontrolled vocabulary) ====
+    if settings.get('show_title_keywords'):
+        _render_title_keywords(results, settings, notes=notes)
+
+    # ==== Coverage vs. Use ====
+    if settings.get('show_coverage_vs_use'):
+        if results.get('cvu_available'):
+            # Preferred: LC-based view (full granularity)
+            _render_coverage_vs_use(results, settings, notes=notes)
+        elif results.get('cvu_by_subject_available'):
+            # Fallback: subject-level view for files without LC/call number
+            # (e.g., ProQuest Ebook Central title reports)
+            _render_coverage_vs_use_by_subject(results, settings, notes=notes)
+
+    if settings['show_gap_analysis']:
+        st.markdown("---")
+        st.subheader("Collection gap analysis")
+        missing = results['missing_lc_classes']
+        thin = results['thin_lc_classes']
+        if missing:
+            st.markdown("**LC Classes with No Holdings:**")
+            st.dataframe(pd.DataFrame([{'LC Class': c, 'Description': LC_CLASSES.get(c, '')}
+                                       for c in missing]), use_container_width=True, hide_index=True)
+        else:
+            st.info("All LC main classes are represented.")
+        if thin:
+            st.markdown(f"**LC Classes Below 1% of Collection:**")
+            rows_t = [{'LC Class': c, 'Description': LC_CLASSES.get(c, ''),
+                       f'{wl}': f"{v:,.0f}",
+                       '% of Collection': f"{v / results['total_weight'] * 100:.2f}%"}
+                      for c, v in sorted(thin.items(), key=lambda x: x[1])]
+            st.dataframe(pd.DataFrame(rows_t), use_container_width=True, hide_index=True)
+        if results['lc_main_counts']:
+            st.markdown("**Strongest Areas (top 5):**")
+            top5 = sorted(results['lc_main_counts'].items(), key=lambda x: -x[1])[:5]
+            rows_s = [{'LC Class': c, 'Description': LC_CLASSES.get(c, ''),
+                       f'{wl}': f"{v:,.0f}",
+                       '% of Collection': f"{v / results['total_weight'] * 100:.1f}%"}
+                      for c, v in top5]
+            st.dataframe(pd.DataFrame(rows_s), use_container_width=True, hide_index=True)
+
+    if settings['show_detail_table'] and results.get('detail_available') and df is not None:
+        st.markdown("---")
+        st.subheader("Title details (paginated)")
+        PAGE_SIZE = 5_000
+        total = results['detail_total']
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = st.number_input("Page", 1, total_pages, 1, key='prof_page')
+        start = (page - 1) * PAGE_SIZE
+        end = min(start + PAGE_SIZE, total)
+        st.caption(f"Records {start + 1:,}–{end:,} of {total:,}")
+        page_idx = idx[start:end]
+        st.dataframe(df.loc[page_idx, results['detail_cols']],
+                     use_container_width=True, height=400, hide_index=True)
+
+    # Consolidated download tray — everything produced above in one ZIP
+    st.markdown("---")
+    st.subheader("Downloads")
+    _render_download_tray("profiler", zip_filename="collection_profiler_results.zip")
+
+
+def page_collection_profiler():
+    """Tool 1: Collection Profiler."""
+    if 'prof_results' not in st.session_state:
+        st.session_state['prof_results'] = None
+    if 'prof_filtered_idx' not in st.session_state:
+        st.session_state['prof_filtered_idx'] = None
+
+    st.header("🗺️ Collection Profiler")
+    st.markdown(
+        "**What does our collection look like?** Upload a title list with subject terms "
+        "and/or LC call numbers to map disciplinary strengths, spot gaps, and explore "
+        "subject coverage."
+    )
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- **Collections:** Baseline assessment, accreditation self-studies, weeding prep "
+            "(find thin/missing areas), justifying budget asks by showing strengths.\n"
+            "- **Instruction:** Prepare for a liaison session — see at a glance what you "
+            "actually have in HQ or PN before walking into the class.\n"
+            "- **Outreach:** Quick visuals for faculty meetings and annual reports "
+            "(\"here's what sociology looks like in our collection\")."
+        )
+
+
+    uploaded_file = st.file_uploader(
+        "📂 Upload title list (CSV)", type=['csv'],
+        help="Needs Subjects and/or LC Classification; usage columns (Loans, Checkouts) are optional. Optimized for 500K–1M+ records.",
+        key="prof_upload"
+    )
+
+    if uploaded_file is None:
+        st.caption(
+            "💡 Your CSV should have some combination of **Subjects**, "
+            "**LC Classification** or **Call Number**, **Title**, "
+            "and optionally a usage column like **Loans** or **Checkouts**."
+        )
+        return
+
+    # Check session cache first — if we've already processed this file in
+    # this session, skip the load + LC extraction + weight coercion entirely
+    cached_df = _cached_df_for_tool("profiler", uploaded_file)
+    if cached_df is not None:
+        df = cached_df
+        st.success(f"✅ Using cached data for *{uploaded_file.name}* "
+                   f"({len(df):,} records)")
+        # Re-detect columns from cached df
+        subj_col = find_column(df, SUBJECT_ALIASES)
+        lc_col = find_column(df, LC_ALIASES)
+        title_col = find_column(df, TITLE_ALIASES)
+        weight_col = find_column(df, WEIGHT_ALIASES)
+        # Derive weight_label the same way the fresh path does
+        weight_label = weight_col if weight_col else "Title Count"
+    else:
+        file_bytes = uploaded_file.getvalue()
+        all_cols = _detect_columns_from_header(file_bytes)
+        subj_col = find_column(all_cols, SUBJECT_ALIASES)
+        lc_col = find_column(all_cols, LC_ALIASES)
+        title_col = find_column(all_cols, TITLE_ALIASES)
+        weight_col = find_column(all_cols, WEIGHT_ALIASES)
+
+        # Load all columns so the manual-override dropdown has full options.
+        # This is a small cost vs. the prior partial-load optimization, but it
+        # means users can recover when our aliases miss their column names.
+        with st.spinner(f"Loading {uploaded_file.name}..."):
+            df = _load_csv_chunked(file_bytes, uploaded_file.name, cols_to_keep=None)
+
+        st.success(f"✅ Loaded **{len(df):,}** records from *{uploaded_file.name}*")
+
+        subj_col = find_column(df, SUBJECT_ALIASES)
+        lc_col = find_column(df, LC_ALIASES)
+        title_col = find_column(df, TITLE_ALIASES)
+        weight_col = find_column(df, WEIGHT_ALIASES)
+
+        if weight_col:
+            df['_weight'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(1)
+            weight_label = weight_col
+        else:
+            df['_weight'] = 1.0
+            weight_label = "Title Count"
+
+        if lc_col:
+            df['_lc_main'], df['_lc_sub'] = _extract_lc_vectorized(df[lc_col])
+        else:
+            df['_lc_main'] = None
+            df['_lc_sub'] = None
+
+        # Save to cache for future tool switches
+        _store_cached_df("profiler", uploaded_file, df)
+
+    # Track prior LC column so we re-extract if user changes it
+    _original_lc_col = find_column(df, LC_ALIASES)
+
+    # Column detection + manual override
+    detected_ok = bool(subj_col or lc_col)
+    with st.expander(
+        "🔍 Column mapping" + ("" if detected_ok else " — ⚠️ action needed"),
+        expanded=not detected_ok
+    ):
+        if detected_ok:
+            st.caption("We auto-detected these columns. Override any of them if we guessed wrong.")
+        else:
+            st.warning(
+                "We couldn't automatically find a Subjects or LC Classification column. "
+                "Pick the right ones from your file below — you need at least one of Subjects or LC."
+            )
+        all_cols = list(df.columns)
+        # Hide internal columns we added
+        all_cols = [c for c in all_cols if not c.startswith('_')]
+        none_opt = "— none —"
+        options = [none_opt] + all_cols
+
+        def _idx(col):
+            return options.index(col) if col in all_cols else 0
+
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            subj_pick = st.selectbox("Subjects column", options, index=_idx(subj_col), key="prof_map_subj")
+            title_pick = st.selectbox("Title column (optional)", options, index=_idx(title_col), key="prof_map_title")
+        with mc2:
+            lc_pick = st.selectbox("LC / Call Number column", options, index=_idx(lc_col), key="prof_map_lc")
+            weight_pick = st.selectbox("Usage / weight column (optional)", options, index=_idx(weight_col), key="prof_map_weight")
+
+        subj_col = None if subj_pick == none_opt else subj_pick
+        lc_col = None if lc_pick == none_opt else lc_pick
+        title_col = None if title_pick == none_opt else title_pick
+        new_weight_col = None if weight_pick == none_opt else weight_pick
+
+    # If user changed the weight column, re-coerce _weight
+    if new_weight_col != weight_col:
+        weight_col = new_weight_col
+        if weight_col:
+            df['_weight'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(1)
+            weight_label = weight_col
+        else:
+            df['_weight'] = 1.0
+            weight_label = "Title Count"
+
+    # If user picked a different LC column than what was auto-detected, re-extract
+    if lc_col and lc_col != _original_lc_col:
+        df['_lc_main'], df['_lc_sub'] = _extract_lc_vectorized(df[lc_col])
+    elif not lc_col:
+        df['_lc_main'] = None
+        df['_lc_sub'] = None
+
+    if not subj_col and not lc_col:
+        st.error("❌ Please pick at least a Subjects or LC Classification column above to continue.")
+        return
+
+    # Sidebar: weight mode + LC filter only (upstream choices that change what's analyzed)
+    with st.sidebar:
+        st.subheader("Analysis settings")
+        weight_options = ["Title count (1 per title)"]
+        if weight_col:
+            weight_options.append(f"Usage metric ({weight_label})")
+        analysis_mode = st.radio("Weight titles by:", weight_options, index=0, key="prof_mode")
+        use_weight = weight_col and "Usage" in analysis_mode
+
+        if lc_col:
+            st.markdown("---")
+            st.subheader("Filter by LC class")
+            avail = sorted(df['_lc_main'].dropna().unique())
+            labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in avail]
+            sel_labels = st.multiselect("Include:", labels, default=labels, key="prof_lc_filter")
+            sel_classes = [l.split(' –')[0] for l in sel_labels]
+        else:
+            sel_classes = None
+
+    # Main-body: visualization toggles in a collapsed "Customize view" expander
+    with st.expander("🎨 Customize view (visualizations, word cloud, thresholds)", expanded=False):
+        vc1, vc2 = st.columns(2)
+        with vc1:
+            top_n = st.slider("Top N subjects", 10, 100, 30, 5, key="prof_topn")
+            show_sunburst = st.checkbox("LC sunburst", True, key="prof_sun")
+            show_treemap = st.checkbox("LC treemap", True, key="prof_tree")
+            show_bars = st.checkbox("Top subjects bar chart", True, key="prof_bars")
+            show_wordcloud = st.checkbox("Subject word cloud", True, key="prof_wc")
+        with vc2:
+            show_heatmap = st.checkbox("LC × subject heatmap", True, key="prof_heat")
+            show_title_keywords = st.checkbox(
+                "Title keywords (uncontrolled vocabulary)",
+                value=bool(title_col),
+                disabled=not title_col,
+                key="prof_tk",
+                help="A supplementary lens that tokenizes title text (with stopwords "
+                     "stripped) — useful for surfacing terminology that subject "
+                     "headings may have missed. Requires a Title column. Distinct "
+                     "from the subject view above."
+            )
+            show_coverage_vs_use = st.checkbox(
+                "Coverage vs. Use (requires usage column)",
+                value=bool(weight_col),
+                disabled=not weight_col,
+                key="prof_cvu",
+                help="Compare what % of the collection each area holds vs. what % "
+                     "of use it drives. Shows overperforming (small but heavily used) "
+                     "and underperforming (large but lightly used) areas. "
+                     "Uses LC class when available; falls back to subject terms otherwise."
+            )
+            show_gap = st.checkbox("Gap analysis", True, key="prof_gap")
+            show_detail = st.checkbox("Title detail table", False, key="prof_detail")
+
+        # Coverage-vs-Use threshold configuration
+        if show_coverage_vs_use and weight_col:
+            with st.expander("⚖️ Coverage vs. Use thresholds"):
+                st.caption("Signal = (% of use) ÷ (% of holdings). A value of 1.0 means "
+                           "usage is proportional to holdings.")
+                cvu_over = st.slider(
+                    "Overperforming threshold (≥)",
+                    min_value=1.1, max_value=5.0, value=2.0, step=0.1,
+                    key="prof_cvu_over",
+                    help="Ratio at or above this flags an area as overperforming "
+                         "(higher % of use than of holdings). Lower = more areas flagged."
+                )
+                cvu_under = st.slider(
+                    "Underperforming threshold (≤)",
+                    min_value=0.1, max_value=0.9, value=0.5, step=0.05,
+                    key="prof_cvu_under",
+                    help="Ratio at or below this flags an area as underperforming "
+                         "(lower % of use than of holdings). Higher = more areas flagged."
+                )
+                cvu_min_titles = st.number_input(
+                    "Minimum titles to include in signal",
+                    min_value=1, max_value=1000, value=10,
+                    key="prof_cvu_min",
+                    help="LC areas with fewer titles than this won't get a signal "
+                         "label (too little data to draw conclusions). They still appear "
+                         "in the table marked as '—'."
+                )
+                cvu_show_sub = st.checkbox(
+                    "Also break down by LC subclass",
+                    value=True,
+                    key="prof_cvu_sub",
+                    help="Shows e.g. HQ1000s separately from HQ750s."
+                )
+        else:
+            cvu_over, cvu_under, cvu_min_titles, cvu_show_sub = 2.0, 0.5, 10, True
+
+        # Word cloud sub-options (only shown when word cloud is on)
+        if show_wordcloud:
+            with st.expander("☁️ Word cloud options"):
+                wc_max_words = st.slider("Max words", 20, 200, 100, 10, key="prof_wc_max")
+                wc_min_len = st.slider("Min word length", 1, 10, 3, key="prof_wc_min")
+                wc_color = st.selectbox(
+                    "Color scheme",
+                    ["viridis", "plasma", "inferno", "magma", "cividis", "twilight", "rainbow"],
+                    key="prof_wc_color"
+                )
+        else:
+            wc_max_words, wc_min_len, wc_color = 100, 3, "viridis"
+
+        # Title-keyword sub-options
+        if show_title_keywords:
+            with st.expander("🔤 Title keyword options"):
+                tk_top_n = st.slider(
+                    "Top N keywords (per n-gram size)", 10, 100, 30, 5, key="prof_tk_topn",
+                    help="Number of keywords/phrases to chart and include in the "
+                         "table for each n-gram size you've selected."
+                )
+                tk_ngram_choice = st.multiselect(
+                    "N-gram sizes",
+                    options=["Single words (unigrams)",
+                             "Two-word phrases (bigrams)",
+                             "Three-word phrases (trigrams)"],
+                    default=["Single words (unigrams)",
+                             "Two-word phrases (bigrams)"],
+                    key="prof_tk_ngrams",
+                    help="Phrases preserve concepts that single words split apart "
+                         "(e.g., 'data science' as a unit, not 'data' + 'science'). "
+                         "N-grams don't cross subtitle punctuation, and stopwords "
+                         "are removed before phrases are built. Selecting more sizes "
+                         "doesn't slow analysis meaningfully."
+                )
+                _ngram_map = {
+                    "Single words (unigrams)": 1,
+                    "Two-word phrases (bigrams)": 2,
+                    "Three-word phrases (trigrams)": 3,
+                }
+                tk_ngram_sizes = tuple(sorted(
+                    _ngram_map[c] for c in tk_ngram_choice
+                )) or (1,)
+                tk_min_freq = st.number_input(
+                    "Min distinct titles (for bigrams/trigrams)",
+                    min_value=1, max_value=20, value=2, step=1,
+                    key="prof_tk_minfreq",
+                    help="Multi-word phrases that appear in only one title are "
+                         "usually noise (or a duplicate record). Set to 1 to "
+                         "include them anyway. Doesn't apply to single-word "
+                         "keywords."
+                )
+                tk_show_wordcloud = st.checkbox(
+                    "Also show keyword word cloud", value=False, key="prof_tk_wc",
+                    help="A separate cloud from the subject one — built from title "
+                         "tokens, not subject headings. Uses unigrams only "
+                         "(word clouds don't render multi-word phrases well)."
+                )
+                if tk_show_wordcloud:
+                    tk_wc_max_words = st.slider(
+                        "Cloud: max words", 20, 200, 100, 10, key="prof_tk_wc_max"
                     )
+                    tk_wc_color = st.selectbox(
+                        "Cloud: color scheme",
+                        ["plasma", "viridis", "inferno", "magma", "cividis",
+                         "twilight", "rainbow"],
+                        key="prof_tk_wc_color"
+                    )
+                else:
+                    tk_wc_max_words, tk_wc_color = 100, "plasma"
+                tk_extra_raw = st.text_area(
+                    "Extra stopwords (comma- or newline-separated)",
+                    value="",
+                    height=80,
+                    key="prof_tk_stops",
+                    help="Add domain-specific words to ignore — e.g., your "
+                         "publisher's series name, or a recurring genre word that "
+                         "isn't analytically interesting. Applied before n-grams "
+                         "are built, so 'history of medicine' becomes the bigram "
+                         "'history medicine' if 'of' is in the stopword list "
+                         "(it already is)."
+                )
+                tk_extra_stopwords = {
+                    w.strip().lower() for w in re.split(r"[,\n]", tk_extra_raw) if w.strip()
+                }
+                if tk_extra_stopwords:
+                    st.caption(f"Filtering out {len(tk_extra_stopwords)} extra word(s).")
+        else:
+            tk_top_n, tk_show_wordcloud = 30, False
+            tk_wc_max_words, tk_wc_color = 100, "plasma"
+            tk_extra_stopwords = set()
+            tk_ngram_sizes = (1, 2, 3)
+            tk_min_freq = 2
+
+        st.caption(
+            "Changes here apply the next time you click **Re-run analysis** "
+            "(or the main button below)."
+        )
+        rerun_clicked = st.button("🔄 Re-run analysis", key="prof_rerun", use_container_width=True)
+
+    # Decide whether to run analysis:
+    # - Always run on first upload of a file (no cached results for this file)
+    # - Re-run if user clicks the rerun button inside the expander
+    # - Re-run if user explicitly clicks the main Analyze button (shown below)
+    file_key = _make_file_key(uploaded_file)
+    last_run_key = st.session_state.get('prof_last_run_file_key')
+    needs_autorun = st.session_state.get('prof_results') is None or last_run_key != file_key
+
+    main_run_clicked = st.button(
+        "🔍 Re-analyze collection",
+        type="secondary",
+        use_container_width=True,
+        key="prof_run",
+        help="Click to re-run with current settings."
+    )
+
+    if needs_autorun or rerun_clicked or main_run_clicked:
+        w_key = '_weight' if use_weight else None
+        pbar = st.progress(0, "Starting analysis...")
+        results = _profiler_run_analysis(
+            df, subj_col, lc_col, title_col, w_key, sel_classes, pbar,
+            has_usage_col=bool(weight_col),
+            ngram_sizes=tk_ngram_sizes,
+        )
+        st.session_state['prof_results'] = results
+        st.session_state['prof_last_run_file_key'] = file_key
+        if sel_classes is not None and lc_col:
+            mask = df['_lc_main'].isin(sel_classes) | df['_lc_main'].isna()
+            st.session_state['prof_filtered_idx'] = df.index[mask]
+        else:
+            st.session_state['prof_filtered_idx'] = df.index
+        st.session_state['prof_settings'] = {
+            'weight_label': weight_label if use_weight else 'Title Count',
+            'usage_col_label': weight_col or 'Usage',
+            'has_usage_col': bool(weight_col),
+            'top_n_subjects': top_n,
+            'show_sunburst': show_sunburst, 'show_treemap': show_treemap,
+            'show_subject_bars': show_bars,
+            'show_wordcloud': show_wordcloud,
+            'wc_max_words': wc_max_words, 'wc_min_len': wc_min_len, 'wc_color': wc_color,
+            'show_heatmap': show_heatmap,
+            'show_title_keywords': show_title_keywords,
+            'tk_top_n': tk_top_n, 'tk_show_wordcloud': tk_show_wordcloud,
+            'tk_wc_max_words': tk_wc_max_words, 'tk_wc_color': tk_wc_color,
+            'tk_extra_stopwords': tk_extra_stopwords,
+            'tk_ngram_sizes': tk_ngram_sizes, 'tk_min_freq': tk_min_freq,
+            'show_coverage_vs_use': show_coverage_vs_use,
+            'cvu_over': cvu_over, 'cvu_under': cvu_under,
+            'cvu_min_titles': cvu_min_titles, 'cvu_show_sub': cvu_show_sub,
+            'show_gap_analysis': show_gap, 'show_detail_table': show_detail,
+        }
+        pbar.empty()
+
+    if st.session_state['prof_results']:
+        _profiler_display_results(
+            st.session_state['prof_results'],
+            st.session_state.get('prof_settings', {
+                'weight_label': 'Title Count', 'usage_col_label': 'Usage',
+                'top_n_subjects': 30,
+                'show_sunburst': True, 'show_treemap': True,
+                'show_subject_bars': True, 'show_wordcloud': True,
+                'wc_max_words': 100, 'wc_min_len': 3, 'wc_color': 'viridis',
+                'show_heatmap': True,
+                'show_title_keywords': False,
+                'tk_top_n': 30, 'tk_show_wordcloud': False,
+                'tk_wc_max_words': 100, 'tk_wc_color': 'plasma',
+                'tk_extra_stopwords': set(),
+                'tk_ngram_sizes': (1, 2, 3), 'tk_min_freq': 2,
+                'show_coverage_vs_use': False,
+                'cvu_over': 2.0, 'cvu_under': 0.5,
+                'cvu_min_titles': 10, 'cvu_show_sub': True,
+                'show_gap_analysis': True, 'show_detail_table': False,
+            }),
+            df,
+            st.session_state.get('prof_filtered_idx', df.index)
+        )
 
 
 # =====================================================================
-# PLACEHOLDERS FOR OTHER TOOLS
+# =====================================================================
+# TOOL 2: USAGE & SUBSCRIPTION ANALYZER
+# =====================================================================
+# "What's being used and what isn't?"
+# Merged from: app(3).py (COUNTER dashboard) + print circulation mode
+# =====================================================================
 # =====================================================================
 
-def page_zero_use():
-    st.title("🔍 Zero-Use Identifier")
-    st.info("Zero-Use Identifier functionality will be implemented here.")
+@st.cache_data(show_spinner=False)
+def _load_counter_csv(file_bytes, filename):
+    """Load a COUNTER 5 TR CSV, stripping the standard 13-row metadata header."""
+    # Try common skiprows values since vendors vary slightly
+    last_err = None
+    for skip in [13, 14, 12, 15]:
+        try:
+            df = pd.read_csv(BytesIO(file_bytes), skiprows=skip, encoding='utf-8-sig',
+                             low_memory=False)
+            df.columns = df.columns.str.strip()
+            # Sanity check: COUNTER should have Title + Metric_Type or similar
+            if 'Title' in df.columns and any(
+                c in df.columns for c in ['Metric_Type', 'Reporting Period_Total',
+                                           'Reporting_Period_Total']
+            ):
+                return df, skip
+        except Exception as e:
+            last_err = e
+            continue
+    # Fallback: read without skipping
+    try:
+        df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False)
+        df.columns = df.columns.str.strip()
+        return df, 0
+    except Exception:
+        raise last_err or ValueError("Could not parse COUNTER CSV.")
 
 
-def page_acquisition_scorer():
-    st.title("📊 Acquisition Scorer")
-    st.info("Acquisition Scorer functionality will be implemented here.")
+@st.cache_data(show_spinner=False)
+def _load_print_csv(file_bytes, filename):
+    """Load a print circulation CSV (flat file, no metadata header)."""
+    try:
+        df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False)
+    except Exception:
+        df = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', low_memory=False)
+    df.columns = df.columns.str.strip()
+    return df
+
+
+def _identify_month_columns(df):
+    """Identify columns that look like 'Jan-2025' or 'Jan 2025'."""
+    return [c for c in df.columns
+            if re.match(r'^[A-Za-z]{3}[- ]\d{4}$', c)]
+
+
+def _month_col_to_date(col):
+    """Convert 'Jan-2025' or 'Jan 2025' to a pd.Timestamp (first of month)."""
+    try:
+        return pd.to_datetime(col.replace(' ', '-'), format='%b-%Y')
+    except Exception:
+        return pd.NaT
+
+
+def _detect_counter_date_range(month_cols):
+    """From a list of month columns, return (min_date, max_date, sorted_cols)
+    or (None, None, []) if empty.
+    """
+    if not month_cols:
+        return None, None, []
+    dated = [(c, _month_col_to_date(c)) for c in month_cols]
+    dated = [(c, d) for c, d in dated if pd.notna(d)]
+    if not dated:
+        return None, None, []
+    dated.sort(key=lambda x: x[1])
+    return dated[0][1], dated[-1][1], [c for c, _ in dated]
+
+
+DATE_COL_ALIASES = [
+    'Checkout Date', 'checkout_date', 'Loan Date', 'loan_date',
+    'Transaction Date', 'transaction_date', 'Last Charge Date', 'last_charge_date',
+    'Last Used', 'last_used', 'Last Checkout', 'last_checkout',
+    'Date', 'date', 'DATE', 'Due Date', 'due_date',
+]
+
+
+def _detect_print_date_column(df):
+    """Find a date-like column in a print circulation dataframe.
+    Returns the column name or None. Tries aliases first, then falls back
+    to any column whose name contains date-related keywords AND parses as dates
+    for >50% of values.
+    """
+    # Try explicit aliases (exact match, case-insensitive)
+    for alias in DATE_COL_ALIASES:
+        for col in df.columns:
+            if alias.lower() == col.lower():
+                return col
+    # Partial match — must contain date-related keyword AND parse as dates
+    date_keywords = ['date', 'checkout', 'loan', 'charge']
+    for col in df.columns:
+        lc = col.lower()
+        if any(tok in lc for tok in date_keywords):
+            # Skip numeric columns — pd.to_datetime coerces numbers to epoch dates
+            if pd.api.types.is_numeric_dtype(df[col]):
+                continue
+            try:
+                parsed = pd.to_datetime(df[col], errors='coerce')
+                if parsed.notna().sum() / max(1, len(df)) > 0.5:
+                    return col
+            except Exception:
+                continue
+    return None
+
+
+def _format_date_range(start, end):
+    """Format a date range for display: 'Jan 2025 – Jun 2025' or 'Feb 12 – Mar 30, 2025'."""
+    if pd.isna(start) or pd.isna(end):
+        return "unknown"
+    if start.year == end.year and start.month == end.month:
+        return start.strftime('%B %Y')
+    if start.year == end.year:
+        return f"{start.strftime('%b')} – {end.strftime('%b %Y')}"
+    return f"{start.strftime('%b %Y')} – {end.strftime('%b %Y')}"
+
+
+def _slug_period(label):
+    """Turn a period label like 'Jan – Jun 2025' into a filename-safe 'Jan-Jun-2025'."""
+    if not label or label == "unknown period":
+        return ""
+    slug = re.sub(r'[^\w\s-]', '', label)  # drop punctuation
+    slug = re.sub(r'\s+', '-', slug.strip())  # spaces → dashes
+    return slug
+
+
+def _render_counter_mode():
+    """COUNTER 5 Title Report analysis."""
+    st.markdown(
+        "Upload a **COUNTER 5 Title Report (TR)** CSV to analyze e-resource usage, "
+        "identify cancellation candidates, and track monthly trends."
+    )
+    uploaded_file = st.file_uploader(
+        "Upload your COUNTER 5 TR CSV", type=["csv"], key="usage_counter_upload"
+    )
+    if uploaded_file is None:
+        with st.expander("📖 How to use this mode", expanded=True):
+            st.markdown("""
+            Upload a standard COUNTER 5 TR export (from EBSCO, ProQuest, Springer, etc.).
+            The loader auto-skips the metadata header and detects the reporting period
+            from month columns.
+
+            **Typical workflow:**
+            1. Load the file and pick a metric (usually `Unique_Item_Requests`)
+            2. Check the detected reporting period at the top; narrow it with the
+               **Date Range** filter in the sidebar if you want to focus on a specific window
+            3. Review the **Top Titles** tab to see your workhorses
+            4. Check **Cancellation Review** for underperformers
+            5. Use **Publisher Summary** to evaluate whole packages
+            6. Look at **Monthly Trends** to spot seasonality or decline
+
+            **Tip:** Set a custom reporting-period label in the sidebar (e.g., "FY2025 Q1")
+            to label downloads clearly.
+            """)
+        return
+
+    try:
+        # Check session cache first
+        cached = _cached_df_for_tool("usage_counter", uploaded_file)
+        if cached is not None:
+            df_raw = cached['df']
+            skip_used = cached['skip_used']
+            st.success(f"✅ Using cached data for *{uploaded_file.name}* "
+                       f"({len(df_raw):,} rows)")
+        else:
+            file_bytes = uploaded_file.getvalue()
+            df_raw, skip_used = _load_counter_csv(file_bytes, uploaded_file.name)
+            _store_cached_df("usage_counter", uploaded_file,
+                             {'df': df_raw, 'skip_used': skip_used})
+            st.success(f"✅ Loaded **{len(df_raw):,}** rows from *{uploaded_file.name}* "
+                       f"(skipped {skip_used} metadata rows)")
+
+        # Detect columns
+        month_cols = _identify_month_columns(df_raw)
+        total_col = next((c for c in df_raw.columns
+                         if c.lower().replace(' ', '_') in
+                         ('reporting_period_total',)), None)
+        if total_col is None:
+            total_col = next((c for c in df_raw.columns
+                             if 'total' in c.lower() and 'period' in c.lower()), None)
+
+        # Date range detection from month columns
+        date_min, date_max, sorted_month_cols = _detect_counter_date_range(month_cols)
+
+        # Reporting period banner
+        if date_min is not None:
+            period_label = _format_date_range(date_min, date_max)
+            st.info(f"📅 **Reporting period detected:** {period_label} "
+                    f"({len(sorted_month_cols)} months of data)")
+        else:
+            st.warning("📅 No month columns detected. The file may have a non-standard "
+                       "format, or may contain only aggregate totals.")
+            period_label = "unknown period"
+
+        with st.expander("🔍 Column Detection", expanded=False):
+            st.write(f"**Total column:** `{total_col}`")
+            st.write(f"**Month columns detected:** {len(month_cols)} "
+                     f"({sorted_month_cols[0] if sorted_month_cols else 'none'} … "
+                     f"{sorted_month_cols[-1] if sorted_month_cols else 'none'})")
+            st.write(f"**All columns:** {list(df_raw.columns)}")
+
+        if total_col is None:
+            st.error("❌ Could not find a 'Reporting Period Total' column. "
+                     "This may not be a standard COUNTER 5 TR file.")
+            return
+
+        # Sidebar filters
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔎 Counter Filters")
+
+        # Date range filter (uses month columns)
+        use_date_filter = False
+        selected_month_cols = sorted_month_cols  # default: all months
+        if sorted_month_cols and len(sorted_month_cols) > 1:
+            with st.sidebar.expander("📅 Date Range", expanded=False):
+                use_date_filter = st.checkbox(
+                    "Filter by date range", value=False, key="usage_use_dates"
+                )
+                if use_date_filter:
+                    # Use select_slider over sorted month labels (simpler than date picker
+                    # for monthly granularity, and avoids confusion with non-month days)
+                    start_label, end_label = st.select_slider(
+                        "Months to include",
+                        options=sorted_month_cols,
+                        value=(sorted_month_cols[0], sorted_month_cols[-1]),
+                        key="usage_date_range"
+                    )
+                    start_idx = sorted_month_cols.index(start_label)
+                    end_idx = sorted_month_cols.index(end_label)
+                    selected_month_cols = sorted_month_cols[start_idx:end_idx + 1]
+                    sel_start = _month_col_to_date(start_label)
+                    sel_end = _month_col_to_date(end_label)
+                    period_label = _format_date_range(sel_start, sel_end)
+                    st.caption(f"Selected: **{period_label}** "
+                               f"({len(selected_month_cols)} months)")
+
+        # Override label for reports/downloads
+        with st.sidebar.expander("🏷️ Report label (optional)", expanded=False):
+            custom_period = st.text_input(
+                "Custom reporting period label",
+                value="",
+                placeholder=f"e.g., FY2025 Q1–Q2",
+                help="Overrides the auto-detected label on downloads and headers.",
+                key="usage_period_label"
+            )
+            if custom_period.strip():
+                period_label = custom_period.strip()
+
+        if 'Metric_Type' in df_raw.columns:
+            metric_options = sorted(df_raw['Metric_Type'].dropna().unique())
+            default_idx = (list(metric_options).index('Unique_Item_Requests')
+                           if 'Unique_Item_Requests' in metric_options else 0)
+            selected_metric = st.sidebar.selectbox(
+                "Metric Type", metric_options, index=default_idx, key="usage_metric"
+            )
+            df_raw = df_raw[df_raw['Metric_Type'] == selected_metric].copy()
+        else:
+            selected_metric = "All (Metric_Type column missing)"
+
+        data_type_col = next((c for c in ['Data Type', 'Data_Type'] if c in df_raw.columns), None)
+        if data_type_col:
+            data_types = sorted(df_raw[data_type_col].dropna().unique())
+            selected_types = st.sidebar.multiselect(
+                "Data Type", data_types, default=data_types, key="usage_dtype"
+            )
+            df_filtered = df_raw[df_raw[data_type_col].isin(selected_types)].copy()
+        else:
+            df_filtered = df_raw.copy()
+
+        if 'Publisher' in df_filtered.columns:
+            publishers = sorted(df_filtered['Publisher'].dropna().unique())
+            selected_pubs = st.sidebar.multiselect(
+                "Publisher", publishers, default=publishers, key="usage_pub"
+            )
+            df_filtered = df_filtered[df_filtered['Publisher'].isin(selected_pubs)]
+
+        # KPIs — if date-filtered, recompute totals from selected month columns
+        st.markdown("---")
+        st.subheader(f"Overview — {selected_metric} · {period_label}")
+
+        # Compute the per-row total that respects the date filter
+        if use_date_filter and selected_month_cols:
+            # Sum just the selected months (coerce to numeric first)
+            month_data = df_filtered[selected_month_cols].apply(
+                pd.to_numeric, errors='coerce'
+            ).fillna(0)
+            df_filtered = df_filtered.copy()
+            df_filtered['_total'] = month_data.sum(axis=1)
+        else:
+            df_filtered = df_filtered.copy()
+            df_filtered['_total'] = pd.to_numeric(
+                df_filtered[total_col], errors='coerce'
+            ).fillna(0)
+
+        total_usage = df_filtered['_total'].sum()
+        unique_titles = df_filtered['Title'].nunique() if 'Title' in df_filtered.columns else 0
+        avg_usage = total_usage / unique_titles if unique_titles > 0 else 0
+        zero_use = (df_filtered['_total'] == 0).sum()
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Usage", f"{int(total_usage):,}")
+        k2.metric("Unique Titles", f"{unique_titles:,}")
+        k3.metric("Avg Usage / Title", f"{avg_usage:.1f}")
+        k4.metric("Zero-Use Titles", f"{zero_use:,}")
+
+        # Notes — shown above tabs so users annotate *before* downloading
+        notes = _notes_widget(
+            "usage_counter",
+            placeholder="e.g., Prepared for FY2025 e-resource renewal review. "
+                        "Cancellation candidates flagged for follow-up with Anthony."
+        )
+
+        # Fresh tray for this render pass
+        _reset_tray("usage_counter")
+
+        # Analysis tabs
+        st.markdown("---")
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "Top titles", "Cancellation review",
+            "Publisher summary", "Monthly trends"
+        ])
+
+        with tab1:
+            top_n = st.slider("Show Top N Titles", 5, 100, 25, key="usage_topn")
+            top_cols = ['Title', '_total']
+            if 'Publisher' in df_filtered.columns:
+                top_cols.insert(1, 'Publisher')
+            top_titles = df_filtered.nlargest(top_n, '_total')[top_cols].rename(
+                columns={'_total': selected_metric}
+            )
+            fig_top = px.bar(
+                top_titles, x=selected_metric, y='Title', orientation='h',
+                title=f"Top {top_n} Titles by {selected_metric}",
+                color=selected_metric,
+                color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                hover_data={'Publisher': True} if 'Publisher' in top_titles.columns else None
+            )
+            fig_top.update_layout(
+                yaxis={'categoryorder': 'total ascending'},
+                height=max(450, top_n * 22)
+            )
+            st.plotly_chart(fig_top, use_container_width=True)
+            _top_fname = f"top_titles_{_slug_period(period_label)}.csv".replace('_.', '.')
+            _top_bytes = _annotate_csv(top_titles, notes,
+                                       extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                   'View': 'Top Titles',
+                                                   'Metric': selected_metric,
+                                                   'Period': period_label})
+            st.download_button("📥 Top titles (CSV)", _top_bytes, _top_fname,
+                               "text/csv", key="usage_dl_top")
+            _add_to_tray("usage_counter", _top_fname, _top_bytes)
+
+        with tab2:
+            st.info("Review titles with low usage for potential cancellation or renegotiation.")
+            threshold = st.number_input(
+                "Low-Usage Threshold (total for reporting period)",
+                min_value=0, value=5, key="usage_threshold"
+            )
+            low_cols = ['Title', '_total']
+            if 'Publisher' in df_filtered.columns:
+                low_cols.insert(1, 'Publisher')
+            if data_type_col:
+                low_cols.append(data_type_col)
+            low_use_df = df_filtered[df_filtered['_total'] <= threshold][low_cols].sort_values('_total')
+            low_use_df = low_use_df.rename(columns={'_total': selected_metric})
+
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("Titles ≤ Threshold", f"{len(low_use_df):,}")
+            cc2.metric("% of Filtered", f"{len(low_use_df)/max(1,len(df_filtered))*100:.1f}%")
+            cc3.metric("Usage Lost if Cancelled",
+                       f"{int(low_use_df[selected_metric].sum()):,}")
+
+            st.dataframe(low_use_df, use_container_width=True, height=400)
+            _cancel_fname = f"cancellation_review_{_slug_period(period_label)}.csv".replace('_.', '.')
+            _cancel_bytes = _annotate_csv(low_use_df, notes,
+                                          extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                      'View': 'Cancellation Review',
+                                                      'Metric': selected_metric,
+                                                      'Threshold': threshold,
+                                                      'Period': period_label})
+            st.download_button("📥 Cancellation review list (CSV)",
+                               _cancel_bytes, _cancel_fname, "text/csv",
+                               key="usage_dl_cancel")
+            _add_to_tray("usage_counter", _cancel_fname, _cancel_bytes)
+
+        with tab3:
+            if 'Publisher' in df_filtered.columns:
+                pub_summary = df_filtered.groupby('Publisher').agg(
+                    **{
+                        'Title Count': ('Title', 'nunique'),
+                        'Total Usage': ('_total', 'sum'),
+                    }
+                ).reset_index()
+                pub_summary['Usage Density'] = (
+                    pub_summary['Total Usage'] / pub_summary['Title Count']
+                ).round(1)
+                pub_summary['Zero-Use Titles'] = df_filtered.assign(
+                    _zero=(df_filtered['_total'] == 0).astype(int)
+                ).groupby('Publisher')['_zero'].sum().reindex(pub_summary['Publisher']).values
+                pub_summary = pub_summary.sort_values('Total Usage', ascending=False)
+
+                st.dataframe(pub_summary, use_container_width=True, hide_index=True, height=500)
+                _pub_fname = f"publisher_summary_{_slug_period(period_label)}.csv".replace('_.', '.')
+                _pub_bytes = _annotate_csv(pub_summary, notes,
+                                           extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                                       'View': 'Publisher Summary',
+                                                       'Metric': selected_metric,
+                                                       'Period': period_label})
+                st.download_button("📥 Publisher summary (CSV)",
+                                   _pub_bytes, _pub_fname, "text/csv",
+                                   key="usage_dl_pub")
+                _add_to_tray("usage_counter", _pub_fname, _pub_bytes)
+            else:
+                st.info("No Publisher column in this file.")
+
+        with tab4:
+            if month_cols:
+                # Use selected_month_cols (which equals sorted_month_cols when filter off)
+                id_vars = ['Title']
+                if 'Publisher' in df_filtered.columns:
+                    id_vars.append('Publisher')
+                present_months = [c for c in selected_month_cols if c in df_filtered.columns]
+                if not present_months:
+                    st.info("No month columns found in filtered data.")
+                else:
+                    df_melted = df_filtered.melt(
+                        id_vars=id_vars, value_vars=present_months,
+                        var_name='Month', value_name='Usage'
+                    )
+                    df_melted['Usage'] = pd.to_numeric(df_melted['Usage'], errors='coerce').fillna(0)
+                    df_melted['Month'] = pd.to_datetime(
+                        df_melted['Month'].str.replace(' ', '-'), format='%b-%Y', errors='coerce'
+                    )
+                    monthly_trend = df_melted.groupby('Month', as_index=False)['Usage'].sum()
+                    fig_trend = px.line(
+                        monthly_trend, x='Month', y='Usage', markers=True,
+                        title=f"Monthly {selected_metric} — {period_label}",
+                    )
+                    fig_trend.update_traces(line_color='#285C4D')
+                    st.plotly_chart(fig_trend, use_container_width=True)
+
+                    # Top-title breakdown
+                    st.markdown("**Monthly trend for top 5 titles:**")
+                    top5_titles = df_filtered.nlargest(5, '_total')['Title'].tolist()
+                    tdf = df_melted[df_melted['Title'].isin(top5_titles)]
+                    if not tdf.empty:
+                        fig_tt = px.line(
+                            tdf.groupby(['Month', 'Title'], as_index=False)['Usage'].sum(),
+                            x='Month', y='Usage', color='Title', markers=True,
+                            title=f"Monthly Usage — Top 5 Titles — {period_label}"
+                        )
+                        st.plotly_chart(fig_tt, use_container_width=True)
+            else:
+                st.info("No month columns (e.g., `Jan-2025`) detected in this file.")
+
+        # Consolidated download tray
+        st.markdown("---")
+        st.subheader("Downloads")
+        _render_download_tray("usage_counter",
+                              zip_filename=f"usage_counter_{_slug_period(period_label)}.zip".replace('_.', '.'))
+
+    except Exception as e:
+        st.error(f"❌ Error processing file: {e}")
+        st.info("Ensure you are uploading a standard COUNTER 5 TR CSV. "
+                "If the file has an unusual structure, try exporting a fresh copy from the vendor.")
+
+
+def _render_print_mode():
+    """Print circulation analysis."""
+    st.markdown(
+        "Upload a **print circulation export** to identify high- and low-circulating "
+        "titles for weeding review, collection rotation, or replacement decisions."
+    )
+    uploaded_file = st.file_uploader(
+        "Upload your print circulation CSV", type=["csv"], key="usage_print_upload"
+    )
+    if uploaded_file is None:
+        with st.expander("📖 How to use this mode", expanded=True):
+            st.markdown("""
+            Upload a flat CSV with columns like:
+            - `Title` *(required)*
+            - `Loans` / `Checkouts` / `Circulation` *(one required as the usage metric)*
+            - `Author`, `LC Classification`, `Location`, `Publication Year` *(optional, enable more analysis)*
+            - `Checkout Date` / `Loan Date` / `Last Charge Date` *(optional, enables date filtering)*
+
+            **Typical workflow:**
+            1. Load the file; the loader auto-detects your usage column and any date column
+            2. If a date column is present, narrow the window with the sidebar **Date Range** filter
+            3. If no date column exists, set a manual label (e.g., "AY 2024–25") in the
+               sidebar so downloads are clearly named
+            4. Review **Top Titles** to see your workhorses
+            5. Check **Weeding Review** for low/no-circulation candidates
+            6. Use **LC Breakdown** to see which areas of the collection are pulling weight
+            """)
+        return
+
+    try:
+        # Check session cache first
+        cached_df = _cached_df_for_tool("usage_print", uploaded_file)
+        if cached_df is not None:
+            df = cached_df.copy()  # copy so sidebar filtering doesn't mutate cache
+            st.success(f"✅ Using cached data for *{uploaded_file.name}* "
+                       f"({len(df):,} records)")
+        else:
+            file_bytes = uploaded_file.getvalue()
+            df = _load_print_csv(file_bytes, uploaded_file.name)
+            _store_cached_df("usage_print", uploaded_file, df)
+            st.success(f"✅ Loaded **{len(df):,}** records from *{uploaded_file.name}*")
+
+        # Detect columns
+        title_col = find_column(df, TITLE_ALIASES)
+        weight_col = find_column(df, WEIGHT_ALIASES)
+        lc_col = find_column(df, LC_ALIASES)
+        author_col = find_column(df, ['Author', 'author', 'AUTHOR', 'Creator'])
+        location_col = find_column(df, ['Location', 'Location Name', 'location'])
+        date_col = _detect_print_date_column(df)
+
+        with st.expander("🔍 Column Detection", expanded=False):
+            st.write(f"Title: `{title_col}` · Usage: `{weight_col}` · "
+                     f"LC: `{lc_col}` · Author: `{author_col}` · "
+                     f"Location: `{location_col}` · Date: `{date_col}`")
+
+        if not title_col:
+            st.error("❌ Need a Title column.")
+            return
+        if not weight_col:
+            st.error("❌ Need a usage column (Loans, Checkouts, Circulation, etc.).")
+            return
+
+        df['_usage'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(0)
+
+        # --- Reporting period handling ---
+        period_label = "unknown period"
+        if date_col:
+            # Parse the date column and show detected range
+            df['_date'] = pd.to_datetime(df[date_col], errors='coerce')
+            valid_dates = df['_date'].dropna()
+            if len(valid_dates) > 0:
+                date_min = valid_dates.min()
+                date_max = valid_dates.max()
+                period_label = _format_date_range(date_min, date_max)
+                st.info(f"📅 **Date range detected** (from `{date_col}`): "
+                        f"{date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')} "
+                        f"· {len(valid_dates):,} dated records")
+            else:
+                st.warning(f"📅 Found date column `{date_col}` but could not parse any values.")
+                date_col = None
+        else:
+            st.warning("📅 No date column detected. You can set a period label manually below "
+                       "for downloads and reports. (Date filtering is unavailable without date data.)")
+
+        # Sidebar filters
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔎 Print Filters")
+
+        # Date range filter (only if we have dates)
+        if date_col and df['_date'].notna().any():
+            with st.sidebar.expander("📅 Date Range", expanded=False):
+                use_date_filter = st.checkbox(
+                    "Filter by date range", value=False, key="usage_p_use_dates"
+                )
+                if use_date_filter:
+                    valid = df['_date'].dropna()
+                    dmin = valid.min().date()
+                    dmax = valid.max().date()
+                    start_date, end_date = st.date_input(
+                        "Select range",
+                        value=(dmin, dmax),
+                        min_value=dmin, max_value=dmax,
+                        key="usage_p_date_range"
+                    )
+                    # Apply filter
+                    mask = (df['_date'].dt.date >= start_date) & (df['_date'].dt.date <= end_date)
+                    df = df[mask | df['_date'].isna()].copy()
+                    period_label = _format_date_range(
+                        pd.Timestamp(start_date), pd.Timestamp(end_date)
+                    )
+                    st.caption(f"Selected: **{period_label}** ({len(df):,} records)")
+
+        # Manual period label override
+        with st.sidebar.expander("🏷️ Report label (optional)", expanded=False):
+            custom_period = st.text_input(
+                "Custom reporting period label",
+                value="",
+                placeholder="e.g., AY 2024–25, FY2025 Q1",
+                help="Used on headers and download filenames. "
+                     "Especially useful when no date column is present.",
+                key="usage_p_period_label"
+            )
+            if custom_period.strip():
+                period_label = custom_period.strip()
+
+        if location_col:
+            locs = sorted(df[location_col].dropna().unique())
+            selected_locs = st.sidebar.multiselect(
+                "Location", locs, default=locs, key="usage_p_loc"
+            )
+            df = df[df[location_col].isin(selected_locs)].copy()
+
+        if lc_col:
+            df['_lc_main'] = df[lc_col].apply(extract_lc_prefix)
+            lc_avail = sorted(df['_lc_main'].dropna().unique())
+            lc_labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in lc_avail]
+            sel_lc_labels = st.sidebar.multiselect(
+                "LC Class", lc_labels, default=lc_labels, key="usage_p_lc"
+            )
+            sel_lc = [l.split(' –')[0] for l in sel_lc_labels]
+            df = df[df['_lc_main'].isin(sel_lc) | df['_lc_main'].isna()].copy()
+
+        # KPIs
+        st.markdown("---")
+        st.subheader(f"Overview — {weight_col} · {period_label}")
+        total_loans = df['_usage'].sum()
+        zero_use = (df['_usage'] == 0).sum()
+        avg_loans = total_loans / max(1, len(df))
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Records", f"{len(df):,}")
+        k2.metric(f"Total {weight_col}", f"{int(total_loans):,}")
+        k3.metric(f"Avg {weight_col} / Title", f"{avg_loans:.1f}")
+        k4.metric("Zero-Use Titles", f"{zero_use:,}")
+
+        # Notes — shown above tabs so users annotate *before* downloading
+        notes = _notes_widget(
+            "usage_print",
+            placeholder="e.g., Annual weeding review for HQ section, Spring 2026. "
+                        "Proposed off-site storage candidates flagged for DelRosario review."
+        )
+
+        # Fresh tray for this render pass
+        _reset_tray("usage_print")
+
+        # Analysis tabs
+        st.markdown("---")
+        tabs = ["Top titles", "Weeding review"]
+        if lc_col:
+            tabs.append("LC breakdown")
+        if author_col:
+            tabs.append("Author summary")
+        tab_objs = st.tabs(tabs)
+
+        with tab_objs[0]:
+            top_n = st.slider("Show Top N Titles", 5, 100, 25, key="usage_p_topn")
+            display_cols = [title_col, '_usage']
+            if author_col:
+                display_cols.insert(1, author_col)
+            if lc_col:
+                display_cols.append(lc_col)
+            top_titles = df.nlargest(top_n, '_usage')[display_cols].rename(
+                columns={'_usage': weight_col}
+            )
+            fig_top = px.bar(
+                top_titles, x=weight_col, y=title_col, orientation='h',
+                title=f"Top {top_n} Titles by {weight_col} — {period_label}",
+                color=weight_col,
+                color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']]
+            )
+            fig_top.update_layout(
+                yaxis={'categoryorder': 'total ascending'},
+                height=max(450, top_n * 22)
+            )
+            st.plotly_chart(fig_top, use_container_width=True)
+
+        with tab_objs[1]:
+            st.info("Review titles with low or zero circulation for potential weeding, "
+                    "off-site storage, or replacement.")
+            threshold = st.number_input(
+                f"Low-Usage Threshold ({weight_col})", min_value=0, value=0, key="usage_p_thr"
+            )
+            low_cols = [title_col, '_usage']
+            if author_col:
+                low_cols.insert(1, author_col)
+            if lc_col:
+                low_cols.append(lc_col)
+            if location_col:
+                low_cols.append(location_col)
+            low_use_df = df[df['_usage'] <= threshold][low_cols].sort_values('_usage')
+            low_use_df = low_use_df.rename(columns={'_usage': weight_col})
+
+            cc1, cc2 = st.columns(2)
+            cc1.metric("Titles ≤ Threshold", f"{len(low_use_df):,}")
+            cc2.metric("% of Collection", f"{len(low_use_df)/max(1,len(df))*100:.1f}%")
+
+            st.dataframe(low_use_df, use_container_width=True, height=400)
+            _weed_fname = f"weeding_review_{_slug_period(period_label)}.csv".replace('_.', '.')
+            _weed_bytes = _annotate_csv(low_use_df, notes,
+                                        extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                    'View': 'Weeding Review',
+                                                    'Metric': weight_col,
+                                                    'Threshold': threshold,
+                                                    'Period': period_label})
+            st.download_button("📥 Weeding review list (CSV)",
+                               _weed_bytes, _weed_fname, "text/csv",
+                               key="usage_p_dl_weed")
+            _add_to_tray("usage_print", _weed_fname, _weed_bytes)
+
+        if lc_col:
+            with tab_objs[2]:
+                lc_summary = df.groupby('_lc_main').agg(
+                    **{
+                        'Title Count': (title_col, 'count'),
+                        f'Total {weight_col}': ('_usage', 'sum'),
+                    }
+                ).reset_index().rename(columns={'_lc_main': 'LC Class'})
+                lc_summary[f'Avg {weight_col} / Title'] = (
+                    lc_summary[f'Total {weight_col}'] / lc_summary['Title Count']
+                ).round(2)
+                lc_summary['Description'] = lc_summary['LC Class'].map(
+                    lambda c: LC_CLASSES.get(c, '?')
+                )
+                lc_summary = lc_summary[['LC Class', 'Description', 'Title Count',
+                                         f'Total {weight_col}', f'Avg {weight_col} / Title']]
+                lc_summary = lc_summary.sort_values(f'Total {weight_col}', ascending=False)
+                st.dataframe(lc_summary, use_container_width=True,
+                             hide_index=True, height=500)
+                _lc_fname = f"lc_circulation_breakdown_{_slug_period(period_label)}.csv".replace('_.', '.')
+                _lc_bytes = _annotate_csv(lc_summary, notes,
+                                          extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                      'View': 'LC Breakdown',
+                                                      'Metric': weight_col,
+                                                      'Period': period_label})
+                st.download_button("📥 LC breakdown (CSV)",
+                                   _lc_bytes, _lc_fname, "text/csv",
+                                   key="usage_p_dl_lc")
+                _add_to_tray("usage_print", _lc_fname, _lc_bytes)
+
+        if author_col:
+            idx = 3 if lc_col else 2
+            with tab_objs[idx]:
+                auth_summary = df.groupby(author_col).agg(
+                    **{
+                        'Title Count': (title_col, 'count'),
+                        f'Total {weight_col}': ('_usage', 'sum'),
+                    }
+                ).reset_index().sort_values(f'Total {weight_col}', ascending=False).head(100)
+                st.markdown("**Top 100 authors by total circulation:**")
+                st.dataframe(auth_summary, use_container_width=True,
+                             hide_index=True, height=500)
+                _auth_fname = f"author_circulation_{_slug_period(period_label)}.csv".replace('_.', '.')
+                _auth_bytes = _annotate_csv(auth_summary, notes,
+                                            extra_meta={'Tool': 'Usage Analyzer (Print)',
+                                                        'View': 'Author Summary',
+                                                        'Metric': weight_col,
+                                                        'Period': period_label})
+                st.download_button("📥 Author summary (CSV)",
+                                   _auth_bytes, _auth_fname, "text/csv",
+                                   key="usage_p_dl_auth")
+                _add_to_tray("usage_print", _auth_fname, _auth_bytes)
+
+        # Consolidated download tray
+        st.markdown("---")
+        st.subheader("Downloads")
+        _render_download_tray("usage_print",
+                              zip_filename=f"usage_print_{_slug_period(period_label)}.zip".replace('_.', '.'))
+
+    except Exception as e:
+        st.error(f"❌ Error processing file: {e}")
+
+
+def page_usage_analyzer():
+    """Tool 2: Usage & Subscription Analyzer."""
+    st.header("📈 Usage & Subscription Analyzer")
+    st.markdown(
+        "**What's being used and what isn't?** Title-level usage analysis for "
+        "renewal, cancellation, and weeding decisions."
+    )
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- **Collections:** Annual database renewals, print weeding by low circulation, "
+            "identifying single-title-driven subscriptions (candidates for swap to pay-per-view "
+            "or title-level purchase), publisher package evaluation.\n"
+            "- **Instruction:** Rarely — this is primarily a purchasing/weeding tool, not "
+            "an instructional one.\n"
+            "- **Outreach:** Evidence for faculty conversations (\"this database gets 12 uses "
+            "a year across your whole department — can we talk alternatives?\"), value reports "
+            "to administration, package-vs-title comparisons for liaison meetings."
+        )
+
+
+    mode = st.radio(
+        "Select data source:",
+        ["📊 COUNTER 5 (e-resources)", "📚 Print Circulation"],
+        horizontal=True, key="usage_mode"
+    )
+    st.markdown("---")
+
+    if mode == "📊 COUNTER 5 (e-resources)":
+        _render_counter_mode()
+    else:
+        _render_print_mode()
 
 
 # =====================================================================
-# MAIN NAVIGATION
 # =====================================================================
+# TOOL 3: ACQUISITION RECOMMENDATION SCORER
+# =====================================================================
+# "What should we buy next?"
+# Score candidate books against checkout history + optional faculty interests
+# =====================================================================
+# =====================================================================
+
+def _ensure_nltk():
+    """Download NLTK data if needed."""
+    if not NLTK_AVAILABLE:
+        return False
+    try:
+        nltk.data.find("tokenizers/punkt")
+        nltk.data.find("corpora/wordnet")
+    except LookupError:
+        nltk.download("punkt", quiet=True)
+        nltk.download("wordnet", quiet=True)
+        nltk.download("omw-1.4", quiet=True)
+    return True
+
+
+def normalize_author(author):
+    """Normalize author for lookup, generating reversed forms."""
+    if pd.isna(author) or not isinstance(author, str):
+        return set()
+    norm = normalize_text(author)
+    if len(norm) <= 2:
+        return set()
+    candidates = {norm}
+    if "," in author:
+        parts = [normalize_text(p) for p in author.split(",", 1)]
+        if len(parts) == 2 and parts[0] and parts[1]:
+            candidates.add(f"{parts[1]} {parts[0]}".strip())
+    return candidates
+
+
+REQUIRED_CHECKOUT_COLS = {"title", "checkouts"}
+RECOMMENDED_CHECKOUT_COLS = {"author", "subjects", "lc_classification"}
+REQUIRED_REC_COLS = {"title"}
+RECOMMENDED_REC_COLS = {"author", "subjects", "lc_classification"}
+
+
+def _suggest(col, candidates, threshold=0.75):
+    best, best_score = None, 0.0
+    for c in candidates:
+        score = SequenceMatcher(None, col.lower(), c.lower()).ratio()
+        if score > best_score:
+            best, best_score = c, score
+    return best if best_score >= threshold else None
+
+
+def validate_columns(df, required, recommended, file_label):
+    actual = set(df.columns.str.lower())
+    df.columns = df.columns.str.lower()
+    warnings = []
+    valid = True
+    for col in required:
+        if col not in actual:
+            suggestion = _suggest(col, actual)
+            hint = f" Did you mean **`{suggestion}`**?" if suggestion else ""
+            st.error(f"❌ **{file_label}** is missing required column `{col}`.{hint}")
+            valid = False
+    for col in recommended:
+        if col not in actual:
+            suggestion = _suggest(col, actual)
+            hint = f" (closest match: `{suggestion}`)" if suggestion else ""
+            warnings.append(f"`{col}` not found{hint} — scores for this factor will be 0")
+    return valid, warnings
+
+
+def validate_checkouts_numeric(df):
+    if "checkouts" not in df.columns:
+        return df
+    original = df["checkouts"].copy()
+    df["checkouts"] = pd.to_numeric(df["checkouts"], errors="coerce").fillna(0)
+    bad = original[df["checkouts"] == 0][original != 0].count()
+    if bad > 0:
+        st.warning(f"⚠️ {bad} rows in the checkouts column had non-numeric values and were set to 0.")
+    return df
+
+
+def consolidate_checkouts(df):
+    key_cols = [c for c in ["title", "author"] if c in df.columns]
+    if not key_cols:
+        return df
+    rows_before = len(df)
+    multi_year_titles = df[df.duplicated(subset=key_cols, keep=False)][key_cols[0]].nunique()
+    if multi_year_titles == 0:
+        return df
+    agg_rules = {}
+    for col in df.columns:
+        if col in key_cols:
+            continue
+        if col == "checkouts" or pd.api.types.is_numeric_dtype(df[col]):
+            agg_rules[col] = "sum"
+        else:
+            agg_rules[col] = "first"
+    consolidated = df.groupby(key_cols, as_index=False, sort=False).agg(agg_rules)
+    rows_after = len(consolidated)
+    st.info(f"📅 **Multi-year data:** {multi_year_titles} title(s) consolidated "
+            f"({rows_before} rows → {rows_after} unique titles). Checkouts summed.")
+    return consolidated.reset_index(drop=True)
+
+
+def check_duplicates_recommendations(df):
+    key_cols = [c for c in ["title", "author"] if c in df.columns]
+    if not key_cols:
+        return df
+    dupes = df.duplicated(subset=key_cols, keep="first").sum()
+    if dupes > 0:
+        st.warning(f"⚠️ Recommendations: {dupes} duplicate row(s) removed.")
+        df = df.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
+    return df
+
+
+def extract_all_subjects(df):
+    subject_counts = defaultdict(int)
+    if "subjects" not in df.columns:
+        return subject_counts
+    for subjects_str in df["subjects"].dropna():
+        for subject in split_subjects(subjects_str):
+            if subject:
+                subject_counts[subject] += 1
+    return dict(subject_counts)
+
+
+# Synonym map (kept in Tool 3 since only the scorer uses it)
+BUILTIN_SYNONYM_GROUPS = {
+    "radical_extreme": ["radical", "extreme", "extremist", "fringe", "militant", "revolutionary"],
+    "conservative": ["conservative", "traditional", "right-wing", "reactionary"],
+    "progressive_liberal": ["progressive", "liberal", "left-wing", "reformist"],
+    "equity_justice": ["equity", "equality", "justice", "fairness", "parity"],
+    "inclusion_diversity": ["inclusion", "diversity", "belonging", "representation", "multiculturalism"],
+    "discrimination": ["discrimination", "bias", "prejudice", "racism", "sexism", "oppression"],
+    "climate_change": ["climate change", "global warming", "greenhouse", "carbon", "emissions"],
+    "environment_ecology": ["environment", "ecology", "ecosystem", "biodiversity", "conservation", "sustainability"],
+    "mental_health": ["mental health", "mental illness", "psychiatric", "psychological", "wellbeing"],
+    "chronic_disease": ["chronic disease", "chronic illness", "long-term condition", "comorbidity"],
+    "infectious_disease": ["infectious disease", "epidemic", "pandemic", "outbreak", "pathogen"],
+    "violence": ["violence", "aggression", "assault", "brutality", "coercion"],
+    "war_conflict": ["war", "conflict", "warfare", "combat", "armed conflict", "insurgency"],
+    "migration": ["migration", "immigration", "emigration", "diaspora", "mobility"],
+    "refugee": ["refugee", "asylum seeker", "displaced person", "exile"],
+    "artificial_intelligence": ["artificial intelligence", "machine learning", "deep learning", "AI", "neural network"],
+    "data_privacy": ["privacy", "data protection", "surveillance", "tracking"],
+    "poverty_inequality": ["poverty", "inequality", "deprivation", "disadvantage", "underserved"],
+    "pedagogy_teaching": ["pedagogy", "teaching", "instruction", "education", "curriculum", "learning"],
+    "gender_identity": ["gender", "gender identity", "transgender", "nonbinary"],
+    "sexuality": ["sexuality", "sexual orientation", "LGBTQ", "queer"],
+    "race_ethnicity": ["race", "ethnicity", "racial", "ethnic"],
+    "religion_faith": ["religion", "faith", "spirituality", "theology"],
+}
+
+
+def build_synonym_map(stemmer, user_overrides_df=None):
+    groups = {label: list(terms) for label, terms in BUILTIN_SYNONYM_GROUPS.items()}
+    if user_overrides_df is not None and not user_overrides_df.empty:
+        for _, row in user_overrides_df.iterrows():
+            term = str(row.get("term", "")).strip()
+            label = str(row.get("group_label", "")).strip()
+            if term and label:
+                groups.setdefault(label, []).append(term)
+    synonym_map = {}
+    for label, terms in groups.items():
+        for term in terms:
+            norm = normalize_text(term)
+            for word in norm.split():
+                stemmed = stemmer.stem(word)
+                if len(stemmed) > 2:
+                    synonym_map.setdefault(stemmed, label)
+    return synonym_map
+
+
+def apply_synonym_map(terms, synonym_map):
+    return [synonym_map.get(t, t) for t in terms]
+
+
+class FacultyScorer:
+    def __init__(self, faculty_df, stemmer, synonym_map):
+        self.stemmer = stemmer
+        self.synonym_map = synonym_map
+        self.faculty_index = self._build_index(faculty_df)
+
+    def _tokenize(self, text):
+        norm = normalize_text(text) if text else ""
+        if not norm:
+            return []
+        stemmed = [self.stemmer.stem(w) for w in norm.split() if len(w) > 2]
+        return apply_synonym_map(stemmed, self.synonym_map)
+
+    def _build_index(self, faculty_df):
+        index = []
+        for _, row in faculty_df.iterrows():
+            name = str(row.get("name", "")).strip()
+            dept = str(row.get("department", "")).strip()
+            interests_raw = str(row.get("research_interests", ""))
+            tokens = set(self._tokenize(interests_raw))
+            if tokens:
+                index.append({"name": name, "department": dept, "tokens": tokens})
+        return index
+
+    def score(self, recommendation):
+        raw_subjects = recommendation.get("subjects", "")
+        raw_title = recommendation.get("title", "")
+        combined = f"{raw_subjects} {raw_title}"
+        rec_tokens = set(self._tokenize(combined))
+        if not rec_tokens or not self.faculty_index:
+            return 0.0, ""
+        best_score = 0.0
+        best_label = ""
+        for faculty in self.faculty_index:
+            fac_tokens = faculty["tokens"]
+            if not fac_tokens:
+                continue
+            intersection = rec_tokens & fac_tokens
+            union = rec_tokens | fac_tokens
+            if not union:
+                continue
+            jaccard = len(intersection) / len(union)
+            scaled = min(jaccard * 300, 100.0)
+            if scaled > best_score:
+                best_score = scaled
+                dept_str = f" ({faculty['department']})" if faculty["department"] else ""
+                best_label = f"{faculty['name']}{dept_str}"
+        return round(best_score, 2), best_label
+
+
+class RecommendationScorer:
+    def __init__(self, checkouts_df, synonym_map=None):
+        self.checkouts_df = checkouts_df
+        self.stemmer = SnowballStemmer("english")
+        self.synonym_map = synonym_map or {}
+        self.total_docs = len(checkouts_df)
+        self.semantic_groups = self._build_semantic_groups()
+        self.author_checkout_map = self._build_author_map()
+        self.lc_checkout_map = self._build_lc_map()
+        self.subject_terms = self._extract_subject_terms_enhanced()
+        self.term_frequencies = self._calculate_term_frequencies()
+
+    def _build_semantic_groups(self):
+        groups = {
+            "computer_science": ["comput", "programm", "softwar", "algorithm", "code"],
+            "artificial_intelligence": ["artifici", "intellig", "machin", "learn", "neural", "deep", "ai"],
+            "data_analytics": ["data", "analysi", "analyt", "statist", "visual", "databas"],
+            "psychology": ["psycholog", "mental", "health", "behavior", "cognit", "psychiatr"],
+            "sociology": ["sociolog", "social", "cultur", "commun", "society"],
+            "economics": ["econom", "market", "trade", "finance", "financi", "busi"],
+            "political_science": ["politic", "govern", "polici", "democrat", "elect", "legisl"],
+            "history": ["histor", "histori", "past", "ancient", "mediev", "modern", "war"],
+            "philosophy": ["philosoph", "ethic", "moral", "metaphys", "epistemolog"],
+            "literature": ["literatur", "novel", "fiction", "poetri", "drama", "narrat"],
+            "education": ["educ", "teach", "learn", "pedagog", "curriculum", "school"],
+            "law": ["law", "legal", "court", "justic", "judg", "attorney"],
+            "medicine": ["medicin", "medic", "health", "clinic", "hospit", "treatment", "diseas"],
+            "environmental": ["environ", "climat", "ecolog", "sustain", "conserv", "ecosyst"],
+            "biology": ["biolog", "life", "scienc", "organ", "cell", "geneti"],
+            "library_science": ["librari", "inform", "catalog", "bibliograph", "archiv", "collect"],
+            "gender_studies": ["gender", "feminis", "women", "masculin", "queer", "lgbt"],
+            "diversity": ["divers", "inclus", "equiti", "racial", "ethnic", "multicultural"],
+        }
+        term_to_group = {}
+        for group_id, terms in groups.items():
+            for term in terms:
+                term_to_group.setdefault(term, []).append(group_id)
+        return {"groups": groups, "term_to_group": term_to_group}
+
+    def _build_author_map(self):
+        author_map = defaultdict(list)
+        for _, row in self.checkouts_df.iterrows():
+            for candidate in normalize_author(row.get("author", "")):
+                author_map[candidate].append(row.get("checkouts", 0))
+        return dict(author_map)
+
+    def _build_lc_map(self):
+        lc_map = defaultdict(list)
+        for _, row in self.checkouts_df.iterrows():
+            if pd.notna(row.get("lc_classification")):
+                lc_prefix = extract_lc_prefix(row["lc_classification"])
+                if lc_prefix:
+                    lc_map[lc_prefix].append(row.get("checkouts", 0))
+        return dict(lc_map)
+
+    def _extract_subject_terms_enhanced(self):
+        all_terms = []
+        doc_term_counts = defaultdict(set)
+        unique_subject_docs = set()
+        for _, row in self.checkouts_df.iterrows():
+            if pd.notna(row.get("subjects")):
+                subjects = split_subjects(str(row["subjects"]))
+                checkouts = row.get("checkouts", 0)
+                for i, subject in enumerate(subjects):
+                    unique_subject_docs.add(subject)
+                    hw = 1.0 if i == 0 else 0.7
+                    for term in self._tokenize_and_stem(subject):
+                        all_terms.append((term, checkouts * hw, False))
+                        doc_term_counts[term].add(subject)
+                    for bigram in self._extract_bigrams(subject):
+                        all_terms.append((bigram, checkouts * hw * 1.3, True))
+                        doc_term_counts[bigram].add(subject)
+        total_subject_docs = max(len(unique_subject_docs), 1)
+        term_checkouts = defaultdict(list)
+        for term, checkout_count, _ in all_terms:
+            term_checkouts[term].append(checkout_count)
+        term_scores = {}
+        for term, counts in term_checkouts.items():
+            avg = sum(counts) / len(counts)
+            docs_with = len(doc_term_counts[term])
+            idf = np.log(total_subject_docs / (1 + docs_with))
+            term_scores[term] = avg * (1 + idf * 0.3)
+        return term_scores
+
+    def _extract_bigrams(self, text):
+        if not text:
+            return []
+        words = [w for w in text.split() if len(w) > 2]
+        return [f"{words[i]}_{words[i+1]}" for i in range(len(words) - 1)]
+
+    def _calculate_term_frequencies(self):
+        tf = Counter()
+        for _, row in self.checkouts_df.iterrows():
+            if pd.notna(row.get("subjects")):
+                norm = normalize_text(str(row["subjects"]))
+                tf.update(self._tokenize_and_stem(norm))
+        return tf
+
+    def _tokenize_and_stem(self, text):
+        norm = normalize_text(text) if text else ""
+        if not norm:
+            return []
+        stemmed = [self.stemmer.stem(w) for w in norm.split() if len(w) > 2]
+        return apply_synonym_map(stemmed, self.synonym_map)
+
+    def _get_synonyms(self, word):
+        synonyms = set()
+        for syn in wordnet.synsets(word):
+            for lemma in syn.lemmas():
+                synonyms.add(self.stemmer.stem(lemma.name().lower()))
+        return synonyms
+
+    def _get_semantic_matches(self, term):
+        matches = []
+        ttg = self.semantic_groups["term_to_group"]
+        if term in ttg:
+            groups = ttg[term]
+            for gid in groups:
+                for gt in self.semantic_groups["groups"][gid]:
+                    if gt in self.subject_terms:
+                        if gt in ttg:
+                            shared = set(groups) & set(ttg[gt])
+                            strength = len(shared) * 0.85
+                        else:
+                            strength = 0.85
+                        matches.append((gt, self.subject_terms[gt], strength))
+        return matches
+
+    def _fuzzy_match_terms(self, term, threshold=0.80):
+        max_score = 0
+        for existing_term in self.subject_terms:
+            sim = SequenceMatcher(None, term, existing_term).ratio()
+            if sim >= threshold:
+                max_score = max(max_score, self.subject_terms[existing_term])
+        return max_score
+
+    def _calculate_subject_similarity(self, recommendation):
+        raw = recommendation.get("subjects")
+        if pd.isna(raw) or not self.subject_terms:
+            return 0.0
+        norm = normalize_text(str(raw))
+        rec_terms = self._tokenize_and_stem(norm)
+        rec_bigrams = self._extract_bigrams(norm)
+        all_rec = rec_terms + rec_bigrams
+        if not all_rec:
+            return 0.0
+        total_score = 0
+        matched = 0
+        exact = 0
+        for rt in all_rec:
+            rec_syns = self._get_synonyms(rt.replace("_", " "))
+            rec_syns.add(rt)
+            max_ts = 0
+            if rt in self.subject_terms:
+                max_ts = self.subject_terms[rt] * 1.5
+                exact += 1
+            if max_ts == 0:
+                for syn in rec_syns:
+                    if syn in self.subject_terms:
+                        max_ts = max(max_ts, self.subject_terms[syn])
+            if max_ts == 0:
+                for _, ts, strength in self._get_semantic_matches(rt):
+                    max_ts = max(max_ts, ts * strength)
+            if max_ts == 0:
+                max_ts = self._fuzzy_match_terms(rt)
+            if max_ts > 0:
+                matched += 1
+                total_score += max_ts
+        if matched == 0:
+            return 0.0
+        avg = total_score / matched
+        max_c = max(self.subject_terms.values())
+        coverage = matched / len(all_rec)
+        exact_ratio = exact / len(all_rec)
+        cw = min(0.6 + 0.4 * coverage + 0.2 * exact_ratio, 1.0)
+        return (avg / max_c) * 100 * cw
+
+    def _calculate_lc_score(self, recommendation):
+        if pd.isna(recommendation.get("lc_classification")) or not self.lc_checkout_map:
+            return 0.0
+        lc_prefix = extract_lc_prefix(recommendation["lc_classification"])
+        if not lc_prefix or lc_prefix not in self.lc_checkout_map:
+            return 0.0
+        vals = self.lc_checkout_map[lc_prefix]
+        avg = sum(vals) / len(vals)
+        max_avg = max(sum(v) / len(v) for v in self.lc_checkout_map.values())
+        return (avg / max_avg) * 100
+
+    def _calculate_author_score(self, recommendation):
+        candidates = normalize_author(recommendation.get("author", ""))
+        if not candidates or not self.author_checkout_map:
+            return 0.0
+        max_avg = max(sum(v) / len(v) for v in self.author_checkout_map.values())
+        best = 0.0
+        for c in candidates:
+            if c in self.author_checkout_map:
+                vals = self.author_checkout_map[c]
+                avg = sum(vals) / len(vals)
+                best = max(best, (avg / max_avg) * 100)
+        return best
+
+    def score_recommendations(self, recommendations_df,
+                              subject_weight=0.5, lc_weight=0.3,
+                              author_weight=0.2, faculty_weight=0.0,
+                              faculty_scorer=None):
+        results = []
+        for _, rec in recommendations_df.iterrows():
+            ss = self._calculate_subject_similarity(rec)
+            ls = self._calculate_lc_score(rec)
+            aus = self._calculate_author_score(rec)
+            fs, mf = 0.0, ""
+            if faculty_scorer and faculty_weight > 0:
+                fs, mf = faculty_scorer.score(rec)
+            likelihood = ss * subject_weight + ls * lc_weight + aus * author_weight + fs * faculty_weight
+            d = rec.to_dict()
+            d["likelihood_score"] = round(likelihood, 2)
+            d["similarity_score"] = round(ss, 2)
+            d["checkout_volume_score"] = round(ls, 2)
+            d["author_popularity_score"] = round(aus, 2)
+            d["faculty_interest_score"] = round(fs, 2)
+            d["matched_faculty"] = mf
+            results.append(d)
+        rdf = pd.DataFrame(results)
+        rdf = rdf.sort_values("likelihood_score", ascending=False).reset_index(drop=True)
+        return rdf
+
+
+def generate_report(results_df):
+    lines = ["=" * 80, "LIBRARY BOOK RECOMMENDATION REPORT", "=" * 80, "",
+             "SUMMARY", "-" * 80,
+             f"Total Recommendations Analyzed: {len(results_df)}", ""]
+    high = len(results_df[results_df["likelihood_score"] >= 70])
+    medium = len(results_df[(results_df["likelihood_score"] >= 40) & (results_df["likelihood_score"] < 70)])
+    low = len(results_df[results_df["likelihood_score"] < 40])
+    lines += [
+        f"High Priority (70-100):   {high} books  ({high/max(1,len(results_df))*100:.1f}%)",
+        f"Medium Priority (40-69):  {medium} books  ({medium/max(1,len(results_df))*100:.1f}%)",
+        f"Low Priority (0-39):      {low} books  ({low/max(1,len(results_df))*100:.1f}%)",
+        "", "TOP 20 RECOMMENDATIONS", "=" * 80, "",
+    ]
+    for idx, row in results_df.head(20).iterrows():
+        lines += [
+            f"#{idx + 1}: {row['title']}",
+            f"   Author: {row.get('author', 'N/A')}",
+            f"   Overall Score: {row['likelihood_score']:.1f}/100",
+            f"   - Subject Similarity:    {row['similarity_score']:.1f}",
+            f"   - Checkout Volume:       {row['checkout_volume_score']:.1f}",
+            f"   - Author Popularity:     {row['author_popularity_score']:.1f}",
+            f"   - Faculty Interest:      {row.get('faculty_interest_score', 0.0):.1f}",
+            f"   - Matched Faculty:       {row.get('matched_faculty', 'N/A')}", "",
+        ]
+    return "\n".join(lines)
+
+
+def page_recommendation_scorer():
+    """Tool 3: Acquisition Recommendation Scorer."""
+    if not NLTK_AVAILABLE:
+        st.error("The `nltk` package is required for this tool. Install with: `pip install nltk`")
+        return
+    _ensure_nltk()
+
+    st.header("📊 Acquisition Recommendation Scorer")
+    st.markdown(
+        "**What should we buy next?** Score candidate books against your checkout "
+        "history to prioritize purchases."
+    )
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- **Collections:** Evaluating vendor slip lists and GOBI picks, approval-plan "
+            "exceptions, triaging faculty requests, flipping DDA candidates to purchase, "
+            "reviewing author/publisher lists for standing orders.\n"
+            "- **Instruction:** Occasionally — clusters of high-scoring recommendations in "
+            "one area can reveal curricular momentum worth a targeted info-lit session.\n"
+            "- **Outreach:** Showing faculty *why* a recommendation scored high (with "
+            "the faculty-interest score naming their research match) makes this a strong "
+            "conversation-starter at liaison meetings.\n\n"
+            "💡 For a broader view of your collection's LC distribution and subject "
+            "coverage, use the **Collection Profiler** (first tool in the sidebar)."
+        )
+
+
+    # File uploads
+    st.subheader("Step 1: Upload your data")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Checkouts File** — Required: `title`, `checkouts`; "
+                    "Recommended: `author`, `subjects`, `lc_classification`")
+        checkouts_file = st.file_uploader("Upload checkouts CSV", type=["csv"], key="rec_checkouts")
+    with c2:
+        st.markdown("**Recommendations File** — Required: `title`; "
+                    "Recommended: `author`, `subjects`, `lc_classification`")
+        recommendations_file = st.file_uploader("Upload recommendations CSV", type=["csv"], key="rec_recs")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("**Faculty Research Interests** *(optional)* — "
+                    "Columns: `name`, `department`, `research_interests`")
+        faculty_file = st.file_uploader("Upload faculty CSV", type=["csv"], key="rec_faculty")
+    with c4:
+        st.markdown("**Custom Synonym Groups** *(optional)* — "
+                    "Columns: `term`, `group_label`")
+        synonym_file = st.file_uploader("Upload synonym CSV", type=["csv"], key="rec_synonyms")
+
+    if checkouts_file and recommendations_file:
+        try:
+            # Check session cache for each file independently (different shape/roles)
+            cached_co = _cached_df_for_tool("rec_checkouts", checkouts_file)
+            cached_rec = _cached_df_for_tool("rec_recommendations", recommendations_file)
+
+            if cached_co is not None and cached_rec is not None:
+                checkouts_df = cached_co.copy()
+                recommendations_df = cached_rec.copy()
+                st.success(f"✅ Using cached data for both files")
+            else:
+                with st.spinner("Loading and validating data..."):
+                    checkouts_df = pd.read_csv(checkouts_file)
+                    recommendations_df = pd.read_csv(recommendations_file)
+                _store_cached_df("rec_checkouts", checkouts_file, checkouts_df)
+                _store_cached_df("rec_recommendations", recommendations_file, recommendations_df)
+
+            co_valid, co_warns = validate_columns(checkouts_df, REQUIRED_CHECKOUT_COLS,
+                                                   RECOMMENDED_CHECKOUT_COLS, "Checkouts file")
+            re_valid, re_warns = validate_columns(recommendations_df, REQUIRED_REC_COLS,
+                                                   RECOMMENDED_REC_COLS, "Recommendations file")
+
+            if co_warns or re_warns:
+                with st.expander("⚠️ Column warnings"):
+                    for w in co_warns + re_warns:
+                        st.markdown(f"- {w}")
+            if not (co_valid and re_valid):
+                st.stop()
+
+            checkouts_df = validate_checkouts_numeric(checkouts_df)
+            checkouts_df = consolidate_checkouts(checkouts_df)
+            recommendations_df = check_duplicates_recommendations(recommendations_df)
+
+            # Faculty
+            faculty_df = None
+            if faculty_file:
+                faculty_df = pd.read_csv(faculty_file)
+                faculty_df.columns = faculty_df.columns.str.lower()
+                missing_fac = [c for c in ["name", "department", "research_interests"]
+                               if c not in faculty_df.columns]
+                if missing_fac:
+                    st.warning(f"⚠️ Faculty file missing: {missing_fac}. Faculty scoring disabled.")
+                    faculty_df = None
+                else:
+                    st.success(f"✅ Loaded {len(faculty_df)} faculty records")
+
+            # Synonyms
+            synonym_overrides_df = None
+            if synonym_file:
+                synonym_overrides_df = pd.read_csv(synonym_file)
+                synonym_overrides_df.columns = synonym_overrides_df.columns.str.lower()
+                if not {"term", "group_label"}.issubset(synonym_overrides_df.columns):
+                    st.warning("⚠️ Synonym file needs `term` and `group_label` columns.")
+                    synonym_overrides_df = None
+                else:
+                    st.success(f"✅ Loaded {len(synonym_overrides_df)} synonym mappings")
+
+            st.success(f"✅ Loaded {len(checkouts_df)} checkout records and "
+                       f"{len(recommendations_df)} recommendations")
+
+            with st.expander("📋 Preview Data"):
+                pc1, pc2 = st.columns(2)
+                with pc1:
+                    st.write("**Checkouts:**")
+                    st.dataframe(checkouts_df.head())
+                with pc2:
+                    st.write("**Recommendations:**")
+                    st.dataframe(recommendations_df.head())
+
+            # --- (Collection Insights panel removed — see Collection Profiler instead) ---
+
+            # Scoring configuration — preset-first, with manual override in advanced
+            st.subheader("Step 2: Choose scoring approach")
+
+            PRESETS = {
+                "Balanced": {"subject": 0.50, "lc": 0.30, "author": 0.20, "faculty": 0.00},
+                "Subject-focused": {"subject": 0.70, "lc": 0.20, "author": 0.10, "faculty": 0.00},
+                "Faculty-driven": {"subject": 0.35, "lc": 0.20, "author": 0.10, "faculty": 0.35},
+            }
+            # If faculty file is loaded, default to the preset that uses it
+            default_preset = "Faculty-driven" if faculty_df is not None else "Balanced"
+
+            # Initialize preset selection in session state
+            if "rec_preset_choice" not in st.session_state:
+                st.session_state["rec_preset_choice"] = default_preset
+
+            preset_options = list(PRESETS.keys()) + ["Advanced (custom weights)"]
+            # Disable Faculty-driven if no faculty file
+            preset_help = ("Pick how to weight the four scoring factors. "
+                           "Faculty-driven needs a faculty CSV (upload one above).")
+            preset_choice = st.radio(
+                "Scoring approach:",
+                preset_options,
+                index=preset_options.index(st.session_state["rec_preset_choice"])
+                      if st.session_state["rec_preset_choice"] in preset_options else 0,
+                horizontal=True,
+                key="rec_preset_choice",
+                help=preset_help,
+            )
+
+            if preset_choice in PRESETS:
+                w = PRESETS[preset_choice]
+                # If a preset wants faculty weight but no faculty file is loaded, warn and fall back
+                if w["faculty"] > 0 and faculty_df is None:
+                    st.warning(
+                        "**Faculty-driven** needs a faculty CSV. Upload one above or "
+                        "pick a different approach. Falling back to **Balanced** for now."
+                    )
+                    w = PRESETS["Balanced"]
+                subject_weight = w["subject"]
+                lc_weight = w["lc"]
+                author_weight = w["author"]
+                faculty_weight = w["faculty"]
+                # Show what the preset does in a compact caption
+                parts = []
+                parts.append(f"Subject {int(subject_weight*100)}%")
+                parts.append(f"LC {int(lc_weight*100)}%")
+                parts.append(f"Author {int(author_weight*100)}%")
+                if faculty_weight > 0:
+                    parts.append(f"Faculty {int(faculty_weight*100)}%")
+                st.caption(" · ".join(parts))
+            else:
+                # Advanced mode — keep the four sliders, with auto-normalize help
+                with st.container(border=True):
+                    st.caption(
+                        "Set any values you want; they'll be normalized to sum to 1.0 "
+                        "before scoring."
+                    )
+                    _fac_default = 0.15 if faculty_df is not None else 0.0
+                    wc1, wc2, wc3, wc4 = st.columns(4)
+                    with wc1:
+                        subject_weight = st.slider(
+                            "Subject Similarity", 0.0, 1.0,
+                            0.45 if faculty_df else 0.5, 0.05, key="rec_sw"
+                        )
+                    with wc2:
+                        lc_weight = st.slider(
+                            "LC Classification", 0.0, 1.0,
+                            0.25 if faculty_df else 0.3, 0.05, key="rec_lw"
+                        )
+                    with wc3:
+                        author_weight = st.slider(
+                            "Author Popularity", 0.0, 1.0,
+                            0.15 if faculty_df else 0.2, 0.05, key="rec_aw"
+                        )
+                    with wc4:
+                        faculty_weight = st.slider(
+                            "Faculty Interest", 0.0, 1.0, _fac_default, 0.05,
+                            disabled=(faculty_df is None), key="rec_fw"
+                        )
+                    raw_total = subject_weight + lc_weight + author_weight + faculty_weight
+                    if raw_total <= 0:
+                        st.error("All weights are zero — set at least one above 0.")
+                    else:
+                        # Auto-normalize silently
+                        subject_weight = subject_weight / raw_total
+                        lc_weight = lc_weight / raw_total
+                        author_weight = author_weight / raw_total
+                        faculty_weight = faculty_weight / raw_total
+                        st.caption(
+                            f"Normalized: Subject {subject_weight:.0%} · "
+                            f"LC {lc_weight:.0%} · Author {author_weight:.0%} · "
+                            f"Faculty {faculty_weight:.0%}"
+                        )
+
+            for key in ("rec_results", "rec_checkouts_scored", "rec_recs_scored",
+                        "rec_faculty_scored", "rec_weights"):
+                if key not in st.session_state:
+                    st.session_state[key] = None
+
+            if st.button("Score recommendations", type="primary", key="rec_score_btn"):
+                with st.spinner("Analyzing..."):
+                    _stemmer = SnowballStemmer("english")
+                    syn_map = build_synonym_map(_stemmer, synonym_overrides_df)
+                    scorer = RecommendationScorer(checkouts_df, synonym_map=syn_map)
+                    _faculty_scorer = None
+                    if faculty_df is not None and faculty_weight > 0:
+                        _faculty_scorer = FacultyScorer(faculty_df, _stemmer, syn_map)
+                    results_df = scorer.score_recommendations(
+                        recommendations_df,
+                        subject_weight=subject_weight, lc_weight=lc_weight,
+                        author_weight=author_weight, faculty_weight=faculty_weight,
+                        faculty_scorer=_faculty_scorer,
+                    )
+                st.success("✅ Analysis complete!")
+                st.session_state["rec_results"] = results_df
+                st.session_state["rec_checkouts_scored"] = checkouts_df
+                st.session_state["rec_recs_scored"] = recommendations_df
+                st.session_state["rec_faculty_scored"] = faculty_df
+                st.session_state["rec_weights"] = {
+                    "subject": subject_weight, "lc": lc_weight,
+                    "author": author_weight, "faculty": faculty_weight,
+                }
+
+            # Results display
+            if st.session_state["rec_results"] is not None:
+                results_df = st.session_state["rec_results"]
+                st.subheader("Step 3: Review results")
+
+                # Fresh tray for this render pass
+                _reset_tray("rec_scorer")
+
+                # Notes — annotate before downloading
+                notes = _notes_widget(
+                    "recommendation_scorer",
+                    placeholder="e.g., YBP slip list Nov 2025, sociology liaison review. "
+                                "Weights adjusted to favor faculty interest (Dr. Chen's lab)."
+                )
+
+                tab_r1, tab_r2, tab_r3, tab_r4 = st.tabs([
+                    "Scored recommendations", "Score distribution",
+                    "Subject analysis", "Faculty analysis"
+                ])
+
+                with tab_r1:
+                    high_p = results_df[results_df["likelihood_score"] >= 70]
+                    med_p = results_df[(results_df["likelihood_score"] >= 40) &
+                                        (results_df["likelihood_score"] < 70)]
+                    low_p = results_df[results_df["likelihood_score"] < 40]
+                    tc1, tc2, tc3, tc4 = st.columns(4)
+                    tc1.metric("Total Scored", len(results_df))
+                    tc2.metric("🟢 High (70+)", len(high_p))
+                    tc3.metric("🟡 Medium (40-69)", len(med_p))
+                    tc4.metric("🔴 Low (<40)", len(low_p))
+
+                    search = st.text_input("Search by title or author", "", key="rec_search")
+                    min_score = st.slider("Minimum score", 0, 100, 0, key="rec_min")
+                    filtered = results_df.copy()
+                    if search:
+                        mask = (filtered["title"].str.contains(search, case=False, na=False) |
+                                filtered.get("author", pd.Series(dtype=str))
+                                .str.contains(search, case=False, na=False))
+                        filtered = filtered[mask]
+                    filtered = filtered[filtered["likelihood_score"] >= min_score]
+
+                    def get_priority(s):
+                        if s >= 70: return "🟢 High"
+                        if s >= 40: return "🟡 Medium"
+                        return "🔴 Low"
+
+                    display = filtered.copy()
+                    display["Priority"] = display["likelihood_score"].apply(get_priority)
+                    pcols = ["Priority", "title", "author", "likelihood_score",
+                             "similarity_score", "checkout_volume_score",
+                             "author_popularity_score", "faculty_interest_score", "matched_faculty"]
+                    others = [c for c in display.columns if c not in pcols]
+                    display = display[[c for c in pcols if c in display.columns] + others]
+                    st.dataframe(display, use_container_width=True, height=600)
+
+                with tab_r2:
+                    scores = results_df["likelihood_score"]
+                    fig_hist = go.Figure()
+                    fig_hist.add_trace(go.Histogram(x=scores, nbinsx=20, marker_color="#285C4D"))
+                    fig_hist.add_vline(x=70, line_dash="dash", line_color="#2ecc71",
+                                       annotation_text="High (70)")
+                    fig_hist.add_vline(x=40, line_dash="dash", line_color="#f39c12",
+                                       annotation_text="Medium (40)")
+                    fig_hist.update_layout(title="Score Distribution",
+                                           xaxis_title="Score", yaxis_title="Count",
+                                           height=400, showlegend=False)
+                    st.plotly_chart(fig_hist, use_container_width=True)
+                    sc1, sc2, sc3 = st.columns(3)
+                    sc1.metric("Mean", f"{scores.mean():.1f}")
+                    sc2.metric("Median", f"{scores.median():.1f}")
+                    sc3.metric("Std Dev", f"{scores.std():.1f}")
+
+                with tab_r3:
+                    co_subj = extract_all_subjects(st.session_state["rec_checkouts_scored"])
+                    rec_subj = extract_all_subjects(st.session_state["rec_recs_scored"])
+                    sa1, sa2, sa3 = st.columns(3)
+                    sa1.metric("Checkout Subjects", len(co_subj))
+                    sa2.metric("Recommendation Subjects", len(rec_subj))
+                    overlap = len(set(co_subj) & set(rec_subj))
+                    sa3.metric("Common Subjects", overlap)
+
+                    common = {s: {"co": co_subj[s], "rec": rec_subj[s]}
+                              for s in set(co_subj) & set(rec_subj)}
+                    if common:
+                        cdf = pd.DataFrame([
+                            {"Subject": s, "In Checkouts": d["co"], "In Recommendations": d["rec"],
+                             "Total": d["co"] + d["rec"]}
+                            for s, d in common.items()
+                        ]).sort_values("Total", ascending=False)
+                        st.dataframe(cdf.head(30), use_container_width=True, height=400)
+
+                    gap_subj = {k: v for k, v in co_subj.items() if k not in rec_subj and v >= 2}
+                    if gap_subj:
+                        st.subheader("Recommendation gaps")
+                        st.markdown("High-circulation subjects missing from your recommendations list:")
+                        gdf = pd.DataFrame([
+                            {"Subject": s, "Checkout Occurrences": c}
+                            for s, c in sorted(gap_subj.items(), key=lambda x: -x[1])[:30]
+                        ])
+                        st.dataframe(gdf, use_container_width=True, height=300)
+
+                with tab_r4:
+                    fac_scored = st.session_state.get("rec_faculty_scored")
+                    if fac_scored is None:
+                        st.info("No faculty file uploaded. Upload one and re-score to see this analysis.")
+                    elif ("faculty_interest_score" not in results_df.columns
+                          or results_df["faculty_interest_score"].sum() == 0):
+                        st.warning("Faculty scores are zero — set faculty weight > 0 and re-score.")
+                    else:
+                        fac_results = results_df[results_df["matched_faculty"].str.strip() != ""].copy()
+                        fc1, fc2 = st.columns(2)
+                        fc1.metric("Faculty Members", len(fac_scored))
+                        fc2.metric("Matched Recommendations", len(fac_results))
+                        if len(fac_results) > 0:
+                            st.dataframe(
+                                fac_results.sort_values("faculty_interest_score", ascending=False)
+                                .head(20)[["title", "author", "likelihood_score",
+                                           "faculty_interest_score", "matched_faculty"]],
+                                use_container_width=True, height=400
+                            )
+
+                # Downloads
+                st.subheader("Downloads")
+                dc1, dc2, dc3 = st.columns(3)
+                _weights = st.session_state.get("rec_weights", {})
+                _weights_str = (f"subject={_weights.get('subject', 0)}, "
+                                f"lc={_weights.get('lc', 0)}, "
+                                f"author={_weights.get('author', 0)}, "
+                                f"faculty={_weights.get('faculty', 0)}")
+                with dc1:
+                    _full_bytes = _annotate_csv(results_df, notes,
+                                                extra_meta={'Tool': 'Recommendation Scorer',
+                                                            'View': 'Full Results',
+                                                            'Weights': _weights_str})
+                    st.download_button("📥 Full results (CSV)",
+                                       _full_bytes,
+                                       "recommendations_scored.csv", "text/csv",
+                                       key="rec_dl_full")
+                    _add_to_tray("rec_scorer", "recommendations_scored.csv", _full_bytes)
+                with dc2:
+                    high_df = results_df[results_df["likelihood_score"] >= 70]
+                    _high_bytes = _annotate_csv(high_df, notes,
+                                                extra_meta={'Tool': 'Recommendation Scorer',
+                                                            'View': 'High Priority (≥70)',
+                                                            'Weights': _weights_str})
+                    st.download_button("📥 High priority only (CSV)",
+                                       _high_bytes,
+                                       "recommendations_high_priority.csv", "text/csv",
+                                       key="rec_dl_high")
+                    _add_to_tray("rec_scorer", "recommendations_high_priority.csv", _high_bytes)
+                with dc3:
+                    # TXT report: prepend notes as a header block (not CSV, so different format)
+                    report_body = generate_report(results_df)
+                    if notes and notes.strip():
+                        from datetime import datetime
+                        notes_block = (
+                            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                            f"Weights: {_weights_str}\n\n"
+                            f"NOTES\n{'-' * 80}\n{notes.strip()}\n\n"
+                        )
+                        report_body = notes_block + report_body
+                    st.download_button("📄 Report (TXT)", report_body,
+                                       "recommendation_report.txt", "text/plain",
+                                       key="rec_dl_txt")
+                    _add_to_tray("rec_scorer", "recommendation_report.txt", report_body)
+
+                # ZIP-all option
+                _render_download_tray("rec_scorer",
+                                      zip_filename="recommendation_scorer_results.zip")
+
+        except Exception as e:
+            st.error(f"❌ Error: {str(e)}")
+            st.info("Check that your CSV files have the required columns.")
+    else:
+        st.info("Upload both a checkouts file and a recommendations file to begin.")
+
+    # Sidebar instructions
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Scorer instructions")
+        st.markdown("""
+        1. Upload **checkouts CSV** *(required)*
+        2. Upload **recommendations CSV** *(required)*
+        3. Optionally add **faculty** and **synonym** CSVs
+        4. Adjust scoring weights
+        5. Click **Score Recommendations**
+
+        **Scores:** 🟢 70+ High · 🟡 40-69 Medium · 🔴 <40 Low
+        """)
+
+
+
+
+# =====================================================================
+# =====================================================================
+# TOOL 4: ZERO-USE IDENTIFIER
+# =====================================================================
+# "What do we own that isn't being used at all?"
+# Two-file comparison: holdings universe vs. usage report.
+# Surfaces titles in holdings that don't appear in usage — the inverse
+# of the Usage Analyzer, which starts with what HAS been used.
+# =====================================================================
+# =====================================================================
+
+# ---- Identifier normalization helpers ----
+
+def _normalize_isbn(val):
+    """Strip hyphens, spaces, and non-digits (except trailing X for ISBN-10).
+    Returns the canonical form, or None if not a plausible ISBN."""
+    if pd.isna(val):
+        return None
+    s = str(val).upper().strip()
+    s = re.sub(r'[^\dX]', '', s)
+    if len(s) not in (10, 13):
+        # Some files cram multiple ISBNs in one cell; try first 13 then 10
+        for length in (13, 10):
+            if len(s) >= length:
+                candidate = s[:length]
+                if length == 10 or candidate.startswith(('978', '979')):
+                    return candidate
+        return None
+    return s
+
+
+def _normalize_issn(val):
+    """ISSNs are 8 chars; canonical form has hyphen but we strip it for matching."""
+    if pd.isna(val):
+        return None
+    s = str(val).upper().strip()
+    s = re.sub(r'[^\dX]', '', s)
+    return s if len(s) == 8 else None
+
+
+def _normalize_doi(val):
+    """Lowercase, strip leading 'doi:' or URL prefix, trim whitespace."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip().lower()
+    s = re.sub(r'^https?://(dx\.)?doi\.org/', '', s)
+    s = re.sub(r'^doi:\s*', '', s)
+    return s if s and '/' in s else None  # Real DOIs always have a slash
+
+
+def _normalize_oclc(val):
+    """OCLC numbers — strip prefixes like 'ocm', 'ocn', '(OCoLC)', leave digits."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    s = re.sub(r'^\(OCoLC\)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^(ocm|ocn|on)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\D', '', s)
+    return s if s else None
+
+
+def _build_title_author_key(title, author):
+    """Composite key for fallback matching when identifiers are absent.
+    Uses normalized title + first significant word of author."""
+    t = normalize_text(title) if title else ""
+    if not t:
+        return None
+    a = normalize_text(author) if author else ""
+    # First token of normalized author — for "Smith, John" → "smith"
+    a_tok = a.split()[0] if a else ""
+    return f"{t}|{a_tok}" if t else None
+
+
+def _detect_id_columns(df):
+    """Detect identifier columns in a dataframe."""
+    return {
+        'isbn': find_column(df, ISBN_ALIASES),
+        'issn': find_column(df, ISSN_ALIASES),
+        'doi': find_column(df, DOI_ALIASES),
+        'oclc': find_column(df, OCLC_ALIASES),
+        'title': find_column(df, TITLE_ALIASES),
+        'author': find_column(df, AUTHOR_ALIASES),
+    }
+
+
+def _build_match_keys(df, id_cols):
+    """Add normalized matching key columns to a dataframe in place.
+    Returns the list of (key_type, column_name) actually built."""
+    built = []
+    if id_cols.get('isbn'):
+        df['_key_isbn'] = df[id_cols['isbn']].apply(_normalize_isbn)
+        built.append(('isbn', '_key_isbn'))
+    if id_cols.get('issn'):
+        df['_key_issn'] = df[id_cols['issn']].apply(_normalize_issn)
+        built.append(('issn', '_key_issn'))
+    if id_cols.get('doi'):
+        df['_key_doi'] = df[id_cols['doi']].apply(_normalize_doi)
+        built.append(('doi', '_key_doi'))
+    if id_cols.get('oclc'):
+        df['_key_oclc'] = df[id_cols['oclc']].apply(_normalize_oclc)
+        built.append(('oclc', '_key_oclc'))
+    if id_cols.get('title'):
+        author_series = df[id_cols['author']] if id_cols.get('author') else pd.Series([None] * len(df), index=df.index)
+        df['_key_titleauth'] = [_build_title_author_key(t, a)
+                                 for t, a in zip(df[id_cols['title']], author_series)]
+        built.append(('title+author', '_key_titleauth'))
+    return built
+
+
+def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
+                              usage_weight_col=None):
+    """Cascade-match each holdings row against the usage file.
+
+    Returns the holdings_df with two new columns:
+        _matched_via : str (which key matched, or 'unmatched')
+        _usage_total : float (sum of usage from matched usage rows, or 0)
+
+    Matching cascades by reliability: ISBN > DOI > OCLC > ISSN > title+author.
+    A holdings row counts as 'matched' on the first key that finds at least
+    one usage row.
+    """
+    holdings_df = holdings_df.copy()
+    holdings_df['_matched_via'] = 'unmatched'
+    holdings_df['_usage_total'] = 0.0
+
+    # Build per-key lookup tables from usage side: key_value → total_usage.
+    # Done once per key type to avoid row-by-row iteration on the usage df.
+    usage_lookups = {}
+    for key_type, key_col in usage_keys:
+        if key_col not in usage_df.columns:
+            continue
+        valid = usage_df[usage_df[key_col].notna() & (usage_df[key_col] != '')]
+        if valid.empty:
+            continue
+        if usage_weight_col and usage_weight_col in valid.columns:
+            grouped = valid.groupby(key_col)[usage_weight_col].sum()
+        else:
+            # No weight column → just count rows per key
+            grouped = valid.groupby(key_col).size().astype(float)
+        usage_lookups[key_type] = grouped.to_dict()
+
+    # Identifiers first (most reliable), title+author last
+    priority = ['isbn', 'doi', 'oclc', 'issn', 'title+author']
+    for key_type in priority:
+        h_col = next((kc for kt, kc in holdings_keys if kt == key_type), None)
+        if h_col is None or key_type not in usage_lookups:
+            continue
+        lookup = usage_lookups[key_type]
+        # Only fill rows still unmatched — keeps higher-priority matches sticky
+        unmatched_mask = holdings_df['_matched_via'] == 'unmatched'
+        h_values = holdings_df.loc[unmatched_mask, h_col]
+        for idx, val in h_values.items():
+            if val and val in lookup:
+                holdings_df.at[idx, '_matched_via'] = key_type
+                holdings_df.at[idx, '_usage_total'] = lookup[val]
+
+    return holdings_df
+
+
+def page_zero_use_identifier():
+    """Tool 4: Zero-Use Identifier — compare a holdings list to a usage list."""
+    st.header("🔍 Zero-Use Identifier")
+    st.markdown(
+        "**What do we own that isn't being used?** Compare a list of all your "
+        "holdings against a usage report to surface titles, journals, or "
+        "databases that aren't appearing in usage at all."
+    )
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- **Collections:** Identify dead-weight items in any format (print, "
+            "e-books, e-journals, databases, streaming media). Especially powerful "
+            "for e-resources where 'zero use' is invisible in the usage report itself "
+            "(many vendors omit titles with no use entirely).\n"
+            "- **Cancellation prep:** Combine with the Usage Analyzer's COUNTER mode — "
+            "use this tool to find titles missing from usage altogether, then use "
+            "COUNTER to triage low-but-nonzero items.\n"
+            "- **Off-site storage:** Surface print holdings with no circulation, "
+            "filtered by pub-year cutoff so newer items don't get flagged unfairly.\n"
+            "- **Renewal evidence:** Show admin or faculty exactly which package "
+            "titles haven't been used at all."
+        )
+
+    with st.expander("📖 How matching works", expanded=False):
+        st.markdown("""
+        Two files, one job: **what's in holdings but missing from usage?**
+
+        **Matching cascade** (most reliable first):
+        1. **ISBN / ISSN / DOI / OCLC** — exact match after normalization
+           (strips hyphens, prefixes like `(OCoLC)`, URL wrappers on DOIs, etc.)
+        2. **Title + first author word** — fallback when no shared identifier
+           exists. Uses the same text normalization as the rest of the dashboard
+           (lowercase, accent-strip, punctuation collapse).
+
+        **Holdings file** = the universe (full catalog, e-journal A-to-Z list,
+        database list, etc.). At minimum needs a Title column; identifier
+        columns improve match quality dramatically.
+
+        **Usage file** = anything with a count attached. COUNTER reports,
+        circulation exports, link-resolver clicks — the same kind of file the
+        Usage Analyzer accepts.
+
+        **Match quality:** the result table includes a `Matched Via` column so
+        you can spot-check whether a fallback title-match looks right.
+
+        **The unmatched ≠ zero-use caveat:** If your usage report only includes
+        titles that had at least one use (very common — many vendors omit
+        zero-use rows), then unmatched items are genuinely zero-use. If your
+        usage report includes zero-use rows explicitly, then unmatched items
+        might just be metadata mismatches. The two populations are split into
+        separate tabs so you can decide.
+        """)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**📚 Holdings file** — the universe")
+        holdings_file = st.file_uploader(
+            "Upload holdings CSV", type=['csv'], key="zu_holdings_upload",
+            help="Your full title list, e-journal A-Z, database list, etc."
+        )
+    with c2:
+        st.markdown("**📊 Usage file** — what's been used")
+        usage_file = st.file_uploader(
+            "Upload usage CSV", type=['csv'], key="zu_usage_upload",
+            help="COUNTER report, circulation export, or any list with a count column."
+        )
+
+    if not (holdings_file and usage_file):
+        st.info("Upload **both** files to begin. The holdings file is your "
+                "full list; the usage file is what has been used.")
+        return
+
+    try:
+        # Load both files (with caching)
+        cached_h = _cached_df_for_tool("zu_holdings", holdings_file)
+        cached_u = _cached_df_for_tool("zu_usage", usage_file)
+
+        if cached_h is not None:
+            holdings_df = cached_h.copy()
+        else:
+            holdings_df = _load_print_csv(holdings_file.getvalue(), holdings_file.name)
+            _store_cached_df("zu_holdings", holdings_file, holdings_df)
+
+        if cached_u is not None:
+            usage_df = cached_u.copy()
+        else:
+            usage_df = _load_print_csv(usage_file.getvalue(), usage_file.name)
+            _store_cached_df("zu_usage", usage_file, usage_df)
+
+        st.success(
+            f"✅ Loaded **{len(holdings_df):,}** holdings rows and "
+            f"**{len(usage_df):,}** usage rows."
+        )
+
+        # Detect columns in both files
+        h_ids = _detect_id_columns(holdings_df)
+        u_ids = _detect_id_columns(usage_df)
+        h_lc = find_column(holdings_df, LC_ALIASES)
+        h_loc = find_column(holdings_df, ['Location', 'Location Name', 'location',
+                                          'Library', 'Branch'])
+        h_format = find_column(holdings_df, ['Format', 'Material Type', 'Resource Type',
+                                             'Type', 'format', 'Bibliographic Format'])
+        h_pubyear = find_column(holdings_df, ['Publication Year', 'Pub Year', 'Year',
+                                              'pub_year', 'Publication Date',
+                                              'Date of Publication'])
+        u_weight = find_column(usage_df, WEIGHT_ALIASES)
+
+        with st.expander("🔍 Column detection & overrides", expanded=False):
+            st.markdown("**Holdings file:**")
+            hcols_text = " · ".join([f"{k.upper()}: `{v}`" if v else f"{k.upper()}: —"
+                                     for k, v in h_ids.items()])
+            st.caption(hcols_text)
+            st.caption(f"LC: `{h_lc}` · Location: `{h_loc}` · "
+                       f"Format: `{h_format}` · Pub Year: `{h_pubyear}`")
+
+            st.markdown("**Usage file:**")
+            ucols_text = " · ".join([f"{k.upper()}: `{v}`" if v else f"{k.upper()}: —"
+                                     for k, v in u_ids.items()])
+            st.caption(ucols_text)
+            st.caption(f"Usage metric: `{u_weight}`")
+
+            none_opt = "— count rows (no weighting) —"
+            usage_cols = [none_opt] + list(usage_df.columns)
+            default_idx = usage_cols.index(u_weight) if u_weight in usage_df.columns else 0
+            new_weight = st.selectbox(
+                "Override usage metric column",
+                usage_cols, index=default_idx, key="zu_weight_override"
+            )
+            u_weight = None if new_weight == none_opt else new_weight
+
+        # Validate: need at least Title in holdings, or one identifier
+        if not h_ids.get('title') and not any(h_ids.get(k) for k in ('isbn', 'issn', 'doi', 'oclc')):
+            st.error("❌ Holdings file needs at least a **Title** column or one "
+                     "identifier column (ISBN, ISSN, DOI, OCLC). Couldn't find any.")
+            return
+
+        # Find shared key types between the two files
+        shared_keys = []
+        for k in ('isbn', 'issn', 'doi', 'oclc'):
+            if h_ids.get(k) and u_ids.get(k):
+                shared_keys.append(k.upper())
+        if h_ids.get('title') and u_ids.get('title'):
+            shared_keys.append('Title+Author')
+
+        if not shared_keys:
+            st.error("❌ No matchable columns found in common between the two files. "
+                     "Need at least one of ISBN, ISSN, DOI, OCLC, or Title in both.")
+            return
+
+        st.info(f"🔗 Will match using: **{', '.join(shared_keys)}** "
+                f"(cascading from most reliable to fallback)")
+
+        # Coerce usage weight to numeric (or use row counts if no weight col)
+        if u_weight and u_weight in usage_df.columns:
+            usage_df['_weight'] = pd.to_numeric(usage_df[u_weight], errors='coerce').fillna(0)
+            weight_for_match = '_weight'
+        else:
+            weight_for_match = None
+
+        # Build match keys on both sides
+        h_keys = _build_match_keys(holdings_df, h_ids)
+        u_keys = _build_match_keys(usage_df, u_ids)
+
+        # Run match
+        with st.spinner("Matching holdings against usage..."):
+            matched = _match_holdings_to_usage(
+                holdings_df, usage_df, h_keys, u_keys,
+                usage_weight_col=weight_for_match
+            )
+
+        # Sidebar filters
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔎 Zero-Use Filters")
+
+        # LC filter
+        if h_lc:
+            matched['_lc_main'] = matched[h_lc].apply(extract_lc_prefix)
+            lc_avail = sorted(matched['_lc_main'].dropna().unique())
+            if lc_avail:
+                lc_labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in lc_avail]
+                sel_lc_labels = st.sidebar.multiselect(
+                    "LC Class", lc_labels, default=lc_labels, key="zu_lc_filter"
+                )
+                sel_lc = [l.split(' –')[0] for l in sel_lc_labels]
+                matched = matched[matched['_lc_main'].isin(sel_lc) | matched['_lc_main'].isna()].copy()
+
+        # Location filter
+        if h_loc:
+            locs = sorted(matched[h_loc].dropna().unique())
+            if locs:
+                sel_locs = st.sidebar.multiselect(
+                    "Location", locs, default=locs, key="zu_loc_filter"
+                )
+                matched = matched[matched[h_loc].isin(sel_locs) | matched[h_loc].isna()].copy()
+
+        # Format filter
+        if h_format:
+            fmts = sorted(matched[h_format].dropna().unique())
+            if fmts:
+                sel_fmts = st.sidebar.multiselect(
+                    "Format", fmts, default=fmts, key="zu_fmt_filter"
+                )
+                matched = matched[matched[h_format].isin(sel_fmts) | matched[h_format].isna()].copy()
+
+        # Threshold for "low use"
+        threshold = st.sidebar.number_input(
+            "Use threshold (≤ this = flagged)",
+            min_value=0.0, value=0.0, step=1.0, key="zu_threshold",
+            help="0 = strictly zero use. Raise this to also catch low-use items."
+        )
+
+        # Treat unmatched items as zero-use? Off by default (safer assumption);
+        # turn on when the usage report is known to include zero-use rows
+        # explicitly (then unmatched truly = zero-use, not a coverage gap).
+        treat_unmatched_as_zero = st.sidebar.checkbox(
+            "Treat unmatched items as zero-use",
+            value=False, key="zu_combine_unmatched",
+            help="OFF (default): unmatched items appear in their own tab. Use when "
+                 "your usage report omits zero-use titles (most COUNTER reports do).\n\n"
+                 "ON: unmatched items are merged into the zero/low-use list. Use only "
+                 "when you trust your usage report's coverage — i.e., it explicitly "
+                 "includes rows for unused titles. Spot-check the match preview "
+                 "below before flipping this on for a final cancellation list."
+        )
+
+        # Optional pub-year cutoff
+        pubyear_cutoff = None
+        if h_pubyear:
+            with st.sidebar.expander("📅 Optional: limit by pub year", expanded=False):
+                use_year = st.checkbox("Only flag items older than:", value=False, key="zu_use_year")
+                if use_year:
+                    pubyear_cutoff = st.number_input(
+                        "Published before",
+                        min_value=1800, max_value=2030, value=2015,
+                        step=1, key="zu_year_cutoff",
+                        help="Newer items often haven't had time to circulate. "
+                             "Setting a cutoff focuses on items old enough that "
+                             "zero use is meaningful."
+                    )
+                    matched['_pubyear'] = pd.to_numeric(matched[h_pubyear], errors='coerce')
+
+        # KPIs
+        st.markdown("---")
+        st.subheader("Matching summary")
+
+        total_holdings = len(matched)
+        n_matched = (matched['_matched_via'] != 'unmatched').sum()
+        n_unmatched = total_holdings - n_matched
+        matched_only = matched[matched['_matched_via'] != 'unmatched']
+        n_matched_low = (matched_only['_usage_total'] <= threshold).sum()
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Holdings", f"{total_holdings:,}")
+        k2.metric("Matched to Usage", f"{n_matched:,}",
+                  f"{n_matched/max(1,total_holdings)*100:.1f}%")
+        if treat_unmatched_as_zero:
+            # Combined view: matched-low + unmatched are both treated as zero/low-use
+            n_combined = n_matched_low + n_unmatched
+            k3.metric(f"≤ {threshold:g} Use (combined)", f"{n_combined:,}",
+                      help="Matched-low + unmatched items, treated together "
+                           "since you've indicated unmatched = zero-use.")
+            k4.metric("Unmatched (now in main list)", f"{n_unmatched:,}",
+                      f"{n_unmatched/max(1,total_holdings)*100:.1f}%",
+                      help="These items are now folded into the zero/low-use list.")
+        else:
+            k3.metric(f"≤ {threshold:g} Use (matched)", f"{n_matched_low:,}",
+                      help="Items that joined to the usage file but had use ≤ threshold.")
+            k4.metric("Unmatched", f"{n_unmatched:,}",
+                      f"{n_unmatched/max(1,total_holdings)*100:.1f}%",
+                      help="Items in holdings with no row in the usage file. Likely "
+                           "zero-use, but could also indicate a coverage gap in the "
+                           "usage report.")
+
+        # Match-method breakdown
+        method_counts = matched['_matched_via'].value_counts()
+        if len(method_counts) > 1:
+            st.caption(
+                "**Match methods used:** " +
+                " · ".join([f"{m}: {c:,}" for m, c in method_counts.items()])
+            )
+
+        # ---- Match preview ----
+        # Show a sample of each match type with both holdings & usage rows side-by-side
+        # so users can sanity-check before trusting the join. Especially valuable for
+        # the title+author fallback, which is the highest-risk match type.
+        title_match_count = int(method_counts.get('title+author', 0))
+        with st.expander(
+            f"🔍 Match preview — spot-check the joins"
+            + (f" ({title_match_count:,} via title+author fallback — review!)"
+               if title_match_count > 0 else ""),
+            expanded=False
+        ):
+            st.caption(
+                "Random samples from each match type. The **title+author** "
+                "tab is the most important to review — it's the fallback when no "
+                "shared identifier exists, and it's the most likely place for "
+                "false positives (e.g., two unrelated books with similar titles "
+                "and the same first-token last name)."
+            )
+            # Build a sample-per-method preview, max 10 rows per method
+            preview_methods = [m for m in method_counts.index if m != 'unmatched']
+            if not preview_methods:
+                st.info("No matches to preview yet. Run with files that share an "
+                        "identifier or title column.")
+            else:
+                # Default to title+author tab if it exists (highest-risk to review)
+                preview_tab_labels = []
+                for m in preview_methods:
+                    n = int(method_counts[m])
+                    flag = " ⚠️" if m == 'title+author' else ""
+                    preview_tab_labels.append(f"{m} ({n:,}){flag}")
+                preview_tabs = st.tabs(preview_tab_labels)
+                # Build usage-side title/author lookups so we can show what we matched against
+                u_title_col = u_ids.get('title')
+                u_author_col = u_ids.get('author')
+                # Map each key column on the usage side to the original Title/Author columns
+                u_keys_by_type = dict(u_keys)
+                for tab_obj, method in zip(preview_tabs, preview_methods):
+                    with tab_obj:
+                        sample = matched[matched['_matched_via'] == method]
+                        sample_size = min(10, len(sample))
+                        if sample_size == 0:
+                            st.info("No items in this method.")
+                            continue
+                        sample = sample.sample(n=sample_size,
+                                               random_state=42).reset_index(drop=True)
+                        # Find the matching usage row(s) for each sample row,
+                        # using the same key column that produced the match.
+                        h_key_col = next((kc for kt, kc in h_keys if kt == method), None)
+                        u_key_col = u_keys_by_type.get(method)
+                        rows = []
+                        for _, hrow in sample.iterrows():
+                            h_title = (hrow.get(h_ids['title'], '—')
+                                       if h_ids.get('title') else '—')
+                            h_author = (hrow.get(h_ids['author'], '—')
+                                        if h_ids.get('author') else '—')
+                            # Find first matching usage row
+                            u_title = u_author = '—'
+                            if h_key_col and u_key_col:
+                                key_val = hrow.get(h_key_col)
+                                if pd.notna(key_val) and key_val:
+                                    matches_in_usage = usage_df[
+                                        usage_df[u_key_col] == key_val
+                                    ]
+                                    if not matches_in_usage.empty:
+                                        first = matches_in_usage.iloc[0]
+                                        if u_title_col:
+                                            u_title = first.get(u_title_col, '—')
+                                        if u_author_col:
+                                            u_author = first.get(u_author_col, '—')
+                            rows.append({
+                                'Holdings title': str(h_title)[:80],
+                                'Holdings author': str(h_author)[:50],
+                                'Usage title': str(u_title)[:80],
+                                'Usage author': str(u_author)[:50],
+                                'Total Use': hrow.get('_usage_total', 0),
+                            })
+                        preview_df = pd.DataFrame(rows)
+                        st.dataframe(preview_df, use_container_width=True,
+                                     hide_index=True, height=min(400, 50 + 35 * len(preview_df)))
+                        if method == 'title+author':
+                            st.caption(
+                                "💡 If the holdings and usage titles look like genuinely "
+                                "different books, your fallback joins are unreliable. "
+                                "Consider adding identifier columns to one or both files, "
+                                "or only trusting matches via ISBN/ISSN/DOI/OCLC."
+                            )
+
+        # Notes — annotate before downloading
+        notes = _notes_widget(
+            "zero_use",
+            placeholder="e.g., FY2025 e-journal cancellation review. "
+                        "Holdings = A-Z list export 11/1; usage = COUNTER TR_J3 (Jan-Oct)."
+        )
+
+        # Fresh tray for this render pass
+        _reset_tray("zero_use")
+
+        # Build the zero-use result set.
+        # Default (split): only MATCHED items with low use go in the main list.
+        # Unmatched items live in their own tab so users can review them
+        # separately. When the combine toggle is on, unmatched items are
+        # folded in (treating them as zero-use items the report didn't return).
+        if treat_unmatched_as_zero:
+            zero_use = matched[
+                ((matched['_matched_via'] != 'unmatched')
+                 & (matched['_usage_total'] <= threshold))
+                | (matched['_matched_via'] == 'unmatched')
+            ].copy()
+        else:
+            zero_use = matched[
+                (matched['_matched_via'] != 'unmatched')
+                & (matched['_usage_total'] <= threshold)
+            ].copy()
+        if pubyear_cutoff is not None and '_pubyear' in zero_use.columns:
+            zero_use = zero_use[zero_use['_pubyear'] < pubyear_cutoff]
+
+        # Tabs
+        st.markdown("---")
+        tabs_to_show = ["Zero/low-use list", "Unmatched items"]
+        if h_lc:
+            tabs_to_show.append("LC breakdown")
+        if h_format:
+            tabs_to_show.append("Format breakdown")
+        if h_pubyear:
+            tabs_to_show.append("Age distribution")
+        tab_objs = st.tabs(tabs_to_show)
+
+        # Build display columns once (used by Zero/low-use and Unmatched tabs)
+        display_cols = []
+        if h_ids.get('title'):
+            display_cols.append(h_ids['title'])
+        if h_ids.get('author'):
+            display_cols.append(h_ids['author'])
+        for k in ('isbn', 'issn', 'doi', 'oclc'):
+            if h_ids.get(k):
+                display_cols.append(h_ids[k])
+        if h_lc:
+            display_cols.append(h_lc)
+        if h_loc:
+            display_cols.append(h_loc)
+        if h_format:
+            display_cols.append(h_format)
+        if h_pubyear:
+            display_cols.append(h_pubyear)
+        # De-dup in case of overlap
+        seen = set()
+        display_cols = [c for c in display_cols if not (c in seen or seen.add(c))]
+
+        # --- Zero/low-use list ---
+        with tab_objs[0]:
+            cutoff_msg = (' AND were published before ' + str(pubyear_cutoff)
+                          if pubyear_cutoff else '')
+            if treat_unmatched_as_zero:
+                st.markdown(
+                    f"**{len(zero_use):,} items** flagged as zero/low-use "
+                    f"(matched ≤ {threshold:g} use **plus** unmatched "
+                    f"items){cutoff_msg}."
+                )
+                st.caption(
+                    "📌 Combining matched-low and unmatched items because "
+                    "**Treat unmatched as zero-use** is on in the sidebar. "
+                    "The `Matched Via` column shows which group each item "
+                    "came from."
+                )
+            else:
+                st.markdown(
+                    f"**{len(zero_use):,} items** in your holdings have ≤ "
+                    f"{threshold:g} use{cutoff_msg}."
+                )
+                if n_unmatched > 0:
+                    st.caption(
+                        f"📌 This list excludes the **{n_unmatched:,} unmatched** "
+                        "items (see the next tab). To merge them in, turn on "
+                        "**Treat unmatched as zero-use** in the sidebar."
+                    )
+            zero_cols = list(display_cols) + ['_matched_via', '_usage_total']
+            zero_cols = [c for c in zero_cols if c in zero_use.columns]
+            display_df = zero_use[zero_cols].rename(columns={
+                '_matched_via': 'Matched Via',
+                '_usage_total': 'Total Use',
+            }).sort_values('Total Use')
+
+            st.dataframe(display_df, use_container_width=True, height=500, hide_index=True)
+
+            _zu_fname = ("zero_use_items_combined.csv" if treat_unmatched_as_zero
+                         else "zero_use_items.csv")
+            _zu_view = ("Zero/Low-Use List (combined with unmatched)"
+                        if treat_unmatched_as_zero else "Zero/Low-Use List")
+            _zu_bytes = _annotate_csv(
+                display_df, notes,
+                extra_meta={'Tool': 'Zero-Use Identifier',
+                            'View': _zu_view,
+                            'Threshold': threshold,
+                            'Pub-year cutoff': pubyear_cutoff or 'none',
+                            'Treat unmatched as zero-use': treat_unmatched_as_zero,
+                            'Holdings rows': total_holdings,
+                            'Usage rows': len(usage_df),
+                            'Match keys': ', '.join(shared_keys)}
+            )
+            st.download_button("📥 Zero/low-use list (CSV)",
+                               _zu_bytes, _zu_fname, "text/csv",
+                               key="zu_dl_main")
+            _add_to_tray("zero_use", _zu_fname, _zu_bytes)
+
+        # --- Unmatched items ---
+        with tab_objs[1]:
+            unmatched_df = matched[matched['_matched_via'] == 'unmatched'].copy()
+            if treat_unmatched_as_zero:
+                st.success(
+                    f"📌 The **{len(unmatched_df):,} unmatched items** below are "
+                    "also included in the Zero/low-use list (combined view is on)."
+                )
+            st.markdown(
+                f"**{len(unmatched_df):,} items** in holdings could not be matched "
+                "to any usage row. These are *probably* zero-use, but they could "
+                "also indicate a coverage gap in the usage report (e.g., a vendor "
+                "that didn't return a row at all for a title with zero use)."
+            )
+            st.caption(
+                "Spot-check a few: if you find titles that *should* have appeared "
+                "in the usage file, your usage report is incomplete and the match "
+                "may be underestimating zero-use."
+            )
+            if not unmatched_df.empty:
+                um_cols = [c for c in display_cols if c in unmatched_df.columns]
+                um_display = unmatched_df[um_cols]
+                st.dataframe(um_display, use_container_width=True, height=400, hide_index=True)
+                _um_bytes = _annotate_csv(
+                    um_display, notes,
+                    extra_meta={'Tool': 'Zero-Use Identifier',
+                                'View': 'Unmatched Items',
+                                'Note': 'Items in holdings with no row in usage file'}
+                )
+                st.download_button("📥 Unmatched items (CSV)",
+                                   _um_bytes, "unmatched_items.csv", "text/csv",
+                                   key="zu_dl_unmatched")
+                _add_to_tray("zero_use", "unmatched_items.csv", _um_bytes)
+
+        # --- LC breakdown ---
+        idx = 2
+        if h_lc:
+            with tab_objs[idx]:
+                lc_summary = matched.groupby('_lc_main').agg(
+                    **{
+                        'Total Holdings': (h_lc, 'count'),
+                        'Total Use': ('_usage_total', 'sum'),
+                    }
+                ).reset_index().rename(columns={'_lc_main': 'LC Class'})
+                low_per_lc = matched[matched['_usage_total'] <= threshold].groupby('_lc_main').size()
+                lc_summary['Zero/Low-Use Items'] = lc_summary['LC Class'].map(low_per_lc).fillna(0).astype(int)
+                lc_summary['% Zero/Low-Use'] = (
+                    lc_summary['Zero/Low-Use Items'] / lc_summary['Total Holdings'] * 100
+                ).round(1)
+                lc_summary['Description'] = lc_summary['LC Class'].map(
+                    lambda c: LC_CLASSES.get(c, '?')
+                )
+                lc_summary = lc_summary[['LC Class', 'Description', 'Total Holdings',
+                                         'Total Use', 'Zero/Low-Use Items', '% Zero/Low-Use']]
+                lc_summary = lc_summary.sort_values('Zero/Low-Use Items', ascending=False)
+
+                st.markdown("**Where is the dead weight concentrated?**")
+                st.dataframe(lc_summary, use_container_width=True, hide_index=True, height=500)
+
+                fig = px.bar(
+                    lc_summary.head(15), x='% Zero/Low-Use', y='LC Class',
+                    orientation='h', color='% Zero/Low-Use',
+                    color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                    hover_data=['Description', 'Total Holdings', 'Zero/Low-Use Items'],
+                    title='% Zero/Low-Use by LC Class (top 15)',
+                )
+                fig.update_layout(yaxis={'categoryorder': 'total ascending'},
+                                  height=500, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+                _lc_bytes = _annotate_csv(
+                    lc_summary, notes,
+                    extra_meta={'Tool': 'Zero-Use Identifier', 'View': 'LC Breakdown',
+                                'Threshold': threshold}
+                )
+                st.download_button("📥 LC breakdown (CSV)",
+                                   _lc_bytes, "zero_use_by_lc.csv", "text/csv",
+                                   key="zu_dl_lc")
+                _add_to_tray("zero_use", "zero_use_by_lc.csv", _lc_bytes)
+            idx += 1
+
+        # --- Format breakdown ---
+        if h_format:
+            with tab_objs[idx]:
+                fmt_summary = matched.groupby(h_format).agg(
+                    **{
+                        'Total Holdings': (h_format, 'count'),
+                        'Total Use': ('_usage_total', 'sum'),
+                    }
+                ).reset_index()
+                low_per_fmt = matched[matched['_usage_total'] <= threshold].groupby(h_format).size()
+                fmt_summary['Zero/Low-Use Items'] = fmt_summary[h_format].map(low_per_fmt).fillna(0).astype(int)
+                fmt_summary['% Zero/Low-Use'] = (
+                    fmt_summary['Zero/Low-Use Items'] / fmt_summary['Total Holdings'] * 100
+                ).round(1)
+                fmt_summary = fmt_summary.sort_values('Zero/Low-Use Items', ascending=False)
+                st.dataframe(fmt_summary, use_container_width=True, hide_index=True)
+                _fmt_bytes = _annotate_csv(
+                    fmt_summary, notes,
+                    extra_meta={'Tool': 'Zero-Use Identifier', 'View': 'Format Breakdown',
+                                'Threshold': threshold}
+                )
+                st.download_button("📥 Format breakdown (CSV)",
+                                   _fmt_bytes, "zero_use_by_format.csv", "text/csv",
+                                   key="zu_dl_fmt")
+                _add_to_tray("zero_use", "zero_use_by_format.csv", _fmt_bytes)
+            idx += 1
+
+        # --- Age distribution ---
+        if h_pubyear:
+            with tab_objs[idx]:
+                # Ensure _pubyear exists (only added when optional cutoff is enabled)
+                if '_pubyear' not in matched.columns:
+                    matched['_pubyear'] = pd.to_numeric(matched[h_pubyear], errors='coerce')
+                age_df = matched.dropna(subset=['_pubyear']).copy()
+                if age_df.empty:
+                    st.info(f"Could not parse any values from `{h_pubyear}` as years.")
+                else:
+                    age_df['_pubyear'] = age_df['_pubyear'].astype(int)
+                    age_df['_is_zero'] = age_df['_usage_total'] <= threshold
+                    age_df['Decade'] = (age_df['_pubyear'] // 10 * 10).astype(int).astype(str) + 's'
+                    decade_summary = age_df.groupby('Decade').agg(
+                        Total=('_pubyear', 'count'),
+                        ZeroLowUse=('_is_zero', 'sum'),
+                    ).reset_index()
+                    decade_summary['% Zero/Low-Use'] = (
+                        decade_summary['ZeroLowUse'] / decade_summary['Total'] * 100
+                    ).round(1)
+                    decade_summary = decade_summary.sort_values('Decade')
+                    st.markdown("**Older items are more likely to sit unused — but how much?**")
+                    fig = px.bar(
+                        decade_summary, x='Decade', y='% Zero/Low-Use',
+                        color='% Zero/Low-Use',
+                        color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                        hover_data=['Total', 'ZeroLowUse'],
+                        title='% Zero/Low-Use by Publication Decade',
+                    )
+                    fig.update_layout(height=400, showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.dataframe(decade_summary, use_container_width=True, hide_index=True)
+
+        # Download tray
+        st.markdown("---")
+        st.subheader("Downloads")
+        _render_download_tray("zero_use", zip_filename="zero_use_results.zip")
+
+    except Exception as e:
+        st.error(f"❌ Error: {e}")
+        st.info("Check that both CSVs have at least a Title column or a shared "
+                "identifier (ISBN/ISSN/DOI/OCLC).")
+
+
+# =====================================================================
+# HOME PAGE & MAIN NAVIGATION
+# =====================================================================
+
+def page_home():
+    st.title("📚 Library Collection Dashboard")
+    st.markdown(
+        "A decision-support suite for collection assessment, subscription management, "
+        "and acquisition prioritization at Howard-Tilton Memorial Library."
+    )
+    st.markdown(
+        "Each tool answers one question. Pick based on what you need to decide."
+    )
+    st.markdown("---")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("""
+        <div class="tool-card">
+            <h3>🗺️ Collection Profiler</h3>
+            <p><em>What does our collection look like?</em></p>
+            <p>LC sunburst, treemap, subject word cloud, gap analysis.
+            Map disciplinary strengths across 1M+ records.</p>
+            <hr>
+            <p><strong>Use for:</strong></p>
+            <ul>
+                <li>Baseline & accreditation reports</li>
+                <li>Liaison prep</li>
+                <li>Budget justifications</li>
+                <li>Weeding area selection</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with c2:
+        st.markdown("""
+        <div class="tool-card">
+            <h3>📈 Usage & Subscription Analyzer</h3>
+            <p><em>What's being used and what isn't?</em></p>
+            <p>Title-level usage for COUNTER e-resources and print circulation.
+            Cancellation candidates, publisher rollups, trends.</p>
+            <hr>
+            <p><strong>Use for:</strong></p>
+            <ul>
+                <li>Annual database renewals</li>
+                <li>Print weeding by circulation</li>
+                <li>Package value evaluation</li>
+                <li>Faculty cancellation conversations</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    c3, c4 = st.columns(2)
+
+    with c3:
+        st.markdown("""
+        <div class="tool-card">
+            <h3>🔍 Zero-Use Identifier</h3>
+            <p><em>What do we own that isn't being used?</em></p>
+            <p>Compare a holdings list against a usage report to surface
+            titles, journals, or databases with no use at all.</p>
+            <hr>
+            <p><strong>Use for:</strong></p>
+            <ul>
+                <li>E-journal & database cancellation prep</li>
+                <li>Off-site storage candidates</li>
+                <li>Dead-weight in big-deal packages</li>
+                <li>Renewal evidence for admin/faculty</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with c4:
+        st.markdown("""
+        <div class="tool-card">
+            <h3>📊 Acquisition Recommendation Scorer</h3>
+            <p><em>What should we buy next?</em></p>
+            <p>Score candidate books against checkout history +
+            faculty research interests. Subject, LC, author, faculty.</p>
+            <hr>
+            <p><strong>Use for:</strong></p>
+            <ul>
+                <li>Vendor slip list triage</li>
+                <li>Approval-plan exceptions</li>
+                <li>Faculty request review</li>
+                <li>DDA flip decisions</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader("Quick decision guide")
+    st.markdown("""
+    | You need to… | Use |
+    |---|---|
+    | Show what the collection covers (or doesn't) | **Collection Profiler** |
+    | Decide which databases to renew or cancel | **Usage & Subscription Analyzer** → COUNTER |
+    | Pick books to weed from the stacks | **Usage & Subscription Analyzer** → Print |
+    | Find what you own that's never been used | **Zero-Use Identifier** |
+    | Identify e-journal/package titles with no use | **Zero-Use Identifier** (holdings vs. COUNTER) |
+    | Prioritize purchases from a vendor list | **Recommendation Scorer** |
+    | Match new books to specific faculty research | **Recommendation Scorer** (with faculty file) |
+    | Find areas with strong use relative to holdings (or weak) | **Collection Profiler** → Coverage vs. Use |
+    | Identify specific low-use titles to weed in those areas | **Usage Analyzer** → Print (after Profiler) |
+    | Find high-use areas missing from the catalog | **Recommendation Scorer** → Subject Analysis tab |
+    """)
+
+    st.markdown("---")
+    with st.expander("ℹ️ About this dashboard"):
+        st.markdown("""
+        **Version 2.0** — consolidated from four earlier Streamlit apps:
+        - *Word Cloud Generator* (now a view option inside the Collection Profiler)
+        - *Collection Strengths Analyzer* (now the Collection Profiler backbone)
+        - *EBSCO Subscription Dashboard* (now the Usage Analyzer → COUNTER mode)
+        - *Book Recommendation Scorer* (now the Acquisition Recommendation Scorer)
+
+        **Design principles:**
+        - Each tool answers a different decision question
+        - Shared utilities (LC parsing, text normalization, CSV loading) live once
+        - Memory-optimized for large catalog exports
+
+        Built with Streamlit. Tulane color palette: `#285C4D` (green), `#71C5E8` (blue).
+        Fonts: Source Serif 4 / DM Sans.
+        """)
+
 
 def main():
     with st.sidebar:
-        st.title("📚 Dashboard Navigation")
+        st.title("📚 Collection Dashboard")
+        st.markdown("*Howard-Tilton Memorial Library*")
+        st.markdown("---")
         page = st.radio(
-            "Choose a Tool:",
-            [
-                "🏠 Home",
-                "🗺️ Collection Profiler",
-                "🔍 Zero-Use Identifier",
-                "📊 Acquisition Scorer"
-            ]
+            "Select a tool:",
+            ["🏠 Home",
+             "🗺️ Collection Profiler",
+             "📈 Usage & Subscription Analyzer",
+             "🔍 Zero-Use Identifier",
+             "📊 Acquisition Recommendation Scorer"],
+            index=0,
+            key="nav"
         )
-        st.divider()
-        st.caption("Tulane University | Howard-Tilton Memorial Library")
+        st.markdown("---")
 
     if page == "🏠 Home":
         page_home()
     elif page == "🗺️ Collection Profiler":
         page_collection_profiler()
+    elif page == "📈 Usage & Subscription Analyzer":
+        page_usage_analyzer()
     elif page == "🔍 Zero-Use Identifier":
-        page_zero_use()
-    elif page == "📊 Acquisition Scorer":
-        page_acquisition_scorer()
+        page_zero_use_identifier()
+    elif page == "📊 Acquisition Recommendation Scorer":
+        page_recommendation_scorer()
+
+    _footer()
 
 
 if __name__ == "__main__":
