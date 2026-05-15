@@ -1,23 +1,37 @@
 """
 Library Collection Dashboard
 ============================
-A unified Streamlit application combining three collection decision-support tools:
+A unified Streamlit application bundling four collection decision-support tools:
 
-  1. Collection Profiler — "What does our collection look like?"
-     Sunburst, treemap, LC × subject heatmap, subject bars, word cloud, gap analysis.
-     Feeds collection assessment, accreditation, weeding prep, liaison planning.
+  1. Collection Profiler — "What does our collection look like, and what's used?"
+     Three views in one tool:
+       • LC Analysis — sunburst, treemap, LC × subject heatmap, gap analysis,
+         coverage-vs-use. Feeds collection assessment and accreditation work.
+       • Subject Term Analysis — top subjects, word cloud, title-keyword n-grams.
+         Feeds policy revision, liaison conversations, marketing planning.
+       • Title Analysis — top titles by usage, weeding review, author summary,
+         date-range filtering. Feeds print weeding and circulation triage.
+         (Absorbs the former standalone Print Circulation analyzer.)
 
-  2. Usage & Subscription Analyzer — "What's being used and what isn't?"
-     Title-level usage analysis for COUNTER 5 e-resource reports and print
-     circulation data. Top titles, cancellation review, publisher rollups,
-     monthly trends. Feeds renewal, cancellation, and weeding decisions.
+  2. COUNTER Analyzer — "Which e-resources are pulling their weight?"
+     Formal COUNTER 5 reports only (TR/TR_J3/TR_B1/DR/PR/IR with the standard
+     12–13 row metadata header and monthly columns). Top titles, cancellation
+     review, publisher rollups, monthly trends. Vendor admin exports with
+     subjects/LC (e.g., EBSCO Detailed Report) belong in the Profiler instead.
 
-  3. Acquisition Recommendation Scorer — "What should we buy next?"
+  3. Zero-Use Identifier — "What do we own that isn't being used?"
+     Holdings vs. usage comparison with multi-identifier matching cascade
+     (ISBN, ISSN, DOI, OCLC, title+author fallback). Feeds cancellation prep,
+     off-site storage candidates, and renewal evidence.
+
+  4. Acquisition Recommendation Scorer — "What should we buy next?"
      Scores new candidate books against checkout history using subject
      similarity, LC fit, author popularity, and faculty research interests.
      Feeds purchasing, approval-plan review, and faculty request triage.
 
-v2.0 — Consolidated edition
+v2.3 — Profiler reorganized into three top-level views (LC/Subject/Title);
+       Print Circulation merged into Title Analysis; Usage Analyzer split off
+       as standalone COUNTER Analyzer (formal COUNTER 5 only).
 Contact: Kay P Maye (kmaye@tulane.edu)
 """
 
@@ -48,6 +62,20 @@ try:
     NLTK_AVAILABLE = True
 except ImportError:
     NLTK_AVAILABLE = False
+
+# Excel support — pandas uses openpyxl for .xlsx and xlrd for .xls.
+# Both are optional dependencies; CSV path always works.
+try:
+    import openpyxl  # noqa: F401
+    XLSX_AVAILABLE = True
+except ImportError:
+    XLSX_AVAILABLE = False
+
+try:
+    import xlrd  # noqa: F401
+    XLS_AVAILABLE = True
+except ImportError:
+    XLS_AVAILABLE = False
 
 
 # =====================================================================
@@ -603,21 +631,37 @@ def _extract_ngrams(segments, n_values=(1,)):
 # =====================================================================
 
 SUBJECT_ALIASES = ['Subjects', 'Subject', 'Subject Terms', 'Subject Headings',
-                   'SUBJECT', 'subject_terms', 'Topics']
+                   'SUBJECT', 'subject_terms', 'Topics', 'subjects']
 LC_ALIASES = ['LC Classification Code', 'LC Classification', 'LC Class',
+              'LC Subclass', 'LCC',
               'Call Number', 'CallNumber', 'call_number', 'Call #',
-              'LC Call Number', 'LCC', 'Classification', 'lc_classification']
-TITLE_ALIASES = ['Title', 'title', 'TITLE', 'Book Title', 'Item Title']
-WEIGHT_ALIASES = ['Loans', 'Loans (Total)', 'Checkouts', 'Circulation',
-                  'Total_Item_Requests', 'Unique_Item_Requests',
-                  'Total_Item_Investigations', 'Usage', 'Uses', 'Count',
-                  'Digital File Downloads', 'Digital File Views', 'checkouts',
-                  # ProQuest / Ebook Central title reports
-                  'Total Book Downloads', 'Book Downloads', 'Downloads',
-                  'Read Online (post Trigger) Sessions',
-                  'Read Online Sessions', 'Sessions',
-                  # Other vendor variants
-                  'Views', 'Requests', 'Hits', 'Total Uses']
+              'LC Call Number', 'Classification', 'lc_classification']
+TITLE_ALIASES = ['Title', 'title', 'TITLE', 'Book Title', 'Item Title',
+                 'Title (Normalized)', 'File Name', 'Filename',
+                 'Item Name', 'Resource Title', 'Object Title']
+
+# Weight/usage aliases — ORDER MATTERS. More specific and meaningful usage
+# columns appear first so they win the alias contest before generic ones.
+# 'Uses' (bare) deliberately omitted — too generic; matches "Remaining CAM Uses"
+# which is *available* capacity, not actual usage.
+WEIGHT_ALIASES = [
+    # COUNTER 5 metrics (most specific — formal e-resource usage)
+    'Total_Item_Requests', 'Unique_Item_Requests',
+    'Total_Item_Investigations', 'Unique_Item_Investigations',
+    'Total_Title_Requests', 'Unique_Title_Requests',
+    # EBSCO Detailed Report — actual usage (in preference order)
+    'Total Accesses', 'Full Downloads', 'Chapter Downloads', 'Online Views',
+    # Print circulation
+    'Loans (Total)', 'Loans (In House + Not In House)',
+    'Loans', 'Checkouts', 'Circulation', 'checkouts',
+    # Digital views / downloads
+    'Digital File Downloads', 'Digital File Views',
+    'Total Book Downloads', 'Book Downloads', 'Downloads',
+    'Read Online (post Trigger) Sessions',
+    'Read Online Sessions', 'Sessions',
+    # Generic — last resort
+    'Views', 'Requests', 'Hits', 'Usage', 'Total Uses', 'Count',
+]
 
 # Identifier columns for cross-file matching (used by Zero-Use Identifier).
 # ISBN/ISSN/DOI/OCLC are reliable join keys; title+author is the fallback
@@ -631,6 +675,8 @@ OCLC_ALIASES = ['OCLC', 'OCLC Number', 'OCLC #', 'OCLC_Number',
                 'WorldCat Number', 'OCN']
 AUTHOR_ALIASES = ['Author', 'author', 'AUTHOR', 'Creator', 'Authors',
                   'Primary Author', 'Main Author']
+LOCATION_ALIASES = ['Location', 'Location Name', 'location', 'Library Location',
+                    'Shelving Location', 'Holding Location']
 
 
 def find_column(df_or_cols, aliases, partial=True):
@@ -646,8 +692,18 @@ def find_column(df_or_cols, aliases, partial=True):
     return None
 
 
-def _detect_columns_from_header(file_bytes):
-    """Read only the header row to detect column names without loading all data."""
+def _detect_columns_from_header(file_bytes, filename=None):
+    """Read only the header row to detect column names without loading all data.
+
+    Dispatches on filename extension when provided — CSV uses read_csv, XLS/XLSX
+    uses read_excel. Falls back to CSV if filename is missing.
+    """
+    if filename and filename.lower().endswith(('.xls', '.xlsx')):
+        try:
+            header = pd.read_excel(BytesIO(file_bytes), nrows=0)
+            return [c.strip() if isinstance(c, str) else c for c in header.columns]
+        except Exception:
+            pass  # fall through to CSV attempt
     try:
         header = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', nrows=0)
     except Exception:
@@ -657,7 +713,23 @@ def _detect_columns_from_header(file_bytes):
 
 @st.cache_data(show_spinner=False)
 def _load_csv_chunked(file_bytes, filename, cols_to_keep=None):
-    """Load CSV with minimal memory footprint."""
+    """Load CSV or Excel file with minimal memory footprint.
+
+    Despite the name (kept for backward compatibility with cache keys), this now
+    dispatches based on filename extension: .xls/.xlsx use pandas.read_excel,
+    everything else uses read_csv with utf-8-sig → latin-1 fallback.
+    """
+    if filename and filename.lower().endswith(('.xls', '.xlsx')):
+        # Excel path — usecols works the same way as CSV
+        try:
+            df = pd.read_excel(BytesIO(file_bytes), usecols=cols_to_keep)
+        except Exception:
+            # If cols_to_keep failed (e.g., mismatch), try without it
+            df = pd.read_excel(BytesIO(file_bytes))
+        df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+        return df
+
+    # CSV path (original behavior)
     try:
         df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False,
                          usecols=cols_to_keep)
@@ -1420,9 +1492,8 @@ def _render_coverage_vs_use(results, settings, notes=""):
         if under_count:
             bullets.append(
                 f"- **{under_count} underperforming area(s)** are candidates for "
-                "weeding review or reassessment. Use the **Usage Analyzer → Print "
-                "Circulation** tool to see the specific low-use titles driving "
-                "those numbers."
+                "weeding review or reassessment. Switch to the **Title Analysis** "
+                "tab to see the specific low-use titles driving those numbers."
             )
         st.markdown("\n".join(bullets))
 
@@ -1624,21 +1695,32 @@ def _render_title_keywords(results, settings, notes=""):
         st.info("Install `wordcloud` and `matplotlib` to enable the keyword cloud.")
 
 
-def _profiler_display_results(results, settings, df, idx):
-    """Render all enabled visualizations in a sensible narrative order."""
+def _profiler_display_results(results, settings, df, idx,
+                              title_col=None, weight_col=None,
+                              author_col=None, date_col=None,
+                              location_col=None):
+    """Render Profiler results in three top-level tabs: LC Analysis, Subject
+    Term Analysis, and Title Analysis.
+
+    The Title Analysis tab absorbs the functionality formerly in the standalone
+    Print/Usage Analyzer: top titles by usage, weeding review (low-usage threshold),
+    LC breakdown by circulation, author summary, date-range filter. These are
+    enabled when the file has a usage column.
+
+    Args beyond `results`/`settings`/`df`/`idx` are the detected column names from
+    the upstream loader. They're optional because not every file has all of them.
+    """
     wl = settings['weight_label']
     top_n = settings['top_n_subjects']
+    usage_col_label = settings.get('usage_col_label', 'Usage')
+    has_usage = bool(settings.get('has_usage_col'))
 
     # Fresh tray for this render pass
     _reset_tray("profiler")
 
+    # ---- Overview KPIs (shown above tabs so they're always visible) ----
     st.markdown("---")
     st.subheader("Collection overview")
-    # Top KPIs — when a usage column is mapped, always show total use up here,
-    # regardless of weighting mode, so the metric is visible even when the
-    # primary analysis weights titles by 1.
-    usage_col_label = settings.get('usage_col_label', 'Usage')
-    has_usage = bool(settings.get('has_usage_col'))
     total_use = 0
     if has_usage:
         if results.get('cvu_available'):
@@ -1650,176 +1732,409 @@ def _profiler_display_results(results, settings, df, idx):
     c1.metric("Records Analyzed", f"{results['n_records']:,}")
     c2.metric(f"Total {wl}", f"{results['total_weight']:,.0f}")
     if has_usage and wl != usage_col_label:
-        # Replace "LC Classes Present" with total use when more informative
-        # (i.e., when weighting mode is Title Count, so total_weight == n_records)
         c3.metric(f"Total {usage_col_label}", f"{int(total_use):,}")
         c4.metric("Unique Subjects", f"{len(results['subject_counts']):,}")
     else:
         c3.metric("LC Classes Present", f"{len(results['lc_main_counts'])}")
         c4.metric("Unique Subjects", f"{len(results['subject_counts']):,}")
 
-    # Notes — shown above results so users annotate *before* downloading
+    # ---- Shared analysis-notes widget (used across all tabs) ----
     notes = _notes_widget(
         "profiler",
         placeholder="e.g., Prepared for sociology accreditation report, Nov 2025. "
                     "Follow-up: discuss HQ underperformance with Dr. Chen."
     )
 
-    # Word cloud (formerly its own tool — now a view option here)
-    if settings['show_wordcloud'] and results['subject_counts']:
-        st.markdown("---")
-        st.subheader(f"Subject word cloud ({wl}-weighted)")
-        if not WORDCLOUD_AVAILABLE:
-            st.warning("Install `wordcloud` and `matplotlib` to enable this view: "
-                       "`pip install wordcloud matplotlib`")
+    # ---- Three top-level tabs ----
+    st.markdown("---")
+    tab_lc, tab_subj, tab_title = st.tabs([
+        "🗺️ LC Analysis",
+        "🏷️ Subject Term Analysis",
+        "📚 Title Analysis",
+    ])
+
+    # ======================================================================
+    # TAB 1: LC ANALYSIS
+    # ======================================================================
+    with tab_lc:
+        if not results.get('lc_main_counts'):
+            st.info("No LC classification data found. Make sure the LC column "
+                    "is mapped correctly, or upload a file with LC call numbers.")
         else:
-            min_len = settings.get('wc_min_len', 3)
-            max_words = settings.get('wc_max_words', 100)
-            color_scheme = settings.get('wc_color', 'viridis')
-            filtered = {t: c for t, c in results['subject_counts'].items()
-                        if t and len(t) >= min_len}
-            if filtered:
-                wc = WordCloud(
-                    width=1200, height=500, background_color='white',
-                    colormap=color_scheme, max_words=max_words,
-                    relative_scaling=0.5, min_font_size=10, prefer_horizontal=0.7,
-                ).generate_from_frequencies(filtered)
-                fig, ax = plt.subplots(figsize=(14, 6))
-                ax.imshow(wc, interpolation='bilinear')
-                ax.axis('off')
-                st.pyplot(fig, use_container_width=True)
-                # Save word cloud image for download
-                buf = BytesIO()
-                fig.savefig(buf, format='png', dpi=200, bbox_inches='tight',
-                            facecolor='white', edgecolor='none')
-                buf.seek(0)
-                _wc_png_bytes = buf.getvalue()
-                st.download_button("📥 Word cloud (PNG)", _wc_png_bytes,
-                                   "collection_wordcloud.png", "image/png",
-                                   key='prof_dl_wc')
-                _add_to_tray("profiler", "collection_wordcloud.png", _wc_png_bytes)
-                plt.close(fig)
+            # --- LC sunburst ---
+            if settings['show_sunburst'] and results['sunburst_data']:
+                st.subheader("LC classification sunburst")
+                sb = results['sunburst_data']
+                fig = go.Figure(go.Sunburst(
+                    ids=[r['id'] for r in sb], labels=[r['label'] for r in sb],
+                    parents=[r['parent'] for r in sb], values=[r['value'] for r in sb],
+                    branchvalues='total',
+                    marker=dict(colors=[r['value'] for r in sb],
+                                colorscale=[[0, '#71C5E8'], [0.5, '#285C4D'], [1, '#1a3d33']]),
+                    maxdepth=2
+                ))
+                fig.update_layout(height=600, margin=dict(t=30, l=0, r=0, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+
+            # --- LC treemap ---
+            if settings['show_treemap'] and results['lc_main_counts']:
+                st.markdown("---")
+                st.subheader("LC classification treemap")
+                tm_data = [{'Class': f"{c} – {LC_CLASSES.get(c, c)}", 'Count': ct,
+                            'Pct': ct / results['total_weight'] * 100}
+                           for c, ct in sorted(results['lc_main_counts'].items(), key=lambda x: -x[1])]
+                tm_df = pd.DataFrame(tm_data)
+                fig = px.treemap(tm_df, path=['Class'], values='Count', color='Count',
+                                 color_continuous_scale=[[0, '#71C5E8'], [0.5, '#285C4D'], [1, '#1a3d33']],
+                                 hover_data={'Pct': ':.1f'})
+                fig.update_layout(height=500, margin=dict(t=30, l=0, r=0, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+
+            # --- LC × Subject heatmap (inherently cross-axis; living in LC tab) ---
+            if settings['show_heatmap'] and results['subject_by_lc']:
+                st.markdown("---")
+                st.subheader("LC class × top subjects heatmap")
+                st.caption("Bridges LC and subject analysis: shows which subject "
+                           "terms cluster within which LC classes.")
+                global_top = [s for s, _ in results['subject_counts'].most_common(min(top_n, 25))]
+                lc_present = sorted(results['subject_by_lc'].keys())
+                matrix = [[results['subject_by_lc'][c].get(s, 0) for s in global_top] for c in lc_present]
+                labels_y = [f"{c} – {LC_CLASSES.get(c, c)}" for c in lc_present]
+                fig = go.Figure(data=go.Heatmap(
+                    z=matrix, x=global_top, y=labels_y,
+                    colorscale=[[0, '#ffffff'], [0.3, '#71C5E8'], [1, '#285C4D']],
+                ))
+                fig.update_layout(height=max(400, len(lc_present) * 35), xaxis=dict(tickangle=45))
+                st.plotly_chart(fig, use_container_width=True)
+
+            # --- Coverage vs. Use (LC-based, when LC + usage are both present) ---
+            if settings.get('show_coverage_vs_use') and results.get('cvu_available'):
+                st.markdown("---")
+                _render_coverage_vs_use(results, settings, notes=notes)
+
+            # --- Gap analysis ---
+            if settings['show_gap_analysis']:
+                st.markdown("---")
+                st.subheader("Collection gap analysis")
+                missing = results['missing_lc_classes']
+                thin = results['thin_lc_classes']
+                if missing:
+                    st.markdown("**LC Classes with No Holdings:**")
+                    st.dataframe(pd.DataFrame([{'LC Class': c, 'Description': LC_CLASSES.get(c, '')}
+                                               for c in missing]),
+                                 use_container_width=True, hide_index=True)
+                else:
+                    st.info("All LC main classes are represented.")
+                if thin:
+                    st.markdown("**LC Classes Below 1% of Collection:**")
+                    rows_t = [{'LC Class': c, 'Description': LC_CLASSES.get(c, ''),
+                               f'{wl}': f"{v:,.0f}",
+                               '% of Collection': f"{v / results['total_weight'] * 100:.2f}%"}
+                              for c, v in sorted(thin.items(), key=lambda x: x[1])]
+                    st.dataframe(pd.DataFrame(rows_t),
+                                 use_container_width=True, hide_index=True)
+                if results['lc_main_counts']:
+                    st.markdown("**Strongest Areas (top 5):**")
+                    top5 = sorted(results['lc_main_counts'].items(), key=lambda x: -x[1])[:5]
+                    rows_s = [{'LC Class': c, 'Description': LC_CLASSES.get(c, ''),
+                               f'{wl}': f"{v:,.0f}",
+                               '% of Collection': f"{v / results['total_weight'] * 100:.1f}%"}
+                              for c, v in top5]
+                    st.dataframe(pd.DataFrame(rows_s),
+                                 use_container_width=True, hide_index=True)
+
+    # ======================================================================
+    # TAB 2: SUBJECT TERM ANALYSIS
+    # ======================================================================
+    with tab_subj:
+        if not results.get('subject_counts'):
+            st.info("No subject data found. Make sure the Subjects column is "
+                    "mapped correctly, or upload a file with subject headings.")
+        else:
+            # --- Subject word cloud ---
+            if settings['show_wordcloud'] and results['subject_counts']:
+                st.subheader(f"Subject word cloud ({wl}-weighted)")
+                if not WORDCLOUD_AVAILABLE:
+                    st.warning("Install `wordcloud` and `matplotlib` to enable this view: "
+                               "`pip install wordcloud matplotlib`")
+                else:
+                    min_len = settings.get('wc_min_len', 3)
+                    max_words = settings.get('wc_max_words', 100)
+                    color_scheme = settings.get('wc_color', 'viridis')
+                    filtered = {t: c for t, c in results['subject_counts'].items()
+                                if t and len(t) >= min_len}
+                    if filtered:
+                        wc = WordCloud(
+                            width=1200, height=500, background_color='white',
+                            colormap=color_scheme, max_words=max_words,
+                            relative_scaling=0.5, min_font_size=10, prefer_horizontal=0.7,
+                        ).generate_from_frequencies(filtered)
+                        fig, ax = plt.subplots(figsize=(14, 6))
+                        ax.imshow(wc, interpolation='bilinear')
+                        ax.axis('off')
+                        st.pyplot(fig, use_container_width=True)
+                        buf = BytesIO()
+                        fig.savefig(buf, format='png', dpi=200, bbox_inches='tight',
+                                    facecolor='white', edgecolor='none')
+                        buf.seek(0)
+                        _wc_png_bytes = buf.getvalue()
+                        st.download_button("📥 Word cloud (PNG)", _wc_png_bytes,
+                                           "collection_wordcloud.png", "image/png",
+                                           key='prof_dl_wc')
+                        _add_to_tray("profiler", "collection_wordcloud.png", _wc_png_bytes)
+                        plt.close(fig)
+                    else:
+                        st.info(f"No subjects meet the minimum length of {min_len} characters.")
+
+            # --- Top subject bars ---
+            if settings['show_subject_bars'] and results['subject_counts']:
+                st.markdown("---")
+                st.subheader(f"Top {top_n} subject terms")
+                top_subjects = results['subject_counts'].most_common(top_n)
+                sdf = pd.DataFrame(top_subjects, columns=['Subject', 'Count'])
+                fig = px.bar(sdf, x='Count', y='Subject', orientation='h', color='Count',
+                             color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']])
+                fig.update_layout(yaxis={'categoryorder': 'total ascending'},
+                                  height=max(450, top_n * 24), showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+                _subj_bytes = _annotate_csv(sdf, notes,
+                                            extra_meta={'Tool': 'Collection Profiler',
+                                                        'View': 'Top Subjects',
+                                                        'Weighting': wl})
+                st.download_button("📥 Subject frequencies (CSV)",
+                                   _subj_bytes, "subject_frequencies.csv",
+                                   "text/csv", key='prof_dl_subj')
+                _add_to_tray("profiler", "subject_frequencies.csv", _subj_bytes)
+
+            # --- Title keywords (n-gram analysis) ---
+            if settings.get('show_title_keywords'):
+                st.markdown("---")
+                _render_title_keywords(results, settings, notes=notes)
+
+            # --- Coverage vs. Use (subject-based fallback when LC isn't available) ---
+            if settings.get('show_coverage_vs_use') and results.get('cvu_by_subject_available') \
+               and not results.get('cvu_available'):
+                st.markdown("---")
+                _render_coverage_vs_use_by_subject(results, settings, notes=notes)
+
+    # ======================================================================
+    # TAB 3: TITLE ANALYSIS (absorbs former Print/Usage Analyzer functionality)
+    # ======================================================================
+    with tab_title:
+        if not title_col:
+            st.info("No Title column detected. Title-level analysis is unavailable. "
+                    "Map a Title column above to use this tab.")
+        elif df is None:
+            st.info("Title-level data not available for this analysis pass.")
+        else:
+            # Filter df to the LC-selected subset (matches what the other tabs see)
+            df_view = df.loc[idx] if idx is not None else df
+
+            # ---- Date-range filter (if a date column was detected) ----
+            period_label = "unknown period"
+            if date_col and date_col in df_view.columns:
+                df_view = df_view.copy()
+                # Year-only columns (integer values like 2025) need special handling —
+                # pd.to_datetime would interpret them as nanoseconds-since-epoch (1970).
+                src = df_view[date_col]
+                if pd.api.types.is_numeric_dtype(src):
+                    # Year column path: coerce to Jan-1 of that year
+                    df_view['_date'] = pd.to_datetime(
+                        src.astype('Int64').astype(str) + '-01-01',
+                        errors='coerce',
+                    )
+                else:
+                    df_view['_date'] = pd.to_datetime(src, errors='coerce')
+                valid_dates = df_view['_date'].dropna()
+                if len(valid_dates) > 0:
+                    date_min = valid_dates.min()
+                    date_max = valid_dates.max()
+                    period_label = _format_date_range(date_min, date_max)
+                    with st.expander(f"📅 Date range filter "
+                                     f"(detected: {date_min.strftime('%Y-%m-%d')} to "
+                                     f"{date_max.strftime('%Y-%m-%d')})",
+                                     expanded=False):
+                        use_filter = st.checkbox(
+                            "Apply date filter", value=False,
+                            key="prof_title_date_use",
+                        )
+                        if use_filter:
+                            dmin_d = date_min.date()
+                            dmax_d = date_max.date()
+                            start_date, end_date = st.date_input(
+                                "Date range:",
+                                value=(dmin_d, dmax_d),
+                                min_value=dmin_d, max_value=dmax_d,
+                                key="prof_title_date_range",
+                            )
+                            if isinstance(start_date, tuple):
+                                start_date, end_date = start_date
+                            mask = (df_view['_date'].dt.date >= start_date) & \
+                                   (df_view['_date'].dt.date <= end_date)
+                            df_view = df_view[mask].copy()
+                            period_label = _format_date_range(
+                                pd.Timestamp(start_date), pd.Timestamp(end_date)
+                            )
+                            st.caption(f"Filtered to {len(df_view):,} records "
+                                       f"in {period_label}")
+
+            # ---- Sub-tabs within Title Analysis ----
+            if has_usage and weight_col and '_weight' in df_view.columns:
+                title_subtabs = ["Top titles", "Weeding review"]
+                if author_col:
+                    title_subtabs.append("Author summary")
+                title_subtabs.append("Title details")
+                ts_objs = st.tabs(title_subtabs)
+                ts_idx = {label: i for i, label in enumerate(title_subtabs)}
+
+                # ---- Top titles ----
+                with ts_objs[ts_idx["Top titles"]]:
+                    n_top = st.slider("Show Top N Titles", 5, 100, 25, key="prof_title_topn")
+                    cols_show = [title_col, '_weight']
+                    if author_col and author_col in df_view.columns:
+                        cols_show.insert(1, author_col)
+                    if location_col and location_col in df_view.columns:
+                        cols_show.append(location_col)
+                    top_titles = df_view.nlargest(n_top, '_weight')[cols_show].rename(
+                        columns={'_weight': weight_col}
+                    )
+                    fig_top = px.bar(
+                        top_titles, x=weight_col, y=title_col, orientation='h',
+                        title=f"Top {n_top} Titles by {weight_col} — {period_label}",
+                        color=weight_col,
+                        color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                    )
+                    fig_top.update_layout(
+                        yaxis={'categoryorder': 'total ascending'},
+                        height=max(450, n_top * 22),
+                    )
+                    st.plotly_chart(fig_top, use_container_width=True)
+                    st.dataframe(top_titles, use_container_width=True, hide_index=True)
+
+                    _top_bytes = _annotate_csv(
+                        top_titles, notes,
+                        extra_meta={'Tool': 'Collection Profiler',
+                                    'View': 'Top Titles',
+                                    'Metric': weight_col,
+                                    'Period': period_label}
+                    )
+                    _top_fname = f"top_titles_{_slug_period(period_label)}.csv".replace('_.', '.')
+                    st.download_button("📥 Top titles (CSV)",
+                                       _top_bytes, _top_fname, "text/csv",
+                                       key="prof_title_dl_top")
+                    _add_to_tray("profiler", _top_fname, _top_bytes)
+
+                # ---- Weeding review (low-usage threshold) ----
+                with ts_objs[ts_idx["Weeding review"]]:
+                    st.info("Review titles with low or zero usage for potential "
+                            "weeding, off-site storage, or replacement.")
+                    max_w = int(df_view['_weight'].max()) if len(df_view) else 100
+                    threshold = st.number_input(
+                        f"Low-Usage Threshold ({weight_col})",
+                        min_value=0, max_value=max_w, value=0,
+                        key="prof_title_thr",
+                    )
+                    low_cols = [title_col, '_weight']
+                    if author_col and author_col in df_view.columns:
+                        low_cols.insert(1, author_col)
+                    if '_lc_main' in df_view.columns:
+                        low_cols.append('_lc_main')
+                    if location_col and location_col in df_view.columns:
+                        low_cols.append(location_col)
+                    low_use = df_view[df_view['_weight'] <= threshold][low_cols].sort_values('_weight')
+                    rename_map = {'_weight': weight_col, '_lc_main': 'LC Class'}
+                    low_use = low_use.rename(columns=rename_map)
+
+                    cc1, cc2 = st.columns(2)
+                    cc1.metric("Titles ≤ Threshold", f"{len(low_use):,}")
+                    cc2.metric("% of Collection",
+                               f"{len(low_use) / max(1, len(df_view)) * 100:.1f}%")
+                    st.dataframe(low_use, use_container_width=True, height=400)
+
+                    _weed_fname = f"weeding_review_{_slug_period(period_label)}.csv".replace('_.', '.')
+                    _weed_bytes = _annotate_csv(
+                        low_use, notes,
+                        extra_meta={'Tool': 'Collection Profiler',
+                                    'View': 'Weeding Review',
+                                    'Metric': weight_col,
+                                    'Threshold': threshold,
+                                    'Period': period_label}
+                    )
+                    st.download_button("📥 Weeding review list (CSV)",
+                                       _weed_bytes, _weed_fname, "text/csv",
+                                       key="prof_title_dl_weed")
+                    _add_to_tray("profiler", _weed_fname, _weed_bytes)
+
+                # ---- Author summary ----
+                if author_col and "Author summary" in ts_idx:
+                    with ts_objs[ts_idx["Author summary"]]:
+                        if author_col in df_view.columns:
+                            auth_summary = df_view.groupby(author_col).agg(
+                                **{
+                                    'Title Count': (title_col, 'count'),
+                                    f'Total {weight_col}': ('_weight', 'sum'),
+                                }
+                            ).reset_index().sort_values(f'Total {weight_col}', ascending=False).head(100)
+                            st.markdown(f"**Top 100 authors by total {weight_col}:**")
+                            st.dataframe(auth_summary, use_container_width=True,
+                                         hide_index=True, height=500)
+                            _auth_fname = f"author_summary_{_slug_period(period_label)}.csv".replace('_.', '.')
+                            _auth_bytes = _annotate_csv(
+                                auth_summary, notes,
+                                extra_meta={'Tool': 'Collection Profiler',
+                                            'View': 'Author Summary',
+                                            'Metric': weight_col,
+                                            'Period': period_label}
+                            )
+                            st.download_button("📥 Author summary (CSV)",
+                                               _auth_bytes, _auth_fname, "text/csv",
+                                               key="prof_title_dl_auth")
+                            _add_to_tray("profiler", _auth_fname, _auth_bytes)
+
+                # ---- Title details (paginated) ----
+                with ts_objs[ts_idx["Title details"]]:
+                    if results.get('detail_available'):
+                        PAGE_SIZE = 5_000
+                        total = len(df_view)
+                        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+                        page = st.number_input("Page", 1, total_pages, 1, key='prof_page')
+                        start = (page - 1) * PAGE_SIZE
+                        end = min(start + PAGE_SIZE, total)
+                        st.caption(f"Records {start + 1:,}–{end:,} of {total:,}")
+                        detail_cols = [c for c in [title_col, author_col, '_lc_main',
+                                                   results.get('detail_cols', [None, None, None])[-1]
+                                                   if results.get('detail_cols') else None]
+                                       if c and c in df_view.columns]
+                        if '_weight' in df_view.columns:
+                            detail_cols.append('_weight')
+                        view_slice = df_view.iloc[start:end][detail_cols].rename(
+                            columns={'_weight': weight_col, '_lc_main': 'LC Class'}
+                        )
+                        st.dataframe(view_slice, use_container_width=True,
+                                     height=400, hide_index=True)
+                    else:
+                        st.info("Title details unavailable for this file.")
             else:
-                st.info(f"No subjects meet the minimum length of {min_len} characters.")
+                # No usage column — only show title details
+                st.info("No usage column detected. The Top Titles, Weeding Review, "
+                        "and Author Summary views are usage-dependent and only "
+                        "appear when a circulation/views/loans column is present. "
+                        "You can still browse title details below.")
+                if results.get('detail_available'):
+                    PAGE_SIZE = 5_000
+                    total = results.get('detail_total', len(df_view))
+                    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+                    page = st.number_input("Page", 1, total_pages, 1, key='prof_page')
+                    start = (page - 1) * PAGE_SIZE
+                    end = min(start + PAGE_SIZE, total)
+                    st.caption(f"Records {start + 1:,}–{end:,} of {total:,}")
+                    detail_cols = results.get('detail_cols', [])
+                    if detail_cols:
+                        page_idx = idx[start:end] if idx is not None else df.index[start:end]
+                        st.dataframe(df.loc[page_idx, detail_cols],
+                                     use_container_width=True, height=400, hide_index=True)
 
-    if settings['show_sunburst'] and results['sunburst_data']:
-        st.markdown("---")
-        st.subheader("LC classification sunburst")
-        sb = results['sunburst_data']
-        fig = go.Figure(go.Sunburst(
-            ids=[r['id'] for r in sb], labels=[r['label'] for r in sb],
-            parents=[r['parent'] for r in sb], values=[r['value'] for r in sb],
-            branchvalues='total',
-            marker=dict(colors=[r['value'] for r in sb],
-                        colorscale=[[0, '#71C5E8'], [0.5, '#285C4D'], [1, '#1a3d33']]),
-            maxdepth=2
-        ))
-        fig.update_layout(height=600, margin=dict(t=30, l=0, r=0, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-    if settings['show_treemap'] and results['lc_main_counts']:
-        st.markdown("---")
-        st.subheader("LC classification treemap")
-        tm_data = [{'Class': f"{c} – {LC_CLASSES.get(c, c)}", 'Count': ct,
-                    'Pct': ct / results['total_weight'] * 100}
-                   for c, ct in sorted(results['lc_main_counts'].items(), key=lambda x: -x[1])]
-        tm_df = pd.DataFrame(tm_data)
-        fig = px.treemap(tm_df, path=['Class'], values='Count', color='Count',
-                         color_continuous_scale=[[0, '#71C5E8'], [0.5, '#285C4D'], [1, '#1a3d33']],
-                         hover_data={'Pct': ':.1f'})
-        fig.update_layout(height=500, margin=dict(t=30, l=0, r=0, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-    if settings['show_subject_bars'] and results['subject_counts']:
-        st.markdown("---")
-        st.subheader(f"Top {top_n} subject terms")
-        top_subjects = results['subject_counts'].most_common(top_n)
-        sdf = pd.DataFrame(top_subjects, columns=['Subject', 'Count'])
-        fig = px.bar(sdf, x='Count', y='Subject', orientation='h', color='Count',
-                     color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']])
-        fig.update_layout(yaxis={'categoryorder': 'total ascending'},
-                          height=max(450, top_n * 24), showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-        _subj_bytes = _annotate_csv(sdf, notes,
-                                    extra_meta={'Tool': 'Collection Profiler',
-                                                'View': 'Top Subjects',
-                                                'Weighting': wl})
-        st.download_button("📥 Subject frequencies (CSV)",
-                           _subj_bytes,
-                           "subject_frequencies.csv",
-                           "text/csv", key='prof_dl_subj')
-        _add_to_tray("profiler", "subject_frequencies.csv", _subj_bytes)
-
-    if settings['show_heatmap'] and results['subject_by_lc']:
-        st.markdown("---")
-        st.subheader("LC class × top subjects heatmap")
-        global_top = [s for s, _ in results['subject_counts'].most_common(min(top_n, 25))]
-        lc_present = sorted(results['subject_by_lc'].keys())
-        matrix = [[results['subject_by_lc'][c].get(s, 0) for s in global_top] for c in lc_present]
-        labels_y = [f"{c} – {LC_CLASSES.get(c, c)}" for c in lc_present]
-        fig = go.Figure(data=go.Heatmap(
-            z=matrix, x=global_top, y=labels_y,
-            colorscale=[[0, '#ffffff'], [0.3, '#71C5E8'], [1, '#285C4D']],
-        ))
-        fig.update_layout(height=max(400, len(lc_present) * 35), xaxis=dict(tickangle=45))
-        st.plotly_chart(fig, use_container_width=True)
-
-    # ==== Title keywords (supplementary lens — uncontrolled vocabulary) ====
-    if settings.get('show_title_keywords'):
-        _render_title_keywords(results, settings, notes=notes)
-
-    # ==== Coverage vs. Use ====
-    if settings.get('show_coverage_vs_use'):
-        if results.get('cvu_available'):
-            # Preferred: LC-based view (full granularity)
-            _render_coverage_vs_use(results, settings, notes=notes)
-        elif results.get('cvu_by_subject_available'):
-            # Fallback: subject-level view for files without LC/call number
-            # (e.g., ProQuest Ebook Central title reports)
-            _render_coverage_vs_use_by_subject(results, settings, notes=notes)
-
-    if settings['show_gap_analysis']:
-        st.markdown("---")
-        st.subheader("Collection gap analysis")
-        missing = results['missing_lc_classes']
-        thin = results['thin_lc_classes']
-        if missing:
-            st.markdown("**LC Classes with No Holdings:**")
-            st.dataframe(pd.DataFrame([{'LC Class': c, 'Description': LC_CLASSES.get(c, '')}
-                                       for c in missing]), use_container_width=True, hide_index=True)
-        else:
-            st.info("All LC main classes are represented.")
-        if thin:
-            st.markdown(f"**LC Classes Below 1% of Collection:**")
-            rows_t = [{'LC Class': c, 'Description': LC_CLASSES.get(c, ''),
-                       f'{wl}': f"{v:,.0f}",
-                       '% of Collection': f"{v / results['total_weight'] * 100:.2f}%"}
-                      for c, v in sorted(thin.items(), key=lambda x: x[1])]
-            st.dataframe(pd.DataFrame(rows_t), use_container_width=True, hide_index=True)
-        if results['lc_main_counts']:
-            st.markdown("**Strongest Areas (top 5):**")
-            top5 = sorted(results['lc_main_counts'].items(), key=lambda x: -x[1])[:5]
-            rows_s = [{'LC Class': c, 'Description': LC_CLASSES.get(c, ''),
-                       f'{wl}': f"{v:,.0f}",
-                       '% of Collection': f"{v / results['total_weight'] * 100:.1f}%"}
-                      for c, v in top5]
-            st.dataframe(pd.DataFrame(rows_s), use_container_width=True, hide_index=True)
-
-    if settings['show_detail_table'] and results.get('detail_available') and df is not None:
-        st.markdown("---")
-        st.subheader("Title details (paginated)")
-        PAGE_SIZE = 5_000
-        total = results['detail_total']
-        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-        page = st.number_input("Page", 1, total_pages, 1, key='prof_page')
-        start = (page - 1) * PAGE_SIZE
-        end = min(start + PAGE_SIZE, total)
-        st.caption(f"Records {start + 1:,}–{end:,} of {total:,}")
-        page_idx = idx[start:end]
-        st.dataframe(df.loc[page_idx, results['detail_cols']],
-                     use_container_width=True, height=400, hide_index=True)
-
-    # Consolidated download tray — everything produced above in one ZIP
+    # ---- Consolidated download tray (across all tabs) ----
     st.markdown("---")
     st.subheader("Downloads")
     _render_download_tray("profiler", zip_filename="collection_profiler_results.zip")
@@ -1850,17 +2165,37 @@ def page_collection_profiler():
 
 
     uploaded_file = st.file_uploader(
-        "📂 Upload title list (CSV)", type=['csv'],
-        help="Needs Subjects and/or LC Classification; usage columns (Loans, Checkouts) are optional. Optimized for 500K–1M+ records.",
+        "📂 Upload title list (CSV or Excel)", type=['csv', 'xls', 'xlsx'],
+        help="Needs Subjects and/or LC Classification; usage columns (Loans, "
+             "Checkouts, Total Accesses, Downloads, etc.) are optional. "
+             "Optimized for 500K–1M+ records. Excel files (XLS, XLSX) are also "
+             "supported — useful for vendor admin exports like the EBSCO "
+             "Detailed Report.",
         key="prof_upload"
     )
 
     if uploaded_file is None:
         st.caption(
-            "💡 Your CSV should have some combination of **Subjects**, "
+            "💡 Your file should have some combination of **Subjects**, "
             "**LC Classification** or **Call Number**, **Title**, "
-            "and optionally a usage column like **Loans** or **Checkouts**."
+            "and optionally a usage column. Vendor admin exports with rich "
+            "metadata (e.g., EBSCO Detailed Report with subjects + LC + usage) "
+            "work especially well here."
         )
+        return
+
+    # Friendly error if user uploaded an Excel file but the required library
+    # isn't installed. Pandas raises a low-level ImportError otherwise.
+    _fname_lower = uploaded_file.name.lower()
+    if _fname_lower.endswith('.xlsx') and not XLSX_AVAILABLE:
+        st.error("❌ This XLSX file needs the `openpyxl` library. Install with "
+                 "`pip install openpyxl`, then re-upload. (Or save the file as "
+                 "CSV from Excel and upload that.)")
+        return
+    if _fname_lower.endswith('.xls') and not XLS_AVAILABLE:
+        st.error("❌ This XLS file needs the `xlrd` library (version 2.0.1+). "
+                 "Install with `pip install xlrd`, then re-upload. (Or save the "
+                 "file as CSV from Excel and upload that.)")
         return
 
     # Check session cache first — if we've already processed this file in
@@ -1879,7 +2214,7 @@ def page_collection_profiler():
         weight_label = weight_col if weight_col else "Title Count"
     else:
         file_bytes = uploaded_file.getvalue()
-        all_cols = _detect_columns_from_header(file_bytes)
+        all_cols = _detect_columns_from_header(file_bytes, uploaded_file.name)
         subj_col = find_column(all_cols, SUBJECT_ALIASES)
         lc_col = find_column(all_cols, LC_ALIASES)
         title_col = find_column(all_cols, TITLE_ALIASES)
@@ -1972,6 +2307,12 @@ def page_collection_profiler():
     if not subj_col and not lc_col:
         st.error("❌ Please pick at least a Subjects or LC Classification column above to continue.")
         return
+
+    # Detect additional columns the Title Analysis tab uses. Silent detection —
+    # these enable optional features but aren't required.
+    author_col = find_column(df, AUTHOR_ALIASES)
+    location_col = find_column(df, LOCATION_ALIASES)
+    date_col = _detect_print_date_column(df)
 
     # Sidebar: weight mode + LC filter only (upstream choices that change what's analyzed)
     with st.sidebar:
@@ -2236,16 +2577,24 @@ def page_collection_profiler():
                 'show_gap_analysis': True, 'show_detail_table': False,
             }),
             df,
-            st.session_state.get('prof_filtered_idx', df.index)
+            st.session_state.get('prof_filtered_idx', df.index),
+            title_col=title_col,
+            weight_col=weight_col,
+            author_col=author_col,
+            date_col=date_col,
+            location_col=location_col,
         )
 
 
 # =====================================================================
 # =====================================================================
-# TOOL 2: USAGE & SUBSCRIPTION ANALYZER
+# TOOL 2: COUNTER ANALYZER
 # =====================================================================
-# "What's being used and what isn't?"
-# Merged from: app(3).py (COUNTER dashboard) + print circulation mode
+# "Which e-resources are pulling their weight?"
+# Formal COUNTER 5 reports only — TR/TR_J3/TR_B1/DR/PR/IR with the
+# 12–13 row metadata header and monthly columns. Vendor admin exports
+# (e.g., EBSCO Detailed Report with subjects/LC) belong in the Profiler.
+# Print circulation now lives in the Profiler's Title Analysis tab.
 # =====================================================================
 # =====================================================================
 
@@ -2321,20 +2670,38 @@ DATE_COL_ALIASES = [
     'Transaction Date', 'transaction_date', 'Last Charge Date', 'last_charge_date',
     'Last Used', 'last_used', 'Last Checkout', 'last_checkout',
     'Date', 'date', 'DATE', 'Due Date', 'due_date',
+    'File Last View Date', 'Last View Date', 'last_view_date',
 ]
 
 
 def _detect_print_date_column(df):
     """Find a date-like column in a print circulation dataframe.
+
     Returns the column name or None. Tries aliases first, then falls back
     to any column whose name contains date-related keywords AND parses as dates
-    for >50% of values.
+    for >50% of values. Numeric year-only columns (e.g., "Loan Year" = 2025)
+    are accepted as date columns when the values are plausibly years.
     """
     # Try explicit aliases (exact match, case-insensitive)
     for alias in DATE_COL_ALIASES:
         for col in df.columns:
             if alias.lower() == col.lower():
                 return col
+
+    # Year-only columns: numeric, named with 'year', values in plausible year range
+    for col in df.columns:
+        lc = col.lower()
+        if 'year' in lc and pd.api.types.is_numeric_dtype(df[col]):
+            try:
+                vals = pd.to_numeric(df[col], errors='coerce').dropna()
+                if len(vals) > 0:
+                    # Plausible years: between 1500 and the current year + 2
+                    in_range = ((vals >= 1500) & (vals <= 2100)).sum()
+                    if in_range / max(1, len(vals)) > 0.9:
+                        return col
+            except Exception:
+                continue
+
     # Partial match — must contain date-related keyword AND parse as dates
     date_keywords = ['date', 'checkout', 'loan', 'charge']
     for col in df.columns:
@@ -2590,7 +2957,7 @@ def _render_counter_mode():
             st.plotly_chart(fig_top, use_container_width=True)
             _top_fname = f"top_titles_{_slug_period(period_label)}.csv".replace('_.', '.')
             _top_bytes = _annotate_csv(top_titles, notes,
-                                       extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                       extra_meta={'Tool': 'COUNTER Analyzer',
                                                    'View': 'Top Titles',
                                                    'Metric': selected_metric,
                                                    'Period': period_label})
@@ -2621,7 +2988,7 @@ def _render_counter_mode():
             st.dataframe(low_use_df, use_container_width=True, height=400)
             _cancel_fname = f"cancellation_review_{_slug_period(period_label)}.csv".replace('_.', '.')
             _cancel_bytes = _annotate_csv(low_use_df, notes,
-                                          extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                          extra_meta={'Tool': 'COUNTER Analyzer',
                                                       'View': 'Cancellation Review',
                                                       'Metric': selected_metric,
                                                       'Threshold': threshold,
@@ -2650,7 +3017,7 @@ def _render_counter_mode():
                 st.dataframe(pub_summary, use_container_width=True, hide_index=True, height=500)
                 _pub_fname = f"publisher_summary_{_slug_period(period_label)}.csv".replace('_.', '.')
                 _pub_bytes = _annotate_csv(pub_summary, notes,
-                                           extra_meta={'Tool': 'Usage Analyzer (COUNTER)',
+                                           extra_meta={'Tool': 'COUNTER Analyzer',
                                                        'View': 'Publisher Summary',
                                                        'Metric': selected_metric,
                                                        'Period': period_label})
@@ -2713,329 +3080,50 @@ def _render_counter_mode():
                 "If the file has an unusual structure, try exporting a fresh copy from the vendor.")
 
 
-def _render_print_mode():
-    """Print circulation analysis."""
+def page_counter_analyzer():
+    """Tool 2: COUNTER Analyzer.
+
+    Handles formal COUNTER 5 reports (TR/TR_J3/TR_B1/DR/PR/IR) with the
+    standard 12–13 row metadata header and monthly columns. The standard
+    COUNTER 5 spec doesn't carry subject data, so this tool focuses on
+    title-level usage triage: top titles, cancellation review, publisher
+    rollups, and monthly trends.
+
+    Files that are *vendor admin exports* rather than formal COUNTER reports
+    (e.g., EBSCO's "Detailed Report" with subjects and LC) belong in the
+    Collection Profiler instead — they have catalog-style metadata that the
+    Profiler can analyze across LC, Subject, and Title views.
+    """
+    st.header("📊 COUNTER Analyzer")
     st.markdown(
-        "Upload a **print circulation export** to identify high- and low-circulating "
-        "titles for weeding review, collection rotation, or replacement decisions."
-    )
-    uploaded_file = st.file_uploader(
-        "Upload your print circulation CSV", type=["csv"], key="usage_print_upload"
-    )
-    if uploaded_file is None:
-        with st.expander("📖 How to use this mode", expanded=True):
-            st.markdown("""
-            Upload a flat CSV with columns like:
-            - `Title` *(required)*
-            - `Loans` / `Checkouts` / `Circulation` *(one required as the usage metric)*
-            - `Author`, `LC Classification`, `Location`, `Publication Year` *(optional, enable more analysis)*
-            - `Checkout Date` / `Loan Date` / `Last Charge Date` *(optional, enables date filtering)*
-
-            **Typical workflow:**
-            1. Load the file; the loader auto-detects your usage column and any date column
-            2. If a date column is present, narrow the window with the sidebar **Date Range** filter
-            3. If no date column exists, set a manual label (e.g., "AY 2024–25") in the
-               sidebar so downloads are clearly named
-            4. Review **Top Titles** to see your workhorses
-            5. Check **Weeding Review** for low/no-circulation candidates
-            6. Use **LC Breakdown** to see which areas of the collection are pulling weight
-            """)
-        return
-
-    try:
-        # Check session cache first
-        cached_df = _cached_df_for_tool("usage_print", uploaded_file)
-        if cached_df is not None:
-            df = cached_df.copy()  # copy so sidebar filtering doesn't mutate cache
-            st.success(f"✅ Using cached data for *{uploaded_file.name}* "
-                       f"({len(df):,} records)")
-        else:
-            file_bytes = uploaded_file.getvalue()
-            df = _load_print_csv(file_bytes, uploaded_file.name)
-            _store_cached_df("usage_print", uploaded_file, df)
-            st.success(f"✅ Loaded **{len(df):,}** records from *{uploaded_file.name}*")
-
-        # Detect columns
-        title_col = find_column(df, TITLE_ALIASES)
-        weight_col = find_column(df, WEIGHT_ALIASES)
-        lc_col = find_column(df, LC_ALIASES)
-        author_col = find_column(df, ['Author', 'author', 'AUTHOR', 'Creator'])
-        location_col = find_column(df, ['Location', 'Location Name', 'location'])
-        date_col = _detect_print_date_column(df)
-
-        with st.expander("🔍 Column Detection", expanded=False):
-            st.write(f"Title: `{title_col}` · Usage: `{weight_col}` · "
-                     f"LC: `{lc_col}` · Author: `{author_col}` · "
-                     f"Location: `{location_col}` · Date: `{date_col}`")
-
-        if not title_col:
-            st.error("❌ Need a Title column.")
-            return
-        if not weight_col:
-            st.error("❌ Need a usage column (Loans, Checkouts, Circulation, etc.).")
-            return
-
-        df['_usage'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(0)
-
-        # --- Reporting period handling ---
-        period_label = "unknown period"
-        if date_col:
-            # Parse the date column and show detected range
-            df['_date'] = pd.to_datetime(df[date_col], errors='coerce')
-            valid_dates = df['_date'].dropna()
-            if len(valid_dates) > 0:
-                date_min = valid_dates.min()
-                date_max = valid_dates.max()
-                period_label = _format_date_range(date_min, date_max)
-                st.info(f"📅 **Date range detected** (from `{date_col}`): "
-                        f"{date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')} "
-                        f"· {len(valid_dates):,} dated records")
-            else:
-                st.warning(f"📅 Found date column `{date_col}` but could not parse any values.")
-                date_col = None
-        else:
-            st.warning("📅 No date column detected. You can set a period label manually below "
-                       "for downloads and reports. (Date filtering is unavailable without date data.)")
-
-        # Sidebar filters
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🔎 Print Filters")
-
-        # Date range filter (only if we have dates)
-        if date_col and df['_date'].notna().any():
-            with st.sidebar.expander("📅 Date Range", expanded=False):
-                use_date_filter = st.checkbox(
-                    "Filter by date range", value=False, key="usage_p_use_dates"
-                )
-                if use_date_filter:
-                    valid = df['_date'].dropna()
-                    dmin = valid.min().date()
-                    dmax = valid.max().date()
-                    start_date, end_date = st.date_input(
-                        "Select range",
-                        value=(dmin, dmax),
-                        min_value=dmin, max_value=dmax,
-                        key="usage_p_date_range"
-                    )
-                    # Apply filter
-                    mask = (df['_date'].dt.date >= start_date) & (df['_date'].dt.date <= end_date)
-                    df = df[mask | df['_date'].isna()].copy()
-                    period_label = _format_date_range(
-                        pd.Timestamp(start_date), pd.Timestamp(end_date)
-                    )
-                    st.caption(f"Selected: **{period_label}** ({len(df):,} records)")
-
-        # Manual period label override
-        with st.sidebar.expander("🏷️ Report label (optional)", expanded=False):
-            custom_period = st.text_input(
-                "Custom reporting period label",
-                value="",
-                placeholder="e.g., AY 2024–25, FY2025 Q1",
-                help="Used on headers and download filenames. "
-                     "Especially useful when no date column is present.",
-                key="usage_p_period_label"
-            )
-            if custom_period.strip():
-                period_label = custom_period.strip()
-
-        if location_col:
-            locs = sorted(df[location_col].dropna().unique())
-            selected_locs = st.sidebar.multiselect(
-                "Location", locs, default=locs, key="usage_p_loc"
-            )
-            df = df[df[location_col].isin(selected_locs)].copy()
-
-        if lc_col:
-            df['_lc_main'] = df[lc_col].apply(extract_lc_prefix)
-            lc_avail = sorted(df['_lc_main'].dropna().unique())
-            lc_labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in lc_avail]
-            sel_lc_labels = st.sidebar.multiselect(
-                "LC Class", lc_labels, default=lc_labels, key="usage_p_lc"
-            )
-            sel_lc = [l.split(' –')[0] for l in sel_lc_labels]
-            df = df[df['_lc_main'].isin(sel_lc) | df['_lc_main'].isna()].copy()
-
-        # KPIs
-        st.markdown("---")
-        st.subheader(f"Overview — {weight_col} · {period_label}")
-        total_loans = df['_usage'].sum()
-        zero_use = (df['_usage'] == 0).sum()
-        avg_loans = total_loans / max(1, len(df))
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total Records", f"{len(df):,}")
-        k2.metric(f"Total {weight_col}", f"{int(total_loans):,}")
-        k3.metric(f"Avg {weight_col} / Title", f"{avg_loans:.1f}")
-        k4.metric("Zero-Use Titles", f"{zero_use:,}")
-
-        # Notes — shown above tabs so users annotate *before* downloading
-        notes = _notes_widget(
-            "usage_print",
-            placeholder="e.g., Annual weeding review for HQ section, Spring 2026. "
-                        "Proposed off-site storage candidates flagged for DelRosario review."
-        )
-
-        # Fresh tray for this render pass
-        _reset_tray("usage_print")
-
-        # Analysis tabs
-        st.markdown("---")
-        tabs = ["Top titles", "Weeding review"]
-        if lc_col:
-            tabs.append("LC breakdown")
-        if author_col:
-            tabs.append("Author summary")
-        tab_objs = st.tabs(tabs)
-
-        with tab_objs[0]:
-            top_n = st.slider("Show Top N Titles", 5, 100, 25, key="usage_p_topn")
-            display_cols = [title_col, '_usage']
-            if author_col:
-                display_cols.insert(1, author_col)
-            if lc_col:
-                display_cols.append(lc_col)
-            top_titles = df.nlargest(top_n, '_usage')[display_cols].rename(
-                columns={'_usage': weight_col}
-            )
-            fig_top = px.bar(
-                top_titles, x=weight_col, y=title_col, orientation='h',
-                title=f"Top {top_n} Titles by {weight_col} — {period_label}",
-                color=weight_col,
-                color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']]
-            )
-            fig_top.update_layout(
-                yaxis={'categoryorder': 'total ascending'},
-                height=max(450, top_n * 22)
-            )
-            st.plotly_chart(fig_top, use_container_width=True)
-
-        with tab_objs[1]:
-            st.info("Review titles with low or zero circulation for potential weeding, "
-                    "off-site storage, or replacement.")
-            threshold = st.number_input(
-                f"Low-Usage Threshold ({weight_col})", min_value=0, value=0, key="usage_p_thr"
-            )
-            low_cols = [title_col, '_usage']
-            if author_col:
-                low_cols.insert(1, author_col)
-            if lc_col:
-                low_cols.append(lc_col)
-            if location_col:
-                low_cols.append(location_col)
-            low_use_df = df[df['_usage'] <= threshold][low_cols].sort_values('_usage')
-            low_use_df = low_use_df.rename(columns={'_usage': weight_col})
-
-            cc1, cc2 = st.columns(2)
-            cc1.metric("Titles ≤ Threshold", f"{len(low_use_df):,}")
-            cc2.metric("% of Collection", f"{len(low_use_df)/max(1,len(df))*100:.1f}%")
-
-            st.dataframe(low_use_df, use_container_width=True, height=400)
-            _weed_fname = f"weeding_review_{_slug_period(period_label)}.csv".replace('_.', '.')
-            _weed_bytes = _annotate_csv(low_use_df, notes,
-                                        extra_meta={'Tool': 'Usage Analyzer (Print)',
-                                                    'View': 'Weeding Review',
-                                                    'Metric': weight_col,
-                                                    'Threshold': threshold,
-                                                    'Period': period_label})
-            st.download_button("📥 Weeding review list (CSV)",
-                               _weed_bytes, _weed_fname, "text/csv",
-                               key="usage_p_dl_weed")
-            _add_to_tray("usage_print", _weed_fname, _weed_bytes)
-
-        if lc_col:
-            with tab_objs[2]:
-                lc_summary = df.groupby('_lc_main').agg(
-                    **{
-                        'Title Count': (title_col, 'count'),
-                        f'Total {weight_col}': ('_usage', 'sum'),
-                    }
-                ).reset_index().rename(columns={'_lc_main': 'LC Class'})
-                lc_summary[f'Avg {weight_col} / Title'] = (
-                    lc_summary[f'Total {weight_col}'] / lc_summary['Title Count']
-                ).round(2)
-                lc_summary['Description'] = lc_summary['LC Class'].map(
-                    lambda c: LC_CLASSES.get(c, '?')
-                )
-                lc_summary = lc_summary[['LC Class', 'Description', 'Title Count',
-                                         f'Total {weight_col}', f'Avg {weight_col} / Title']]
-                lc_summary = lc_summary.sort_values(f'Total {weight_col}', ascending=False)
-                st.dataframe(lc_summary, use_container_width=True,
-                             hide_index=True, height=500)
-                _lc_fname = f"lc_circulation_breakdown_{_slug_period(period_label)}.csv".replace('_.', '.')
-                _lc_bytes = _annotate_csv(lc_summary, notes,
-                                          extra_meta={'Tool': 'Usage Analyzer (Print)',
-                                                      'View': 'LC Breakdown',
-                                                      'Metric': weight_col,
-                                                      'Period': period_label})
-                st.download_button("📥 LC breakdown (CSV)",
-                                   _lc_bytes, _lc_fname, "text/csv",
-                                   key="usage_p_dl_lc")
-                _add_to_tray("usage_print", _lc_fname, _lc_bytes)
-
-        if author_col:
-            idx = 3 if lc_col else 2
-            with tab_objs[idx]:
-                auth_summary = df.groupby(author_col).agg(
-                    **{
-                        'Title Count': (title_col, 'count'),
-                        f'Total {weight_col}': ('_usage', 'sum'),
-                    }
-                ).reset_index().sort_values(f'Total {weight_col}', ascending=False).head(100)
-                st.markdown("**Top 100 authors by total circulation:**")
-                st.dataframe(auth_summary, use_container_width=True,
-                             hide_index=True, height=500)
-                _auth_fname = f"author_circulation_{_slug_period(period_label)}.csv".replace('_.', '.')
-                _auth_bytes = _annotate_csv(auth_summary, notes,
-                                            extra_meta={'Tool': 'Usage Analyzer (Print)',
-                                                        'View': 'Author Summary',
-                                                        'Metric': weight_col,
-                                                        'Period': period_label})
-                st.download_button("📥 Author summary (CSV)",
-                                   _auth_bytes, _auth_fname, "text/csv",
-                                   key="usage_p_dl_auth")
-                _add_to_tray("usage_print", _auth_fname, _auth_bytes)
-
-        # Consolidated download tray
-        st.markdown("---")
-        st.subheader("Downloads")
-        _render_download_tray("usage_print",
-                              zip_filename=f"usage_print_{_slug_period(period_label)}.zip".replace('_.', '.'))
-
-    except Exception as e:
-        st.error(f"❌ Error processing file: {e}")
-
-
-def page_usage_analyzer():
-    """Tool 2: Usage & Subscription Analyzer."""
-    st.header("📈 Usage & Subscription Analyzer")
-    st.markdown(
-        "**What's being used and what isn't?** Title-level usage analysis for "
-        "renewal, cancellation, and weeding decisions."
+        "**Which e-resources are pulling their weight?** "
+        "Title-level usage analysis from formal COUNTER 5 reports — for "
+        "renewal decisions, cancellation candidates, Big Deal evaluation, "
+        "and package-vs-title comparisons."
     )
     with st.expander("ℹ️ When to use this tool"):
         st.markdown(
-            "- **Collections:** Annual database renewals, print weeding by low circulation, "
-            "identifying single-title-driven subscriptions (candidates for swap to pay-per-view "
-            "or title-level purchase), publisher package evaluation.\n"
-            "- **Instruction:** Rarely — this is primarily a purchasing/weeding tool, not "
-            "an instructional one.\n"
-            "- **Outreach:** Evidence for faculty conversations (\"this database gets 12 uses "
-            "a year across your whole department — can we talk alternatives?\"), value reports "
-            "to administration, package-vs-title comparisons for liaison meetings."
+            "- **Renewal review (Sept):** Run on each vendor's TR before submitting "
+            "renewal changes. Focus on Publisher Summary and Cancellation Review tabs.\n"
+            "- **Cancellation prep (July):** Pull most recent 12 months of TR_J3 to "
+            "identify low-use titles for the Aug 1 deadline.\n"
+            "- **Big Deal evaluation (Dec):** Run on each Big Deal under renewal "
+            "to surface dead-weight titles as bargaining leverage.\n"
+            "- **Annual watchlist (May):** Run on full prior-calendar-year COUNTER "
+            "data as part of the year's biggest evidence harvest.\n\n"
+            "**Not for:** vendor admin exports (e.g., EBSCO Detailed Report) — "
+            "those have subjects and LC, and belong in the Collection Profiler."
         )
 
+    _render_counter_mode()
 
-    mode = st.radio(
-        "Select data source:",
-        ["📊 COUNTER 5 (e-resources)", "📚 Print Circulation"],
-        horizontal=True, key="usage_mode"
-    )
-    st.markdown("---")
 
-    if mode == "📊 COUNTER 5 (e-resources)":
-        _render_counter_mode()
-    else:
-        _render_print_mode()
+# Backward-compatibility alias: prior sessions or bookmarks pointed at
+# "Usage & Subscription Analyzer". Forward to the renamed COUNTER analyzer.
+def page_usage_analyzer():
+    """Deprecated wrapper — Usage Analyzer was renamed to COUNTER Analyzer."""
+    page_counter_analyzer()
+
 
 
 # =====================================================================
@@ -4130,7 +4218,7 @@ def page_zero_use_identifier():
             "e-books, e-journals, databases, streaming media). Especially powerful "
             "for e-resources where 'zero use' is invisible in the usage report itself "
             "(many vendors omit titles with no use entirely).\n"
-            "- **Cancellation prep:** Combine with the Usage Analyzer's COUNTER mode — "
+            "- **Cancellation prep:** Combine with the **COUNTER Analyzer** — "
             "use this tool to find titles missing from usage altogether, then use "
             "COUNTER to triage low-but-nonzero items.\n"
             "- **Off-site storage:** Surface print holdings with no circulation, "
@@ -4155,8 +4243,8 @@ def page_zero_use_identifier():
         columns improve match quality dramatically.
 
         **Usage file** = anything with a count attached. COUNTER reports,
-        circulation exports, link-resolver clicks — the same kind of file the
-        Usage Analyzer accepts.
+        circulation exports, link-resolver clicks — the same kinds of files
+        the COUNTER Analyzer and Profiler's Title Analysis tab accept.
 
         **Match quality:** the result table includes a `Matched Via` column so
         you can spot-check whether a fallback title-match looks right.
@@ -4776,14 +4864,17 @@ def page_home():
             <h3>🗺️ Collection Profiler</h3>
             <p><em>What does our collection look like?</em></p>
             <p>LC sunburst, treemap, subject word cloud, gap analysis.
-            Map disciplinary strengths across 1M+ records.</p>
+            Map disciplinary strengths across 1M+ records via three views:
+            LC Analysis, Subject Term Analysis, and Title Analysis (which
+            absorbs circulation-style usage triage when usage data is present).</p>
             <hr>
             <p><strong>Use for:</strong></p>
             <ul>
                 <li>Baseline & accreditation reports</li>
-                <li>Liaison prep</li>
+                <li>Liaison prep & subject policy revision</li>
                 <li>Budget justifications</li>
-                <li>Weeding area selection</li>
+                <li>Print weeding by low circulation</li>
+                <li>Coverage vs. Use (when usage column present)</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -4791,17 +4882,18 @@ def page_home():
     with c2:
         st.markdown("""
         <div class="tool-card">
-            <h3>📈 Usage & Subscription Analyzer</h3>
-            <p><em>What's being used and what isn't?</em></p>
-            <p>Title-level usage for COUNTER e-resources and print circulation.
-            Cancellation candidates, publisher rollups, trends.</p>
+            <h3>📊 COUNTER Analyzer</h3>
+            <p><em>Which e-resources are pulling their weight?</em></p>
+            <p>Title-level usage from formal COUNTER 5 reports (TR/TR_J3/TR_B1/
+            DR/PR/IR). Cancellation candidates, publisher rollups, monthly trends.
+            Vendor admin exports with subjects/LC go to the Profiler instead.</p>
             <hr>
             <p><strong>Use for:</strong></p>
             <ul>
-                <li>Annual database renewals</li>
-                <li>Print weeding by circulation</li>
-                <li>Package value evaluation</li>
-                <li>Faculty cancellation conversations</li>
+                <li>Annual database renewals (Sept)</li>
+                <li>Cancellation review (July → Aug 1 deadline)</li>
+                <li>Big Deal evaluation (Dec renewals)</li>
+                <li>Annual watchlist refresh (May)</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -4849,26 +4941,30 @@ def page_home():
     st.markdown("""
     | You need to… | Use |
     |---|---|
-    | Show what the collection covers (or doesn't) | **Collection Profiler** |
-    | Decide which databases to renew or cancel | **Usage & Subscription Analyzer** → COUNTER |
-    | Pick books to weed from the stacks | **Usage & Subscription Analyzer** → Print |
+    | Show what the collection covers (or doesn't) | **Collection Profiler** → LC Analysis |
+    | Map disciplinary strengths via subject terms | **Collection Profiler** → Subject Term Analysis |
+    | Pick books to weed from the stacks | **Collection Profiler** → Title Analysis |
+    | Analyze a vendor admin export with subjects + LC + usage | **Collection Profiler** (e.g., EBSCO Detailed Report) |
+    | Decide which databases to renew or cancel | **COUNTER Analyzer** |
+    | Run monthly-trend analysis on formal COUNTER reports | **COUNTER Analyzer** |
     | Find what you own that's never been used | **Zero-Use Identifier** |
     | Identify e-journal/package titles with no use | **Zero-Use Identifier** (holdings vs. COUNTER) |
     | Prioritize purchases from a vendor list | **Recommendation Scorer** |
     | Match new books to specific faculty research | **Recommendation Scorer** (with faculty file) |
-    | Find areas with strong use relative to holdings (or weak) | **Collection Profiler** → Coverage vs. Use |
-    | Identify specific low-use titles to weed in those areas | **Usage Analyzer** → Print (after Profiler) |
+    | Find areas with strong use relative to holdings (or weak) | **Collection Profiler** → LC Analysis (Coverage vs. Use) |
     | Find high-use areas missing from the catalog | **Recommendation Scorer** → Subject Analysis tab |
     """)
 
     st.markdown("---")
     with st.expander("ℹ️ About this dashboard"):
         st.markdown("""
-        **Version 2.0** — consolidated from four earlier Streamlit apps:
-        - *Word Cloud Generator* (now a view option inside the Collection Profiler)
-        - *Collection Strengths Analyzer* (now the Collection Profiler backbone)
-        - *EBSCO Subscription Dashboard* (now the Usage Analyzer → COUNTER mode)
-        - *Book Recommendation Scorer* (now the Acquisition Recommendation Scorer)
+        **Version 2.3** — consolidated suite, simplified to four tools:
+        - **Collection Profiler** — three views (LC, Subject Term, Title) on
+          catalog and admin-export files. Title Analysis absorbs the former
+          Print Circulation analyzer.
+        - **COUNTER Analyzer** — formal COUNTER 5 reports only.
+        - **Zero-Use Identifier** — holdings vs. usage matching.
+        - **Acquisition Recommendation Scorer** — purchase prioritization.
 
         **Design principles:**
         - Each tool answers a different decision question
@@ -4889,9 +4985,9 @@ def main():
             "Select a tool:",
             ["🏠 Home",
              "🗺️ Collection Profiler",
-             "📈 Usage & Subscription Analyzer",
+             "📊 COUNTER Analyzer",
              "🔍 Zero-Use Identifier",
-             "📊 Acquisition Recommendation Scorer"],
+             "🎯 Acquisition Recommendation Scorer"],
             index=0,
             key="nav"
         )
@@ -4901,11 +4997,11 @@ def main():
         page_home()
     elif page == "🗺️ Collection Profiler":
         page_collection_profiler()
-    elif page == "📈 Usage & Subscription Analyzer":
-        page_usage_analyzer()
+    elif page == "📊 COUNTER Analyzer":
+        page_counter_analyzer()
     elif page == "🔍 Zero-Use Identifier":
         page_zero_use_identifier()
-    elif page == "📊 Acquisition Recommendation Scorer":
+    elif page == "🎯 Acquisition Recommendation Scorer":
         page_recommendation_scorer()
 
     _footer()
