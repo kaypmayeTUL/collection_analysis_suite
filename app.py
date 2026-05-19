@@ -1,17 +1,19 @@
 """
-Library Collection Dashboard
-============================
-A unified Streamlit application bundling four collection decision-support tools:
+Library Collection Dashboard (slim edition)
+===========================================
+A unified Streamlit application bundling three collection decision-support tools:
 
   1. Collection Profiler — "What does our collection look like, and what's used?"
      Three views in one tool:
        • LC Analysis — sunburst, treemap, LC × subject heatmap, gap analysis,
-         coverage-vs-use. Feeds collection assessment and accreditation work.
+         coverage-vs-use, sub-class range distribution. Feeds collection
+         assessment and accreditation work.
        • Subject Term Analysis — top subjects, word cloud, title-keyword n-grams.
          Feeds policy revision, liaison conversations, marketing planning.
        • Title Analysis — top titles by usage, weeding review, author summary,
-         date-range filtering. Feeds print weeding and circulation triage.
-         (Absorbs the former standalone Print Circulation analyzer.)
+         date-range filtering, yearly trends. Feeds print weeding and
+         circulation triage. (Absorbs the former standalone Print Circulation
+         analyzer.)
 
   2. COUNTER Analyzer — "Which e-resources are pulling their weight?"
      Formal COUNTER 5 reports only (TR/TR_J3/TR_B1/DR/PR/IR with the standard
@@ -24,14 +26,9 @@ A unified Streamlit application bundling four collection decision-support tools:
      (ISBN, ISSN, DOI, OCLC, title+author fallback). Feeds cancellation prep,
      off-site storage candidates, and renewal evidence.
 
-  4. Acquisition Recommendation Scorer — "What should we buy next?"
-     Scores new candidate books against checkout history using subject
-     similarity, LC fit, author popularity, and faculty research interests.
-     Feeds purchasing, approval-plan review, and faculty request triage.
-
-v2.3 — Profiler reorganized into three top-level views (LC/Subject/Title);
-       Print Circulation merged into Title Analysis; Usage Analyzer split off
-       as standalone COUNTER Analyzer (formal COUNTER 5 only).
+v2.4 (slim) — Acquisition Recommendation Scorer extracted to its own standalone
+       app (recommender_app.py). This edition focuses on the three
+       collection-analysis tools. NLTK is no longer a runtime dependency.
 Contact: Kay P Maye (kmaye@tulane.edu)
 """
 
@@ -54,14 +51,6 @@ try:
     WORDCLOUD_AVAILABLE = True
 except ImportError:
     WORDCLOUD_AVAILABLE = False
-
-try:
-    import nltk
-    from nltk.stem import SnowballStemmer
-    from nltk.corpus import wordnet
-    NLTK_AVAILABLE = True
-except ImportError:
-    NLTK_AVAILABLE = False
 
 # Excel support — pandas uses openpyxl for .xlsx and xlrd for .xls.
 # Both are optional dependencies; CSV path always works.
@@ -460,6 +449,1134 @@ LC_SUBCLASSES = {
 }
 
 
+# LC numeric range catalog — subclass code → list of (start, end, label) tuples.
+# Each tuple defines an LC-defined range within a two-letter subclass, drawn from
+# the Library of Congress Classification Outline (https://www.loc.gov/aba/cataloging/classification/lcco/).
+#
+# Coverage scope: substantive but bounded. Covers the highest-traffic subclasses
+# across humanities, social sciences, and STEM where library users most often
+# need range-level granularity. Subclasses not listed fall back to bucketing
+# by hundreds (e.g., "HX 100s") via _bucket_by_hundreds.
+#
+# Range semantics:
+#   - start, end are inclusive
+#   - end can be a float (HQ 1101-2030.7) — LC ranges sometimes use decimals
+#   - ranges should not overlap within a subclass; if they do, the first match wins
+#   - sort within each subclass list by `start` ascending for clarity
+#
+# To extend: add entries for additional subclasses, or refine existing ones.
+# Curated against the LC outline; some ranges combine adjacent LC sub-ranges
+# where the distinction is finer than the dashboard needs to surface.
+LC_RANGES = {
+    # ===== Class B — Philosophy, Psychology, Religion =====
+    'B': [
+        (1, 68, 'Philosophy (General)'),
+        (69, 5739, 'History & systems of philosophy'),
+    ],
+    'BF': [
+        (1, 1000, 'Psychology'),
+        (1001, 1389, 'Parapsychology'),
+        (1404, 2055, 'Occult sciences'),
+    ],
+    'BJ': [
+        (1, 1725, 'Ethics'),
+        (1801, 2195, 'Social usages, etiquette'),
+    ],
+    'BL': [
+        (1, 50, 'Religion (General)'),
+        (51, 65, 'Philosophy of religion'),
+        (70, 980, 'History & principles of religions'),
+        (1000, 2370, 'Asian, Indian, & Iranian religions'),
+        (2390, 2630, 'African, Pacific, Indigenous religions'),
+    ],
+    'BR': [
+        (1, 1725, 'Christianity'),
+    ],
+    'BS': [
+        (1, 2970, 'The Bible'),
+    ],
+    'BT': [
+        (1, 1480, 'Doctrinal theology'),
+    ],
+    'BV': [
+        (1, 5099, 'Practical theology'),
+    ],
+    'BX': [
+        (1, 4795, 'Christian denominations'),
+        (4800, 9999, 'Protestant denominations'),
+    ],
+
+    # ===== Class C — Auxiliary Sciences of History =====
+    'C': [
+        (1, 51, 'Auxiliary sciences of history (general)'),
+    ],
+    'CB': [
+        (3, 482, 'History of civilization'),
+        (156, 161, 'Ancient civilizations'),
+        (203, 281, 'Civilization & medieval period'),
+        (351, 482, 'Modern civilization'),
+    ],
+    'CC': [
+        (1, 960, 'Archaeology'),
+    ],
+    'CD': [
+        (1, 6471, 'Diplomatics, archives, seals'),
+        (921, 4280, 'Archives'),
+    ],
+    'CE': [
+        (1, 97, 'Technical chronology, calendar'),
+    ],
+    'CJ': [
+        (1, 6661, 'Numismatics (coins, medals)'),
+    ],
+    'CN': [
+        (1, 1355, 'Inscriptions, epigraphy'),
+    ],
+    'CR': [
+        (1, 6305, 'Heraldry'),
+    ],
+    'CS': [
+        (1, 3090, 'Genealogy'),
+    ],
+    'CT': [
+        (21, 9999, 'Biography'),
+        (21, 22, 'Biography as an art or literary form'),
+        (100, 3150, 'General collective biography'),
+        (3200, 3830, 'Biography of women (collective)'),
+        (3990, 9999, 'Biography of specific groups or classes'),
+    ],
+
+    # ===== Class D — World History =====
+    'D': [
+        (1, 2027, 'World history (general)'),
+        (51, 95, 'Ancient history'),
+        (101, 199, 'Medieval history'),
+        (200, 475, 'Modern history (general)'),
+        (501, 680, 'World War I (1914–1918)'),
+        (731, 838, 'World War II (1939–1945)'),
+        (839, 860, 'Post-war history (1945–1989)'),
+        (861, 2027, 'Post-Cold War period (1989–)'),
+    ],
+    'DA': [
+        (1, 990, 'Great Britain (general)'),
+        (700, 745, 'Wales'),
+        (750, 890, 'Scotland'),
+        (900, 995, 'Ireland'),
+    ],
+    'DB': [
+        (1, 3150, 'Austria, Hungary, Czechia, Slovakia'),
+        (2000, 3150, 'Hungary, Czech Republic, Slovakia'),
+    ],
+    'DC': [
+        (1, 947, 'France'),
+        (33, 59.8, 'France: pre-1815'),
+        (60, 424, 'France: 1815–present'),
+        (601, 800, 'Andorra, Monaco'),
+        (921, 947, 'France: regional history'),
+    ],
+    'DD': [
+        (1, 905, 'Germany'),
+        (256.5, 257.4, 'Holy Roman Empire'),
+        (258, 290, 'Germany: 1918–1945 (Weimar, Nazi era)'),
+        (290, 905, 'Germany: 1945–present (incl. divided & reunified)'),
+    ],
+    'DE': [
+        (1, 100, 'Greco-Roman world (general)'),
+    ],
+    'DF': [
+        (10, 951, 'Greece'),
+        (10, 289, 'Ancient Greece'),
+        (501, 649, 'Byzantine Empire'),
+        (701, 951, 'Modern Greece'),
+    ],
+    'DG': [
+        (11, 999, 'Italy'),
+        (11, 365, 'Ancient Italy & Rome'),
+        (401, 583, 'Medieval & Renaissance Italy'),
+        (601, 875, 'Modern Italy'),
+    ],
+    'DJ': [
+        (1, 401, 'Netherlands'),
+    ],
+    'DJK': [
+        (1, 77, 'Eastern Europe (general)'),
+    ],
+    'DK': [
+        (1, 949, 'Russia, Soviet Union, former Soviet republics'),
+        (1, 274, 'Russia: pre-1917'),
+        (245, 274, 'Russian Revolution'),
+        (266, 290, 'Soviet Union (USSR), 1917–1991'),
+        (501, 949, 'Russia: 1991–present + former republics'),
+    ],
+    'DL': [
+        (1, 1180, 'Northern Europe, Scandinavia'),
+    ],
+    'DP': [
+        (1, 402, 'Spain & Portugal'),
+        (1, 272, 'Spain'),
+        (501, 802, 'Portugal'),
+    ],
+    'DR': [
+        (1, 2285, 'Balkan Peninsula'),
+        (401, 741, 'Turkey'),
+        (901, 2285, 'Albania, Bulgaria, Romania, Yugoslavia (former), etc.'),
+    ],
+    'DS': [
+        (1, 937, 'Asia'),
+        (1, 41, 'Asia (general)'),
+        (51, 95.9, 'Middle East'),
+        (101, 151, 'Israel, Palestine'),
+        (251, 326, 'Iran (Persia)'),
+        (327, 329.4, 'Central Asia'),
+        (331, 349.9, 'Southern Asia (general)'),
+        (350, 375, 'Afghanistan'),
+        (376, 392, 'Pakistan'),
+        (401, 486, 'India'),
+        (488, 490, 'Sri Lanka'),
+        (491, 492, 'Bhutan, Nepal'),
+        (501, 526.7, 'East Asia (general)'),
+        (701, 799.9, 'China'),
+        (798, 799.9, 'Hong Kong, Macao, Taiwan'),
+        (801, 897, 'Japan'),
+        (901, 937, 'Korea'),
+    ],
+    'DT': [
+        (1, 3415, 'Africa'),
+        (1, 159.9, 'Africa (general & North Africa)'),
+        (43, 154, 'Egypt'),
+        (160, 177, 'Libya'),
+        (181, 346, 'Maghreb (Tunisia, Algeria, Morocco)'),
+        (348, 363, 'West & Central Africa (general)'),
+        (470, 671, 'West Africa'),
+        (777, 1465, 'Eastern, Southern Africa'),
+        (1501, 2405, 'Southern Africa'),
+        (2421, 2999, 'Madagascar & adjacent islands'),
+        (3001, 3415, 'Other African regions'),
+    ],
+    'DU': [
+        (1, 950, 'Oceania (Australia, New Zealand, Pacific)'),
+        (80, 398, 'Australia'),
+        (400, 430, 'New Zealand'),
+        (490, 950, 'Pacific islands'),
+    ],
+    'DX': [
+        (101, 301, 'Romanies (Gypsies)'),
+    ],
+
+    # ===== Class E — US History =====
+    'E': [
+        (11, 143, 'America (general); pre-Columbian; discovery'),
+        (151, 909, 'United States (general)'),
+        (151, 169, 'United States (general history)'),
+        (171, 183.9, 'US history by period (general)'),
+        (184, 200, 'Elements in the population'),
+        (185, 185.98, 'African Americans'),
+        (186, 199, 'Indigenous peoples of the Americas'),
+        (201, 298, 'Colonial period (1607–1775)'),
+        (300, 453, 'Revolution & Confederation (1775–1789)'),
+        (456, 655, 'Civil War period (1861–1865)'),
+        (660, 738, 'Late 19th century (1865–1900)'),
+        (740, 837.7, '20th century (1900–2000)'),
+        (838, 909, '21st century (2001–)'),
+    ],
+
+    # ===== Class F — History of the Americas =====
+    'F': [
+        (1, 975, 'United States local history (Northern, NE, Mid-Atlantic, Mid-West, South)'),
+        (1, 15, 'New England'),
+        (16, 215, 'Northeastern states (NY, NJ, PA, etc.)'),
+        (221, 580, 'Southern states'),
+        (586, 705, 'Mid-Western states'),
+        (721, 975, 'Western states'),
+        (1001, 1145.2, 'Canada'),
+        (1170, 1170, 'Bermuda, Atlantic islands'),
+        (1201, 1392, 'Mexico'),
+        (1401, 3799, 'Latin America (general)'),
+        (1401, 1419, 'Latin America (general)'),
+        (1421, 1577, 'Central America'),
+        (1601, 2151, 'West Indies (Caribbean)'),
+        (2155, 2191, 'Guianas'),
+        (2201, 2659, 'South America (general & Venezuela, Colombia)'),
+        (2661, 2799, 'Brazil'),
+        (2801, 3021, 'Argentina'),
+        (3031, 3091, 'Uruguay'),
+        (3101, 3201, 'Paraguay'),
+        (3201, 3359, 'Bolivia'),
+        (3401, 3619, 'Chile'),
+        (3701, 3799, 'Peru'),
+    ],
+
+    # ===== Class G — Geography, Anthropology, Recreation =====
+    'G': [
+        (1, 922, 'Geography (general), atlases, maps'),
+    ],
+    'GA': [
+        (1, 1776, 'Mathematical geography, cartography'),
+    ],
+    'GB': [
+        (3, 5030, 'Physical geography'),
+        (400, 649, 'Geomorphology'),
+        (651, 2998, 'Hydrology, water resources'),
+        (5000, 5030, 'Natural disasters'),
+    ],
+    'GC': [
+        (1, 1581, 'Oceanography'),
+    ],
+    'GE': [
+        (1, 350, 'Environmental sciences & studies'),
+        (170, 190, 'Environmental policy'),
+        (195, 199, 'Environmental management & sustainability'),
+        (300, 350, 'Environmental ethics & justice'),
+    ],
+    'GF': [
+        (1, 900, 'Human ecology, anthropogeography'),
+    ],
+    'GN': [
+        (1, 890, 'Anthropology'),
+        (49, 296, 'Physical anthropology'),
+        (301, 674, 'Ethnology, social & cultural anthropology'),
+        (700, 890, 'Prehistoric archaeology'),
+    ],
+    'GR': [
+        (1, 950, 'Folklore'),
+    ],
+    'GT': [
+        (1, 7070, 'Manners & customs (general)'),
+        (3400, 5090, 'Customs relative to private life'),
+        (5220, 7070, 'Customs relative to public & social life'),
+    ],
+    'GV': [
+        (1, 1860, 'Recreation, leisure, sports'),
+        (557, 1198.995, 'Sports (general & by sport)'),
+        (1201, 1570, 'Games & amusements'),
+        (1580, 1799, 'Dance'),
+    ],
+
+    # ===== Class H — Social Sciences =====
+    'HB': [
+        (1, 3840, 'Economic theory & demography'),
+    ],
+    'HC': [
+        (10, 1085, 'Economic history & conditions'),
+    ],
+    'HD': [
+        (1, 1130, 'Industries, land use, labor (general)'),
+        (1131, 1395, 'Land tenure & agrarian reform'),
+        (1401, 2210, 'Agricultural economics'),
+        (2321, 4730, 'Industry'),
+        (4801, 8943, 'Labor & class struggles'),
+        (9000, 9999, 'Special industries'),
+    ],
+    'HF': [
+        (1, 6182, 'Commerce'),
+        (5001, 6182, 'Business & marketing'),
+    ],
+    'HG': [
+        (1, 9999, 'Finance, money, banking'),
+    ],
+    'HM': [
+        (1, 1281, 'Sociology (general)'),
+    ],
+    'HN': [
+        (1, 995, 'Social history & conditions'),
+    ],
+    'HQ': [
+        (1, 11, 'The family. Marriage. Women (general)'),
+        (12, 449, 'Sexual life & sexuality'),
+        (450, 472, 'Erotica'),
+        (503, 1064, 'Family, marriage, home'),
+        (1075, 1090.7, 'Sex role'),
+        (1101, 2030.7, 'Women, feminism, women\'s studies'),
+        (2035, 2039, 'Life skills'),
+    ],
+    'HT': [
+        (51, 100, 'Communities (general)'),
+        (101, 395, 'Urban sociology'),
+        (401, 485, 'Rural sociology'),
+        (601, 1445, 'Classes & class structure'),
+        (1501, 1595, 'Races'),
+    ],
+    'HV': [
+        (1, 4959, 'Social pathology, social work'),
+        (5001, 5840, 'Substance abuse'),
+        (6001, 7220.5, 'Criminology'),
+        (7231, 9920.5, 'Criminal justice administration'),
+    ],
+    'HX': [
+        (1, 970.7, 'Socialism, communism, anarchism'),
+    ],
+
+    # ===== Class J — Political Science =====
+    'JA': [
+        (1, 92, 'Political science (general)'),
+    ],
+    'JC': [
+        (11, 605, 'Political theory'),
+    ],
+    'JF': [
+        (20, 1177, 'Comparative government'),
+        (1338, 2112, 'Public administration'),
+    ],
+    'JK': [
+        (1, 9993, 'United States political institutions'),
+    ],
+    'JL': [
+        (1, 3899, 'Americas (outside US)'),
+    ],
+    'JN': [
+        (1, 9689, 'Europe'),
+    ],
+    'JQ': [
+        (1, 6651, 'Asia, Africa, Australia, Oceania'),
+    ],
+    'JS': [
+        (3, 8500, 'Local government & municipal government'),
+    ],
+    'JV': [
+        (1, 9480, 'Colonies, colonization, emigration, immigration'),
+    ],
+    'JZ': [
+        (5, 6530, 'International relations'),
+    ],
+
+    # ===== Class K — Law =====
+    # The largest LC schedule. Subclasses cover both legal systems
+    # (KB religious, KD UK, KE Canada, KF US federal, etc.) and regions.
+    'K': [
+        (1, 7720, 'Law (general); comparative & uniform law'),
+        (370, 487, 'Comparative law'),
+        (500, 5582, 'Jurisprudence & philosophy of law'),
+    ],
+    'KB': [
+        (1, 4855, 'Religious law (general)'),
+    ],
+    'KBM': [
+        (1, 4855, 'Jewish law'),
+    ],
+    'KBP': [
+        (1, 4855, 'Islamic law'),
+    ],
+    'KBR': [
+        (1, 1300, 'History of canon law'),
+    ],
+    'KBU': [
+        (1, 4855, 'Law of the Roman Catholic Church'),
+    ],
+    'KD': [
+        (51, 9684, 'United Kingdom & Ireland'),
+        (51, 600, 'UK: sources & legal history'),
+        (640, 7990, 'UK: law'),
+        (8001, 9684, 'Ireland'),
+    ],
+    'KDC': [
+        (1, 990, 'Scotland'),
+    ],
+    'KDE': [
+        (1, 990, 'Northern Ireland'),
+    ],
+    'KDK': [
+        (1, 9990, 'Ireland (Republic)'),
+    ],
+    'KDZ': [
+        (1, 4999, 'America. North America'),
+    ],
+    'KE': [
+        (1, 9450, 'Canada'),
+    ],
+    'KF': [
+        (1, 9827, 'United States federal law'),
+        (101, 130, 'Bibliography'),
+        (140, 246, 'Legislative documents'),
+        (4101, 4500, 'Constitutional law'),
+        (4501, 4595, 'States (general)'),
+        (4651, 4945, 'Civil rights'),
+        (5050, 5455, 'Government & public administration'),
+        (8700, 9050, 'Criminal procedure'),
+        (8701, 9075, 'Criminal law'),
+        (9201, 9479, 'Civil procedure & courts'),
+        (9601, 9764, 'Procedure'),
+        (9750, 9827, 'Criminal law (special topics)'),
+    ],
+    'KFA': [
+        (1, 1000, 'US state law: Alabama, Alaska, Arizona, Arkansas'),
+    ],
+    'KFC': [
+        (1, 1000, 'US state law: California, Colorado, Connecticut'),
+    ],
+    'KFD': [
+        (1, 999, 'US state law: Delaware'),
+    ],
+    'KFF': [
+        (1, 999, 'US state law: Florida'),
+    ],
+    'KFG': [
+        (1, 999, 'US state law: Georgia'),
+    ],
+    'KFH': [
+        (1, 999, 'US state law: Hawaii'),
+    ],
+    'KFI': [
+        (1, 9999, 'US state law: Idaho, Illinois, Indiana, Iowa'),
+    ],
+    'KFK': [
+        (1, 9999, 'US state law: Kansas, Kentucky'),
+    ],
+    'KFL': [
+        (1, 999, 'US state law: Louisiana'),
+    ],
+    'KFM': [
+        (1, 9999, 'US state law: Maine, Maryland, Massachusetts, Michigan, Minnesota, Mississippi, Missouri, Montana'),
+    ],
+    'KFN': [
+        (1, 9999, 'US state law: Nebraska, Nevada, New Hampshire, New Jersey, New Mexico, New York, North Carolina, North Dakota'),
+    ],
+    'KFO': [
+        (1, 999, 'US state law: Ohio, Oklahoma, Oregon'),
+    ],
+    'KFP': [
+        (1, 999, 'US state law: Pennsylvania'),
+    ],
+    'KFR': [
+        (1, 999, 'US state law: Rhode Island'),
+    ],
+    'KFS': [
+        (1, 999, 'US state law: South Carolina, South Dakota'),
+    ],
+    'KFT': [
+        (1, 999, 'US state law: Tennessee, Texas'),
+    ],
+    'KFU': [
+        (1, 999, 'US state law: Utah'),
+    ],
+    'KFV': [
+        (1, 9999, 'US state law: Vermont, Virginia'),
+    ],
+    'KFW': [
+        (1, 9999, 'US state law: Washington, West Virginia, Wisconsin, Wyoming'),
+    ],
+    'KFX': [
+        (1, 9999, 'US local law (cities, counties)'),
+    ],
+    'KG': [
+        (1, 9999, 'Latin America. Mexico. Central America. West Indies'),
+    ],
+    'KH': [
+        (1, 9999, 'South America'),
+    ],
+    'KJ': [
+        (1, 9999, 'Europe (general)'),
+    ],
+    'KJC': [
+        (1, 9999, 'European regional, comparative & uniform law'),
+    ],
+    'KJK': [
+        (1, 4990, 'Albania, Andorra'),
+    ],
+    'KJV': [
+        (1, 9999, 'France'),
+    ],
+    'KK': [
+        (1, 9999, 'Germany'),
+    ],
+    'KKA': [
+        (1, 9999, 'Germany: federal & state'),
+    ],
+    'KKE': [
+        (1, 9999, 'Greece, Hungary'),
+    ],
+    'KL': [
+        (1, 9999, 'Asia & Eurasia'),
+    ],
+    'KM': [
+        (1, 9999, 'South Asia'),
+    ],
+    'KN': [
+        (1, 9999, 'East Asia (China, Japan, Korea)'),
+    ],
+    'KP': [
+        (1, 9999, 'Southeast Asia'),
+    ],
+    'KQ': [
+        (1, 9999, 'Africa'),
+    ],
+    'KR': [
+        (1, 9999, 'Africa (Eastern, Southern)'),
+    ],
+    'KS': [
+        (1, 9999, 'Pacific area & Antarctica'),
+    ],
+    'KU': [
+        (1, 9999, 'Australia'),
+    ],
+    'KV': [
+        (1, 9999, 'Other Pacific & Oceania'),
+    ],
+    'KW': [
+        (1, 9999, 'Pacific area legal systems'),
+    ],
+    'KZ': [
+        (2, 6795, 'International law'),
+        (199, 1450, 'History of international law'),
+        (1234, 1236, 'Treaties on international law'),
+        (3092, 3093, 'Sources of international law'),
+        (3110, 3775, 'Subjects of international law (states, peoples)'),
+        (4002, 5490, 'Specific subjects'),
+        (6010, 6795, 'International criminal law, war, peace'),
+    ],
+
+    # ===== Class L — Education =====
+    'LA': [
+        (5, 2396, 'History of education'),
+    ],
+    'LB': [
+        (5, 3640, 'Theory & practice of education'),
+        (1025, 1050.75, 'Teaching (Principles & practice)'),
+        (1050.9, 1091, 'Educational psychology'),
+        (1101, 1139, 'Child study'),
+        (1140, 1140.5, 'Preschool education'),
+        (1141, 1489, 'Kindergarten'),
+        (1501, 1602, 'Elementary education'),
+        (1603, 1696.6, 'Secondary education'),
+        (1705, 2286, 'Education & training of teachers'),
+        (2300, 2430, 'Higher education'),
+    ],
+    'LC': [
+        (8, 6691, 'Special aspects of education'),
+        (1390, 5160.3, 'Education of special classes of persons'),
+    ],
+    'LD': [
+        (13, 7501, 'Individual U.S. institutions'),
+    ],
+
+    # ===== Class P — Language & Literature =====
+    'P': [
+        (1, 1091, 'Philology & linguistics (general)'),
+    ],
+    'PA': [
+        (1, 5665, 'Classical philology, Greek & Latin literature'),
+    ],
+    'PB': [
+        (1, 3029, 'Modern European languages (general)'),
+    ],
+    'PC': [
+        (1, 5498, 'Romance languages'),
+    ],
+    'PE': [
+        (1, 3729, 'English language'),
+    ],
+    'PG': [
+        (1, 9198, 'Slavic, Baltic, Albanian languages & literatures'),
+    ],
+    'PL': [
+        (1, 8844, 'Languages & literatures of Eastern Asia, Africa, Oceania'),
+    ],
+    'PN': [
+        (1, 6790, 'Literature (general)'),
+        (1600, 3299, 'Drama'),
+        (4001, 4321, 'Oratory, elocution'),
+        (4699, 5650, 'Journalism, the periodical press'),
+        (6010, 6790, 'Collections of general literature'),
+    ],
+    'PQ': [
+        (1, 3999, 'French literature'),
+        (4001, 5999, 'Italian literature'),
+        (6001, 8929, 'Spanish literature'),
+        (9000, 9999, 'Portuguese literature'),
+    ],
+    'PR': [
+        (1, 78, 'English literature (general)'),
+        (83, 888, 'History & criticism'),
+        (1098, 1799, 'Collections'),
+        (1803, 2165, 'Anglo-Saxon, Old & Middle English'),
+        (2199, 2405, '15th–16th century'),
+        (2411, 2999, 'Shakespeare & his contemporaries'),
+        (3291, 3785, '17th–18th century'),
+        (4000, 5990, '19th–20th century'),
+        (6000, 6049, '1961–2000'),
+        (6050, 6076, '21st century'),
+        (8309, 9680, 'Commonwealth & former colonial literatures'),
+    ],
+    'PS': [
+        (1, 3576, 'American literature'),
+        (700, 893, 'Colonial period through 1830'),
+        (991, 3390, '19th century'),
+        (3500, 3549, '1900–1960'),
+        (3550, 3576, '1961–2000'),
+        (3600, 3626, '21st century'),
+    ],
+    'PT': [
+        (1, 9999, 'German, Dutch, Scandinavian literatures'),
+    ],
+    'PZ': [
+        (1, 90, 'Fiction & juvenile belles lettres'),
+    ],
+
+    # ===== Class Q — Science =====
+    'QA': [
+        (1, 939, 'Mathematics (general)'),
+        (75, 76.95, 'Computer science & computing'),
+        (101, 145, 'Elementary mathematics, arithmetic'),
+        (150, 272.5, 'Algebra'),
+        (273, 280, 'Probability theory'),
+        (276, 280, 'Statistics'),
+        (299, 433, 'Analysis & calculus'),
+        (440, 699, 'Geometry, topology'),
+        (801, 939, 'Analytic mechanics'),
+    ],
+    'QB': [
+        (1, 991, 'Astronomy'),
+    ],
+    'QC': [
+        (1, 999, 'Physics'),
+        (170, 197, 'Atomic physics, quantum'),
+        (350, 467, 'Optics, light'),
+        (501, 766, 'Electricity & magnetism'),
+        (770, 798, 'Nuclear & particle physics'),
+        (851, 999, 'Geophysics, meteorology'),
+    ],
+    'QD': [
+        (1, 999, 'Chemistry'),
+        (146, 197, 'Inorganic chemistry'),
+        (241, 441, 'Organic chemistry'),
+        (450, 731, 'Physical & theoretical chemistry'),
+    ],
+    'QE': [
+        (1, 996.5, 'Geology'),
+    ],
+    'QH': [
+        (1, 705.5, 'Natural history (general)'),
+        (301, 705.5, 'Biology'),
+        (351, 425, 'General biology'),
+        (426, 470, 'Genetics'),
+        (471, 489, 'Reproduction'),
+        (501, 531, 'Life'),
+        (540, 599.9, 'Ecology'),
+        (705, 705.5, 'Microscopy'),
+    ],
+    'QK': [
+        (1, 989, 'Botany'),
+    ],
+    'QL': [
+        (1, 991, 'Zoology'),
+    ],
+    'QM': [
+        (1, 695, 'Human anatomy'),
+    ],
+    'QP': [
+        (1, 981, 'Physiology'),
+    ],
+    'QR': [
+        (1, 502, 'Microbiology'),
+    ],
+
+    # ===== Class R — Medicine =====
+    'R': [
+        (1, 920, 'Medicine (general)'),
+    ],
+    'RA': [
+        (1, 1270, 'Public aspects of medicine'),
+        (407, 409.5, 'Health status indicators, surveys'),
+        (421, 790.95, 'Public health, hygiene, preventive medicine'),
+        (1001, 1270, 'Forensic medicine, medical jurisprudence'),
+    ],
+    'RB': [
+        (1, 214, 'Pathology'),
+    ],
+    'RC': [
+        (1, 1245, 'Internal medicine, clinical medicine'),
+        (31, 1245, 'Internal medicine'),
+        (321, 571, 'Neurology, neurosciences'),
+        (435, 571, 'Psychiatry'),
+        (581, 951, 'Specialties (cardiovascular, oncology, etc.)'),
+        (952, 1245, 'Geriatrics, sports medicine, tropical medicine'),
+    ],
+    'RD': [
+        (1, 811, 'Surgery'),
+    ],
+    'RE': [
+        (1, 994, 'Ophthalmology'),
+    ],
+    'RF': [
+        (1, 547, 'Otorhinolaryngology'),
+    ],
+    'RG': [
+        (1, 991, 'Gynecology & obstetrics'),
+    ],
+    'RJ': [
+        (1, 570, 'Pediatrics'),
+    ],
+    'RT': [
+        (1, 120, 'Nursing'),
+    ],
+
+    # ===== Class T — Technology =====
+    'T': [
+        (1, 995, 'Technology (general)'),
+        (10.5, 11.9, 'Communication of technical information'),
+        (55, 55.3, 'Industrial safety, hygiene'),
+        (170, 174.5, 'Industrial archaeology'),
+        (385, 388, 'Engineering & technical drawing'),
+    ],
+    'TA': [
+        (1, 2040, 'Engineering (general), civil engineering'),
+        (1, 145, 'General engineering'),
+        (164, 167, 'Bioengineering'),
+        (168, 168, 'Systems engineering'),
+        (170, 171, 'Environmental engineering'),
+        (174, 174, 'Engineering design'),
+        (177.4, 185, 'Engineering economy'),
+        (190, 197, 'Engineering operations & management'),
+        (213, 215, 'Engineering machinery & tools'),
+        (329, 348, 'Engineering mathematics'),
+        (349, 359, 'Mechanics of engineering'),
+        (401, 492, 'Materials of engineering & construction'),
+        (501, 625, 'Surveying'),
+        (630, 695, 'Structural engineering'),
+        (703, 712, 'Engineering geology'),
+        (715, 787, 'Earthwork. Foundations'),
+        (800, 820, 'Tunneling'),
+        (1001, 1280, 'Transportation engineering'),
+        (1501, 1820, 'Applied optics. Photonics'),
+        (2001, 2040, 'Plasma engineering'),
+    ],
+    'TC': [
+        (1, 1800, 'Hydraulic engineering'),
+        (1501, 1800, 'Ocean engineering'),
+    ],
+    'TD': [
+        (1, 1066, 'Environmental technology, sanitary engineering'),
+        (159, 168, 'Municipal engineering'),
+        (169, 171.8, 'Environmental protection'),
+        (172, 193.5, 'Environmental pollution'),
+        (194, 195, 'Environmental impact analysis'),
+        (201, 500, 'Water supply for domestic & industrial purposes'),
+        (511, 780, 'Sewage collection & disposal'),
+        (783, 812.5, 'Municipal refuse, solid wastes'),
+        (878, 894, 'Special types of environment'),
+        (895, 899, 'Industrial sanitation, industrial hygiene'),
+        (920, 934, 'Rural & farm sanitary engineering'),
+        (940, 949, 'Low temperature sanitary engineering'),
+    ],
+    'TE': [
+        (1, 450, 'Highway engineering, roads & pavements'),
+    ],
+    'TF': [
+        (1, 1620, 'Railroad engineering & operation'),
+    ],
+    'TG': [
+        (1, 470, 'Bridge engineering'),
+    ],
+    'TH': [
+        (1, 9745, 'Building construction'),
+        (5011, 5701, 'Construction by phase of work'),
+        (7005, 7699, 'Heating & ventilation. Air conditioning'),
+        (7700, 7975, 'Illumination. Lighting'),
+        (8001, 8581, 'Decoration & decorative furnishings'),
+        (9025, 9745, 'Protection of buildings'),
+    ],
+    'TJ': [
+        (1, 1570, 'Mechanical engineering & machinery'),
+        (170, 179, 'Mechanics applied to machinery. Dynamics'),
+        (181, 210, 'Mechanical movements'),
+        (212, 225, 'Mechanical drives'),
+        (227, 240, 'Machine design & drawing'),
+        (241, 254.7, 'Machine construction'),
+        (255, 265, 'Heat engines'),
+        (266, 267.5, 'Turbines. Turbomachines'),
+        (268, 740, 'Steam engineering'),
+        (751, 805, 'Locomotives'),
+        (807, 830, 'Power resources'),
+        (836, 927, 'Hydraulic machinery'),
+        (940, 940, 'Vacuum technology'),
+        (950, 1030, 'Pneumatic machinery'),
+        (1040, 1119, 'Machinery exclusive of prime movers'),
+        (1125, 1345, 'Machine shops & machine shop practice'),
+        (1380, 1495, 'Hoisting & conveying machinery'),
+        (1517, 1519, 'Lubrication & lubricants'),
+        (1525, 1570, 'Mechatronics. Microelectromechanical systems. Robots'),
+    ],
+    'TK': [
+        (1, 9971, 'Electrical engineering, electronics, nuclear engineering'),
+        (5101, 6720.5, 'Telecommunications'),
+        (7800, 8360, 'Electronics'),
+        (7885, 7895, 'Computer engineering'),
+        (9001, 9401, 'Nuclear engineering. Atomic power'),
+    ],
+    'TL': [
+        (1, 4050, 'Motor vehicles, aeronautics, astronautics'),
+        (1, 484, 'Motor vehicles. Cycles'),
+        (500, 777, 'Aeronautics. Aeronautical engineering'),
+        (780, 785.8, 'Rocket propulsion. Rockets'),
+        (787, 4050, 'Astronautics. Space travel'),
+    ],
+    'TN': [
+        (1, 997, 'Mining engineering. Metallurgy'),
+    ],
+    'TP': [
+        (1, 1185, 'Chemical technology'),
+        (155, 156, 'Chemical engineering'),
+        (368, 456, 'Food processing & manufacture'),
+        (480, 498, 'Low temperature engineering. Cryogenic engineering'),
+        (500, 660, 'Fermentation industries. Beverages. Alcohol'),
+        (670, 699, 'Oils, fats, waxes'),
+        (700, 746, 'Illuminating industries (non-electric)'),
+        (785, 869, 'Clay industries. Ceramics. Glass'),
+        (875, 888, 'Cement industries'),
+        (890, 933, 'Explosives & pyrotechnics'),
+        (934, 945, 'Paints, pigments, varnishes'),
+        (1080, 1185, 'Polymers & polymer manufacture'),
+    ],
+    'TR': [
+        (1, 1050, 'Photography'),
+        (1, 196, 'Photography (general)'),
+        (200, 559, 'Photographic processing & materials'),
+        (624, 835, 'Applied photography'),
+        (845, 899, 'Cinematography. Motion pictures'),
+        (925, 1050, 'Photomechanical processes'),
+    ],
+    'TS': [
+        (1, 2301, 'Manufactures'),
+        (155, 194, 'Production management'),
+        (200, 770, 'Metal manufactures. Metalworking'),
+        (800, 937, 'Wood technology. Lumber'),
+        (940, 1047, 'Leather industries. Tanning'),
+        (1060, 1070, 'Furs'),
+        (1080, 1268, 'Paper manufacture & trade'),
+        (1300, 1865, 'Textile industries'),
+        (1870, 1935, 'Rubber industry'),
+        (1950, 2301, 'Animal products'),
+    ],
+    'TT': [
+        (1, 999, 'Handicrafts. Arts & crafts'),
+        (161, 170.7, 'Manual training. School shops'),
+        (174, 176, 'Articles for children'),
+        (180, 200, 'Woodworking. Furniture making'),
+        (201, 203, 'Lathework. Turning'),
+        (205, 267, 'Metalworking'),
+        (300, 387, 'Painting. Wood finishing'),
+        (387, 410, 'Soft home furnishings'),
+        (490, 695, 'Clothing manufacture. Dressmaking. Tailoring'),
+        (697, 927, 'Home arts. Homecrafts'),
+        (950, 979, 'Hairdressing. Beauty culture. Barbers\' work'),
+        (980, 999, 'Laundry work'),
+    ],
+    'TX': [
+        (1, 1110, 'Home economics'),
+        (301, 339, 'The house'),
+        (341, 641, 'Nutrition. Foods & food supply'),
+        (642, 840, 'Cooking'),
+        (851, 885, 'Dining-room service'),
+        (901, 953, 'Hospitality industry. Hotels, clubs, restaurants'),
+        (955, 985, 'Mobile home living. Trailer camps. Recreational vehicles'),
+    ],
+
+    # ===== Class S — Agriculture =====
+    'S': [
+        (1, 972, 'Agriculture (general)'),
+        (560, 575.5, 'Farm economics. Farm management'),
+        (583, 587.73, 'Agricultural chemistry'),
+        (605.5, 605.5, 'Organic farming'),
+        (621, 621.5, 'Agricultural meteorology'),
+        (622, 627, 'Soils. Soil science'),
+        (631, 667, 'Fertilizers'),
+        (671, 760.5, 'Farm machinery & engineering'),
+        (900, 972, 'Conservation of natural resources'),
+    ],
+    'SB': [
+        (1, 1110, 'Plant culture'),
+        (109, 110, 'Economic botany'),
+        (175, 423, 'Field crops'),
+        (450, 467.8, 'Horticulture. Horticultural crops'),
+        (469, 476.4, 'Landscape architecture'),
+        (599, 990.5, 'Pests & diseases'),
+        (599, 990.5, 'Pests & diseases'),
+        (992, 998, 'Economic entomology'),
+    ],
+    'SD': [
+        (1, 669.5, 'Forestry'),
+    ],
+    'SF': [
+        (1, 1100, 'Animal culture'),
+        (411, 459, 'Pets'),
+        (481, 507, 'Poultry. Eggs'),
+        (600, 1100, 'Veterinary medicine'),
+    ],
+    'SH': [
+        (1, 691, 'Aquaculture. Fisheries. Angling'),
+    ],
+    'SK': [
+        (1, 664, 'Hunting sports'),
+    ],
+
+    # ===== Class U — Military Science =====
+    'U': [
+        (1, 900, 'Military science (general)'),
+        (21, 22, 'Theory of military science'),
+        (101, 145, 'History of military science'),
+        (159, 165, 'War. Philosophy. Military sociology'),
+        (200, 305, 'Strategy & tactics'),
+        (400, 714, 'Military education & training'),
+        (750, 773, 'Military life, customs, morale'),
+        (799, 897, 'Military administration'),
+    ],
+    'UA': [
+        (10, 997, 'Armies: organization, distribution, military situation'),
+    ],
+    'UB': [
+        (1, 900, 'Military administration'),
+        (160, 165, 'Records, returns, muster rolls'),
+        (170, 175, 'Adjutant generals\' offices'),
+        (180, 197, 'Inspection'),
+        (250, 271, 'Intelligence'),
+        (275, 277, 'Espionage'),
+        (320, 615, 'Personnel management'),
+        (407, 409, 'Compulsory service. Conscription'),
+        (416, 419, 'Voluntary service'),
+        (663, 665, 'Veterans'),
+    ],
+    'UC': [
+        (10, 780, 'Maintenance & transportation'),
+    ],
+    'UD': [
+        (1, 495, 'Infantry'),
+    ],
+    'UE': [
+        (1, 500, 'Cavalry. Armor'),
+    ],
+    'UF': [
+        (1, 910, 'Artillery'),
+    ],
+    'UG': [
+        (1, 5000, 'Military engineering. Air forces. Space surveillance'),
+        (570, 614, 'Air forces. Air warfare'),
+        (622, 1435, 'Military air forces by region or country'),
+        (1500, 1530, 'Air defenses'),
+        (1900, 1950, 'Military space surveillance & operations'),
+    ],
+    'UH': [
+        (20, 800, 'Other services'),
+    ],
+
+    # ===== Class V — Naval Science =====
+    'V': [
+        (1, 995, 'Naval science (general)'),
+    ],
+    'VA': [
+        (10, 750, 'Navies: organization, description, facilities'),
+    ],
+    'VB': [
+        (15, 970, 'Naval administration'),
+    ],
+    'VC': [
+        (10, 580, 'Naval maintenance'),
+    ],
+    'VD': [
+        (7, 430, 'Naval seamen'),
+    ],
+    'VE': [
+        (7, 500, 'Marines'),
+    ],
+    'VF': [
+        (1, 580, 'Naval ordnance'),
+    ],
+    'VG': [
+        (20, 2029, 'Minor services of navies'),
+    ],
+    'VK': [
+        (1, 1661, 'Navigation. Merchant marine'),
+    ],
+    'VM': [
+        (1, 989, 'Naval architecture. Shipbuilding. Marine engineering'),
+    ],
+
+    # ===== Class M — Music =====
+    'ML': [
+        (1, 3930, 'Literature on music'),
+    ],
+    'M': [
+        (1, 5000, 'Music'),
+    ],
+
+    # ===== Class N — Fine Arts =====
+    'N': [
+        (1, 9165, 'Visual arts (general)'),
+    ],
+    'NA': [
+        (1, 9428, 'Architecture'),
+    ],
+    'NB': [
+        (1, 1952, 'Sculpture'),
+    ],
+    'NC': [
+        (1, 1940, 'Drawing, design, illustration'),
+    ],
+    'ND': [
+        (25, 3416, 'Painting'),
+    ],
+    'NE': [
+        (1, 3002, 'Print media'),
+    ],
+
+    # ===== Class Z — Bibliography & Library Science =====
+    'Z': [
+        (4, 1, 'Books in general'),
+        (40, 115.5, 'Writing, paleography'),
+        (116, 659, 'Book industries & trade'),
+        (665, 1000.5, 'Libraries & library science'),
+        (1001, 8999, 'Bibliography'),
+    ],
+}
+
+
+def _bucket_by_hundreds(num):
+    """Generic fallback for subclasses without a curated range catalog.
+
+    Buckets a numeric LC subclass component into '0s', '100s', '200s', etc.
+    Used when LC_RANGES has no entry for the relevant subclass.
+    """
+    if num is None or pd.isna(num):
+        return None
+    try:
+        hundred = int(num // 100) * 100
+        return f"{hundred}s" if hundred > 0 else "0s"
+    except (ValueError, TypeError):
+        return None
+
+
+def lookup_lc_range(subclass, number):
+    """Map a (subclass, number) pair to its range label.
+
+    Walks the LC_RANGES catalog for the subclass; if the number falls inside
+    a curated range, returns that range's label. If no curated range exists
+    or no range matches, falls back to hundreds-bucketing (e.g., 'HQ 1100s').
+    Returns None when subclass or number is missing.
+
+    Note: ranges within a subclass may overlap (e.g., HD 4801-8943 and
+    HD 5001-5840 both exist in the official LC outline). When that happens,
+    the *more specific* (narrower) range wins, so callers get the most
+    informative label available.
+    """
+    if not subclass or number is None or pd.isna(number):
+        return None
+    ranges = LC_RANGES.get(subclass.upper())
+    if not ranges:
+        bucket = _bucket_by_hundreds(number)
+        return f"{subclass} {bucket}" if bucket else None
+
+    # Find all matching ranges, then prefer the narrowest (most specific)
+    matches = [(start, end, label) for (start, end, label) in ranges
+               if start <= number <= end]
+    if matches:
+        # Sort by width ascending — narrower range wins
+        matches.sort(key=lambda r: r[1] - r[0])
+        return matches[0][2]
+
+    # No curated range matched; fall back to hundreds-bucketing
+    bucket = _bucket_by_hundreds(number)
+    return f"{subclass} {bucket}" if bucket else None
+
+
+
 # =====================================================================
 # SHARED: Text normalization & LC utilities
 # =====================================================================
@@ -510,14 +1627,31 @@ def extract_lc_prefix(lc_class):
 
 
 def _extract_lc_vectorized(series):
-    """Vectorized LC class extraction — returns (main_class, subclass) Series."""
+    """Vectorized LC call number parsing.
+
+    Returns three Series — (main_class, subclass, number) — extracted from
+    call numbers like 'HQ1190 .C66 2007':
+      - main_class: first letter ('H')
+      - subclass:   1–3 leading letters ('HQ')
+      - number:     numeric component as float ('1190.0'); supports decimals
+                    like 'HQ1090.7' which appear in some LC ranges. None when
+                    the call number has no parseable numeric component.
+
+    The numeric component enables sub-class range analysis via lookup_lc_range.
+    """
     cleaned = series.astype(str).str.strip().str.upper()
-    letters = cleaned.str.extract(r'^([A-Z]{1,3})', expand=False)
+    # Combined regex: capture letters + optional decimal number
+    extracted = cleaned.str.extract(r'^([A-Z]{1,3})\s*([0-9]+(?:\.[0-9]+)?)?', expand=True)
+    letters = extracted[0]
+    number_str = extracted[1]
     main_class = letters.str[0]
+    # Convert number to float; non-matches become NaN
+    number = pd.to_numeric(number_str, errors='coerce')
     mask = series.isna() | (series.astype(str).str.strip() == '')
     main_class = main_class.where(~mask, other=None)
     letters = letters.where(~mask, other=None)
-    return main_class, letters
+    number = number.where(~mask, other=None)
+    return main_class, letters, number
 
 
 # Title-keyword analysis ------------------------------------------------------
@@ -1843,6 +2977,297 @@ def _profiler_display_results(results, settings, df, idx,
                     st.dataframe(pd.DataFrame(rows_s),
                                  use_container_width=True, hide_index=True)
 
+            # --- Sub-class range distribution ---
+            # Drills inside selected LC subclasses (HQ, PR, PS, etc.) to show
+            # which numeric ranges are getting the most representation/use.
+            # The range labels come from LC_RANGES (curated where high-traffic,
+            # bucketed by hundreds otherwise via lookup_lc_range).
+            if df is not None and '_lc_range' in df.columns and '_lc_sub' in df.columns:
+                df_lc = df.loc[idx] if idx is not None else df
+                # Filter to rows with a parseable subclass
+                df_lc = df_lc[df_lc['_lc_sub'].notna() & df_lc['_lc_range'].notna()]
+                if len(df_lc) > 0:
+                    st.markdown("---")
+                    st.subheader("Sub-class range distribution")
+                    st.caption("Drills below the two-letter subclass to show "
+                               "which LC ranges within it are most represented "
+                               "or most used. Choose one or more subclasses to "
+                               "compare. Curated ranges are drawn from the LC "
+                               "Classification Outline; uncurated subclasses fall "
+                               "back to bucketing by hundreds (e.g., 'F 1400s').")
+
+                    # Default: pick the top 5 subclasses by weight
+                    sub_totals = (df_lc.groupby('_lc_sub')['_weight']
+                                  .sum()
+                                  .sort_values(ascending=False))
+                    available_subs = sub_totals.index.tolist()
+                    default_subs = available_subs[:5]
+                    selected_subs = st.multiselect(
+                        "Subclasses to drill into:",
+                        options=available_subs,
+                        default=default_subs,
+                        key="prof_lc_range_subs",
+                        help="By default, the top 5 subclasses by weight are shown. "
+                             "Pick fewer for a focused view, or pick the specific "
+                             "subclasses you're investigating.",
+                    )
+
+                    if selected_subs:
+                        df_subs = df_lc[df_lc['_lc_sub'].isin(selected_subs)]
+                        range_summary = (df_subs.groupby(['_lc_sub', '_lc_range'])
+                                         .agg(Records=('_weight', 'count'),
+                                              Total=('_weight', 'sum'))
+                                         .reset_index()
+                                         .rename(columns={
+                                             '_lc_sub': 'Subclass',
+                                             '_lc_range': 'Range',
+                                             'Records': 'Records',
+                                             'Total': f'Total {wl}',
+                                         }))
+                        range_summary = range_summary.sort_values(
+                            f'Total {wl}', ascending=False
+                        )
+
+                        # Bar chart — combined subclass+range labels for readability
+                        # when multiple subclasses are shown together
+                        if len(selected_subs) > 1:
+                            range_summary['Display'] = (
+                                range_summary['Subclass'] + ' — ' + range_summary['Range']
+                            )
+                            y_col = 'Display'
+                        else:
+                            y_col = 'Range'
+
+                        # Cap to top 25 ranges by weight to keep the chart readable
+                        chart_data = range_summary.head(25)
+                        fig_range = px.bar(
+                            chart_data,
+                            x=f'Total {wl}', y=y_col, orientation='h',
+                            color='Subclass' if len(selected_subs) > 1 else None,
+                            color_discrete_sequence=[
+                                '#285C4D', '#71C5E8', '#92ad9c', '#a8d8e8', '#4a7866',
+                            ],
+                            title=(f"Range distribution within "
+                                   f"{', '.join(selected_subs)} "
+                                   f"({len(df_subs):,} records)"),
+                            hover_data=['Records'],
+                        )
+                        fig_range.update_layout(
+                            height=max(400, len(chart_data) * 28),
+                            yaxis={'categoryorder': 'total ascending'},
+                            margin=dict(l=10, r=10, t=60, b=10),
+                        )
+                        st.plotly_chart(fig_range, use_container_width=True)
+
+                        # Detail table (full, not just top 25)
+                        display_df = range_summary[
+                            ['Subclass', 'Range', 'Records', f'Total {wl}']
+                        ].copy()
+                        if has_usage:
+                            display_df['% of selected subclass'] = (
+                                display_df.groupby('Subclass')[f'Total {wl}']
+                                .transform(lambda x: x / x.sum() * 100)
+                                .round(1)
+                                .astype(str) + '%'
+                            )
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                        # Download
+                        _range_bytes = _annotate_csv(
+                            display_df, notes,
+                            extra_meta={'Tool': 'Collection Profiler',
+                                        'View': 'Sub-class Range Distribution',
+                                        'Weighting': wl,
+                                        'Subclasses': ', '.join(selected_subs)}
+                        )
+                        st.download_button(
+                            "📥 Range distribution (CSV)",
+                            _range_bytes, "lc_range_distribution.csv",
+                            "text/csv", key='prof_dl_ranges',
+                        )
+                        _add_to_tray("profiler", "lc_range_distribution.csv",
+                                     _range_bytes)
+
+                        # --- Range-level Coverage vs. Use ---
+                        # Only meaningful when usage data is present. Compares
+                        # holdings_share vs. usage_share at the range level
+                        # within the selected subclasses, mirroring the
+                        # subclass-level CVU but at finer granularity.
+                        if has_usage and '_weight' in df_subs.columns:
+                            st.markdown("---")
+                            st.subheader("Range-level coverage vs. use")
+                            st.caption(
+                                "Compares **% of selected-subclass holdings** in each range "
+                                "against **% of use** that range drives. Same signal logic "
+                                "as the LC Main Class view above, but drilled down to LC "
+                                "ranges within the subclasses you picked. Uses the same "
+                                "thresholds set in the sidebar."
+                            )
+
+                            # Build titles_dict and usage_dict at the range level.
+                            # Titles count = 1 per row (records); usage = _weight sum.
+                            # The reference total is the selected-subclass subtotal so
+                            # percentages compare ranges *within* what's been selected,
+                            # not the whole collection — that's the more interpretable
+                            # question at this granularity.
+                            range_titles = (df_subs.groupby('_lc_range')
+                                            .size().to_dict())
+                            range_usage = (df_subs.groupby('_lc_range')['_weight']
+                                           .sum().to_dict())
+                            total_t = sum(range_titles.values())
+                            total_u = sum(range_usage.values())
+
+                            if total_t > 0 and total_u > 0:
+                                # Range labels are self-describing — no need for a
+                                # separate label_lookup; pass an empty dict and let
+                                # Description show '—'. Then suppress that column.
+                                cvu_range_df = _build_cvu_table(
+                                    range_titles, range_usage,
+                                    total_t, total_u,
+                                    settings.get('cvu_over', 2.0),
+                                    settings.get('cvu_under', 0.5),
+                                    settings.get('cvu_min_titles', 10),
+                                    {},  # no lookup — range IS the label
+                                    'Range',
+                                )
+                                if not cvu_range_df.empty:
+                                    # Drop Description (always — for range view); sort by signal
+                                    cvu_range_df = cvu_range_df.drop(columns=['Description'])
+                                    cvu_range_df['_sort_key'] = cvu_range_df[
+                                        'Use/Holdings Signal'
+                                    ].fillna(-1)
+                                    cvu_range_df = (cvu_range_df
+                                                    .sort_values('_sort_key', ascending=False)
+                                                    .drop(columns='_sort_key'))
+
+                                    # KPI row
+                                    k1, k2, k3 = st.columns(3)
+                                    over_n = (cvu_range_df['Assessment']
+                                              == "🟢 Overperforming").sum()
+                                    under_n = (cvu_range_df['Assessment']
+                                               == "🔴 Underperforming").sum()
+                                    prop_n = (cvu_range_df['Assessment']
+                                              == "✅ Proportional").sum()
+                                    k1.metric("🟢 Overperforming ranges", int(over_n))
+                                    k2.metric("🔴 Underperforming ranges", int(under_n))
+                                    k3.metric("✅ Proportional ranges", int(prop_n))
+
+                                    st.dataframe(
+                                        cvu_range_df,
+                                        use_container_width=True, hide_index=True,
+                                        height=400,
+                                        column_config={
+                                            '% of Collection': st.column_config.NumberColumn(
+                                                format="%.2f%%",
+                                                help="Share of holdings within the "
+                                                     "selected subclass(es). The total "
+                                                     "is the selected subset, not the "
+                                                     "whole collection.",
+                                            ),
+                                            '% of Use': st.column_config.NumberColumn(
+                                                format="%.2f%%",
+                                            ),
+                                            'Use/Holdings Signal': st.column_config.NumberColumn(
+                                                format="%.2f",
+                                                help="(% of use) ÷ (% of holdings). "
+                                                     "1.0 = proportional.",
+                                            ),
+                                        },
+                                    )
+
+                                    # Scatter plot
+                                    plot_df = cvu_range_df[
+                                        cvu_range_df['Assessment'] != "—"
+                                    ].copy()
+                                    if not plot_df.empty:
+                                        fig_cvu_r = px.scatter(
+                                            plot_df,
+                                            x='% of Collection', y='% of Use',
+                                            size='Titles Held', color='Assessment',
+                                            color_discrete_map={
+                                                "🟢 Overperforming": "#2ecc71",
+                                                "🔴 Underperforming": "#e74c3c",
+                                                "✅ Proportional": "#71C5E8",
+                                            },
+                                            hover_data=['Range', 'Total Use',
+                                                        'Use/Title Ratio'],
+                                            title="Holdings share vs. usage share by range",
+                                        )
+                                        # Add diagonal reference line (proportional)
+                                        max_pct = max(plot_df['% of Collection'].max(),
+                                                      plot_df['% of Use'].max())
+                                        fig_cvu_r.add_shape(
+                                            type='line',
+                                            x0=0, y0=0, x1=max_pct, y1=max_pct,
+                                            line=dict(color='gray', dash='dot', width=1),
+                                        )
+                                        fig_cvu_r.update_layout(
+                                            height=500,
+                                            margin=dict(t=60, l=10, r=10, b=10),
+                                        )
+                                        st.plotly_chart(fig_cvu_r,
+                                                        use_container_width=True)
+
+                                    # Narrative summary
+                                    if over_n > 0 or under_n > 0:
+                                        bullets = []
+                                        if over_n > 0:
+                                            top_over = (cvu_range_df[
+                                                cvu_range_df['Assessment']
+                                                == "🟢 Overperforming"
+                                            ].head(3)['Range'].tolist())
+                                            bullets.append(
+                                                f"- **{over_n} overperforming range"
+                                                f"{'s' if over_n != 1 else ''}** — "
+                                                f"pulling weight above their holdings "
+                                                f"share. Examples: "
+                                                f"*{', '.join(top_over)}*. Consider "
+                                                f"deeper investment."
+                                            )
+                                        if under_n > 0:
+                                            top_under = (cvu_range_df[
+                                                cvu_range_df['Assessment']
+                                                == "🔴 Underperforming"
+                                            ].head(3)['Range'].tolist())
+                                            bullets.append(
+                                                f"- **{under_n} underperforming range"
+                                                f"{'s' if under_n != 1 else ''}** — "
+                                                f"well-represented but lightly used. "
+                                                f"Examples: *{', '.join(top_under)}*. "
+                                                f"Candidates for weeding review or "
+                                                f"reassessment. Switch to the **Title "
+                                                f"Analysis** tab and filter by these "
+                                                f"ranges to see specific low-use titles."
+                                            )
+                                        st.markdown("\n".join(bullets))
+
+                                    # Download
+                                    _cvu_range_bytes = _annotate_csv(
+                                        cvu_range_df, notes,
+                                        extra_meta={
+                                            'Tool': 'Collection Profiler',
+                                            'View': 'Range-level Coverage vs. Use',
+                                            'Subclasses': ', '.join(selected_subs),
+                                            'Over threshold': settings.get('cvu_over', 2.0),
+                                            'Under threshold': settings.get('cvu_under', 0.5),
+                                            'Min titles threshold': settings.get('cvu_min_titles', 10),
+                                        }
+                                    )
+                                    st.download_button(
+                                        "📥 Range-level CVU (CSV)",
+                                        _cvu_range_bytes,
+                                        "coverage_vs_use_ranges.csv",
+                                        "text/csv", key='prof_dl_cvu_ranges',
+                                    )
+                                    _add_to_tray("profiler",
+                                                 "coverage_vs_use_ranges.csv",
+                                                 _cvu_range_bytes)
+                            else:
+                                st.info("Need both holdings and usage data within the "
+                                        "selected subclasses to compute coverage vs. use.")
+                    else:
+                        st.info("Pick at least one subclass to see its range distribution.")
+
     # ======================================================================
     # TAB 2: SUBJECT TERM ANALYSIS
     # ======================================================================
@@ -1930,62 +3355,238 @@ def _profiler_display_results(results, settings, df, idx,
             # Filter df to the LC-selected subset (matches what the other tabs see)
             df_view = df.loc[idx] if idx is not None else df
 
-            # ---- Date-range filter (if a date column was detected) ----
+            # ---- Time period filter (year multiselect + optional date range) ----
+            # If a date column is detected, build a year-level filter (always) and
+            # an additional date-range filter (when the column has sub-year granularity).
+            # The year filter is the primary control because most trend questions are
+            # year-over-year. Date-range stays available for files with full dates.
             period_label = "unknown period"
+            years_in_data = []     # sorted unique years present
+            years_selected = []    # years the user has actively included
+            has_subyear_granularity = False
             if date_col and date_col in df_view.columns:
                 df_view = df_view.copy()
-                # Year-only columns (integer values like 2025) need special handling —
-                # pd.to_datetime would interpret them as nanoseconds-since-epoch (1970).
                 src = df_view[date_col]
                 if pd.api.types.is_numeric_dtype(src):
-                    # Year column path: coerce to Jan-1 of that year
+                    # Year column path: coerce to Jan-1 of that year. No sub-year detail.
                     df_view['_date'] = pd.to_datetime(
                         src.astype('Int64').astype(str) + '-01-01',
                         errors='coerce',
                     )
                 else:
                     df_view['_date'] = pd.to_datetime(src, errors='coerce')
+                    # Detect sub-year granularity — if any date isn't Jan 1, we have
+                    # at least month-level detail and the date-range filter is useful.
+                    parsed = df_view['_date'].dropna()
+                    if len(parsed) > 0:
+                        has_subyear_granularity = bool(
+                            ((parsed.dt.month != 1) | (parsed.dt.day != 1)).any()
+                        )
+
                 valid_dates = df_view['_date'].dropna()
                 if len(valid_dates) > 0:
-                    date_min = valid_dates.min()
-                    date_max = valid_dates.max()
-                    period_label = _format_date_range(date_min, date_max)
-                    with st.expander(f"📅 Date range filter "
-                                     f"(detected: {date_min.strftime('%Y-%m-%d')} to "
-                                     f"{date_max.strftime('%Y-%m-%d')})",
-                                     expanded=False):
-                        use_filter = st.checkbox(
-                            "Apply date filter", value=False,
-                            key="prof_title_date_use",
+                    df_view['_year'] = df_view['_date'].dt.year
+                    years_in_data = sorted(int(y) for y in df_view['_year'].dropna().unique())
+                    period_label = (f"{years_in_data[0]}–{years_in_data[-1]}"
+                                    if len(years_in_data) > 1
+                                    else f"{years_in_data[0]}")
+
+                    with st.expander(
+                        f"📅 Time period filter "
+                        f"({len(years_in_data)} year{'s' if len(years_in_data) != 1 else ''} "
+                        f"in data: {period_label})",
+                        expanded=False,
+                    ):
+                        # Year multiselect — primary control
+                        years_selected = st.multiselect(
+                            "Include years:",
+                            options=years_in_data,
+                            default=years_in_data,
+                            key="prof_title_years",
+                            help="Pick one or more years to scope all Title Analysis "
+                                 "sub-tabs. Defaults to all years; the Yearly trends "
+                                 "sub-tab respects this selection too.",
                         )
-                        if use_filter:
-                            dmin_d = date_min.date()
-                            dmax_d = date_max.date()
-                            start_date, end_date = st.date_input(
-                                "Date range:",
-                                value=(dmin_d, dmax_d),
-                                min_value=dmin_d, max_value=dmax_d,
-                                key="prof_title_date_range",
-                            )
-                            if isinstance(start_date, tuple):
-                                start_date, end_date = start_date
-                            mask = (df_view['_date'].dt.date >= start_date) & \
-                                   (df_view['_date'].dt.date <= end_date)
-                            df_view = df_view[mask].copy()
-                            period_label = _format_date_range(
-                                pd.Timestamp(start_date), pd.Timestamp(end_date)
-                            )
+                        if years_selected and set(years_selected) != set(years_in_data):
+                            df_view = df_view[df_view['_year'].isin(years_selected)].copy()
+                            if len(years_selected) > 1:
+                                period_label = (
+                                    f"{min(years_selected)}–{max(years_selected)}"
+                                )
+                            else:
+                                period_label = f"{years_selected[0]}"
                             st.caption(f"Filtered to {len(df_view):,} records "
                                        f"in {period_label}")
 
+                        # Date-range slider — only for sub-year granularity, secondary control
+                        if has_subyear_granularity and len(valid_dates) > 0:
+                            use_dr = st.checkbox(
+                                "Also apply a date range within the selected years",
+                                value=False, key="prof_title_use_dr",
+                            )
+                            if use_dr:
+                                # Recompute min/max after year filter
+                                vd = df_view['_date'].dropna()
+                                if len(vd) > 0:
+                                    dmin_d = vd.min().date()
+                                    dmax_d = vd.max().date()
+                                    start_date, end_date = st.date_input(
+                                        "Date range:",
+                                        value=(dmin_d, dmax_d),
+                                        min_value=dmin_d, max_value=dmax_d,
+                                        key="prof_title_date_range",
+                                    )
+                                    if isinstance(start_date, tuple):
+                                        start_date, end_date = start_date
+                                    mask = (df_view['_date'].dt.date >= start_date) & \
+                                           (df_view['_date'].dt.date <= end_date)
+                                    df_view = df_view[mask].copy()
+                                    period_label = _format_date_range(
+                                        pd.Timestamp(start_date),
+                                        pd.Timestamp(end_date),
+                                    )
+
+            # If no year selection happened above, treat all years as selected
+            if not years_selected and years_in_data:
+                years_selected = years_in_data
+
             # ---- Sub-tabs within Title Analysis ----
             if has_usage and weight_col and '_weight' in df_view.columns:
-                title_subtabs = ["Top titles", "Weeding review"]
+                # Yearly trends appears first when we have >1 year of data —
+                # multi-year files want this view as the headline.
+                title_subtabs = []
+                show_yearly = len(years_in_data) > 1 and '_year' in df_view.columns
+                if show_yearly:
+                    title_subtabs.append("Yearly trends")
+                title_subtabs.extend(["Top titles", "Weeding review"])
                 if author_col:
                     title_subtabs.append("Author summary")
                 title_subtabs.append("Title details")
                 ts_objs = st.tabs(title_subtabs)
                 ts_idx = {label: i for i, label in enumerate(title_subtabs)}
+
+                # ---- Yearly trends (only when >1 year of data) ----
+                if show_yearly:
+                    with ts_objs[ts_idx["Yearly trends"]]:
+                        st.info("How usage shifts year-over-year. Useful for "
+                                "spotting growing or declining areas across multi-year datasets.")
+
+                        # Per-year aggregates
+                        year_agg = df_view.groupby('_year').agg(
+                            Records=('_weight', 'count'),
+                            Total=('_weight', 'sum'),
+                            Mean=('_weight', 'mean'),
+                            Median=('_weight', 'median'),
+                        ).reset_index().rename(columns={
+                            '_year': 'Year',
+                            'Records': 'Records',
+                            'Total': f'Total {weight_col}',
+                            'Mean': f'Mean {weight_col}',
+                            'Median': f'Median {weight_col}',
+                        })
+                        # Force Year as int (no decimals in display)
+                        year_agg['Year'] = year_agg['Year'].astype(int)
+
+                        # KPI row
+                        kc1, kc2, kc3 = st.columns(3)
+                        kc1.metric("Years in selection", f"{len(year_agg)}")
+                        kc2.metric(f"Total {weight_col}",
+                                   f"{int(year_agg[f'Total {weight_col}'].sum()):,}")
+                        avg_per_year = year_agg[f'Total {weight_col}'].mean() if len(year_agg) else 0
+                        kc3.metric(f"Avg {weight_col} per year", f"{int(round(avg_per_year)):,}")
+
+                        # Trend bar chart
+                        fig_yr = px.bar(
+                            year_agg, x='Year', y=f'Total {weight_col}',
+                            title=f"{weight_col} by year — {period_label}",
+                            color=f'Total {weight_col}',
+                            color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                            hover_data=['Records', f'Mean {weight_col}', f'Median {weight_col}'],
+                        )
+                        fig_yr.update_layout(height=400, showlegend=False,
+                                             xaxis=dict(type='category'))
+                        st.plotly_chart(fig_yr, use_container_width=True)
+                        st.dataframe(year_agg, use_container_width=True, hide_index=True)
+
+                        # Year totals download
+                        _yr_bytes = _annotate_csv(
+                            year_agg, notes,
+                            extra_meta={'Tool': 'Collection Profiler',
+                                        'View': 'Yearly trends',
+                                        'Metric': weight_col,
+                                        'Period': period_label}
+                        )
+                        st.download_button(
+                            "📥 Yearly totals (CSV)",
+                            _yr_bytes, f"yearly_totals_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                            "text/csv", key="prof_title_dl_year",
+                        )
+                        _add_to_tray("profiler",
+                                     f"yearly_totals_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                                     _yr_bytes)
+
+                        # Top-N titles year-over-year
+                        st.markdown("---")
+                        st.markdown("**Top titles across years**")
+                        n_yoy = st.slider(
+                            "How many top titles to track?",
+                            3, 25, 10, key="prof_title_yoy_n",
+                            help="Picks the top N titles overall (by total usage across "
+                                 "selected years), then shows their usage in each year.",
+                        )
+                        # Identify overall top N titles
+                        top_titles_overall = (df_view.groupby(title_col)['_weight']
+                                              .sum()
+                                              .nlargest(n_yoy)
+                                              .index.tolist())
+                        if top_titles_overall:
+                            yoy_subset = df_view[df_view[title_col].isin(top_titles_overall)]
+                            yoy_pivot = (yoy_subset
+                                         .groupby([title_col, '_year'])['_weight']
+                                         .sum()
+                                         .reset_index()
+                                         .rename(columns={'_weight': weight_col,
+                                                          '_year': 'Year'}))
+                            yoy_pivot['Year'] = yoy_pivot['Year'].astype(int)
+
+                            fig_yoy = px.line(
+                                yoy_pivot, x='Year', y=weight_col, color=title_col,
+                                title=f"Top {n_yoy} titles — usage trajectory",
+                                markers=True,
+                            )
+                            fig_yoy.update_layout(
+                                height=max(400, n_yoy * 20),
+                                xaxis=dict(type='category'),
+                            )
+                            st.plotly_chart(fig_yoy, use_container_width=True)
+
+                            # Wide-format table: titles × years
+                            yoy_wide = yoy_pivot.pivot(
+                                index=title_col, columns='Year', values=weight_col
+                            ).fillna(0).astype(int)
+                            yoy_wide = yoy_wide.reindex(top_titles_overall)
+                            yoy_wide['Total'] = yoy_wide.sum(axis=1)
+                            yoy_wide = yoy_wide.sort_values('Total', ascending=False)
+                            st.dataframe(yoy_wide, use_container_width=True)
+
+                            # Download
+                            _yoy_bytes = _annotate_csv(
+                                yoy_wide.reset_index(), notes,
+                                extra_meta={'Tool': 'Collection Profiler',
+                                            'View': 'Yearly trends — top titles',
+                                            'Metric': weight_col,
+                                            'Top N': str(n_yoy),
+                                            'Period': period_label}
+                            )
+                            st.download_button(
+                                "📥 Top titles by year (CSV)",
+                                _yoy_bytes,
+                                f"top_titles_by_year_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                                "text/csv", key="prof_title_dl_yoy",
+                            )
+                            _add_to_tray("profiler",
+                                         f"top_titles_by_year_{_slug_period(period_label)}.csv".replace('_.', '.'),
+                                         _yoy_bytes)
 
                 # ---- Top titles ----
                 with ts_objs[ts_idx["Top titles"]]:
@@ -2241,10 +3842,18 @@ def page_collection_profiler():
             weight_label = "Title Count"
 
         if lc_col:
-            df['_lc_main'], df['_lc_sub'] = _extract_lc_vectorized(df[lc_col])
+            df['_lc_main'], df['_lc_sub'], df['_lc_number'] = _extract_lc_vectorized(df[lc_col])
+            # Vectorize range lookup using zip — small loop over rows, but each
+            # call is cheap and the total work scales with row count, not records.
+            df['_lc_range'] = [
+                lookup_lc_range(sub, num)
+                for sub, num in zip(df['_lc_sub'], df['_lc_number'])
+            ]
         else:
             df['_lc_main'] = None
             df['_lc_sub'] = None
+            df['_lc_number'] = None
+            df['_lc_range'] = None
 
         # Save to cache for future tool switches
         _store_cached_df("profiler", uploaded_file, df)
@@ -2299,10 +3908,16 @@ def page_collection_profiler():
 
     # If user picked a different LC column than what was auto-detected, re-extract
     if lc_col and lc_col != _original_lc_col:
-        df['_lc_main'], df['_lc_sub'] = _extract_lc_vectorized(df[lc_col])
+        df['_lc_main'], df['_lc_sub'], df['_lc_number'] = _extract_lc_vectorized(df[lc_col])
+        df['_lc_range'] = [
+            lookup_lc_range(sub, num)
+            for sub, num in zip(df['_lc_sub'], df['_lc_number'])
+        ]
     elif not lc_col:
         df['_lc_main'] = None
         df['_lc_sub'] = None
+        df['_lc_number'] = None
+        df['_lc_range'] = None
 
     if not subj_col and not lc_col:
         st.error("❌ Please pick at least a Subjects or LC Classification column above to continue.")
@@ -3128,926 +4743,7 @@ def page_usage_analyzer():
 
 # =====================================================================
 # =====================================================================
-# TOOL 3: ACQUISITION RECOMMENDATION SCORER
-# =====================================================================
-# "What should we buy next?"
-# Score candidate books against checkout history + optional faculty interests
-# =====================================================================
-# =====================================================================
-
-def _ensure_nltk():
-    """Download NLTK data if needed."""
-    if not NLTK_AVAILABLE:
-        return False
-    try:
-        nltk.data.find("tokenizers/punkt")
-        nltk.data.find("corpora/wordnet")
-    except LookupError:
-        nltk.download("punkt", quiet=True)
-        nltk.download("wordnet", quiet=True)
-        nltk.download("omw-1.4", quiet=True)
-    return True
-
-
-def normalize_author(author):
-    """Normalize author for lookup, generating reversed forms."""
-    if pd.isna(author) or not isinstance(author, str):
-        return set()
-    norm = normalize_text(author)
-    if len(norm) <= 2:
-        return set()
-    candidates = {norm}
-    if "," in author:
-        parts = [normalize_text(p) for p in author.split(",", 1)]
-        if len(parts) == 2 and parts[0] and parts[1]:
-            candidates.add(f"{parts[1]} {parts[0]}".strip())
-    return candidates
-
-
-REQUIRED_CHECKOUT_COLS = {"title", "checkouts"}
-RECOMMENDED_CHECKOUT_COLS = {"author", "subjects", "lc_classification"}
-REQUIRED_REC_COLS = {"title"}
-RECOMMENDED_REC_COLS = {"author", "subjects", "lc_classification"}
-
-
-def _suggest(col, candidates, threshold=0.75):
-    best, best_score = None, 0.0
-    for c in candidates:
-        score = SequenceMatcher(None, col.lower(), c.lower()).ratio()
-        if score > best_score:
-            best, best_score = c, score
-    return best if best_score >= threshold else None
-
-
-def validate_columns(df, required, recommended, file_label):
-    actual = set(df.columns.str.lower())
-    df.columns = df.columns.str.lower()
-    warnings = []
-    valid = True
-    for col in required:
-        if col not in actual:
-            suggestion = _suggest(col, actual)
-            hint = f" Did you mean **`{suggestion}`**?" if suggestion else ""
-            st.error(f"❌ **{file_label}** is missing required column `{col}`.{hint}")
-            valid = False
-    for col in recommended:
-        if col not in actual:
-            suggestion = _suggest(col, actual)
-            hint = f" (closest match: `{suggestion}`)" if suggestion else ""
-            warnings.append(f"`{col}` not found{hint} — scores for this factor will be 0")
-    return valid, warnings
-
-
-def validate_checkouts_numeric(df):
-    if "checkouts" not in df.columns:
-        return df
-    original = df["checkouts"].copy()
-    df["checkouts"] = pd.to_numeric(df["checkouts"], errors="coerce").fillna(0)
-    bad = original[df["checkouts"] == 0][original != 0].count()
-    if bad > 0:
-        st.warning(f"⚠️ {bad} rows in the checkouts column had non-numeric values and were set to 0.")
-    return df
-
-
-def consolidate_checkouts(df):
-    key_cols = [c for c in ["title", "author"] if c in df.columns]
-    if not key_cols:
-        return df
-    rows_before = len(df)
-    multi_year_titles = df[df.duplicated(subset=key_cols, keep=False)][key_cols[0]].nunique()
-    if multi_year_titles == 0:
-        return df
-    agg_rules = {}
-    for col in df.columns:
-        if col in key_cols:
-            continue
-        if col == "checkouts" or pd.api.types.is_numeric_dtype(df[col]):
-            agg_rules[col] = "sum"
-        else:
-            agg_rules[col] = "first"
-    consolidated = df.groupby(key_cols, as_index=False, sort=False).agg(agg_rules)
-    rows_after = len(consolidated)
-    st.info(f"📅 **Multi-year data:** {multi_year_titles} title(s) consolidated "
-            f"({rows_before} rows → {rows_after} unique titles). Checkouts summed.")
-    return consolidated.reset_index(drop=True)
-
-
-def check_duplicates_recommendations(df):
-    key_cols = [c for c in ["title", "author"] if c in df.columns]
-    if not key_cols:
-        return df
-    dupes = df.duplicated(subset=key_cols, keep="first").sum()
-    if dupes > 0:
-        st.warning(f"⚠️ Recommendations: {dupes} duplicate row(s) removed.")
-        df = df.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
-    return df
-
-
-def extract_all_subjects(df):
-    subject_counts = defaultdict(int)
-    if "subjects" not in df.columns:
-        return subject_counts
-    for subjects_str in df["subjects"].dropna():
-        for subject in split_subjects(subjects_str):
-            if subject:
-                subject_counts[subject] += 1
-    return dict(subject_counts)
-
-
-# Synonym map (kept in Tool 3 since only the scorer uses it)
-BUILTIN_SYNONYM_GROUPS = {
-    "radical_extreme": ["radical", "extreme", "extremist", "fringe", "militant", "revolutionary"],
-    "conservative": ["conservative", "traditional", "right-wing", "reactionary"],
-    "progressive_liberal": ["progressive", "liberal", "left-wing", "reformist"],
-    "equity_justice": ["equity", "equality", "justice", "fairness", "parity"],
-    "inclusion_diversity": ["inclusion", "diversity", "belonging", "representation", "multiculturalism"],
-    "discrimination": ["discrimination", "bias", "prejudice", "racism", "sexism", "oppression"],
-    "climate_change": ["climate change", "global warming", "greenhouse", "carbon", "emissions"],
-    "environment_ecology": ["environment", "ecology", "ecosystem", "biodiversity", "conservation", "sustainability"],
-    "mental_health": ["mental health", "mental illness", "psychiatric", "psychological", "wellbeing"],
-    "chronic_disease": ["chronic disease", "chronic illness", "long-term condition", "comorbidity"],
-    "infectious_disease": ["infectious disease", "epidemic", "pandemic", "outbreak", "pathogen"],
-    "violence": ["violence", "aggression", "assault", "brutality", "coercion"],
-    "war_conflict": ["war", "conflict", "warfare", "combat", "armed conflict", "insurgency"],
-    "migration": ["migration", "immigration", "emigration", "diaspora", "mobility"],
-    "refugee": ["refugee", "asylum seeker", "displaced person", "exile"],
-    "artificial_intelligence": ["artificial intelligence", "machine learning", "deep learning", "AI", "neural network"],
-    "data_privacy": ["privacy", "data protection", "surveillance", "tracking"],
-    "poverty_inequality": ["poverty", "inequality", "deprivation", "disadvantage", "underserved"],
-    "pedagogy_teaching": ["pedagogy", "teaching", "instruction", "education", "curriculum", "learning"],
-    "gender_identity": ["gender", "gender identity", "transgender", "nonbinary"],
-    "sexuality": ["sexuality", "sexual orientation", "LGBTQ", "queer"],
-    "race_ethnicity": ["race", "ethnicity", "racial", "ethnic"],
-    "religion_faith": ["religion", "faith", "spirituality", "theology"],
-}
-
-
-def build_synonym_map(stemmer, user_overrides_df=None):
-    groups = {label: list(terms) for label, terms in BUILTIN_SYNONYM_GROUPS.items()}
-    if user_overrides_df is not None and not user_overrides_df.empty:
-        for _, row in user_overrides_df.iterrows():
-            term = str(row.get("term", "")).strip()
-            label = str(row.get("group_label", "")).strip()
-            if term and label:
-                groups.setdefault(label, []).append(term)
-    synonym_map = {}
-    for label, terms in groups.items():
-        for term in terms:
-            norm = normalize_text(term)
-            for word in norm.split():
-                stemmed = stemmer.stem(word)
-                if len(stemmed) > 2:
-                    synonym_map.setdefault(stemmed, label)
-    return synonym_map
-
-
-def apply_synonym_map(terms, synonym_map):
-    return [synonym_map.get(t, t) for t in terms]
-
-
-class FacultyScorer:
-    def __init__(self, faculty_df, stemmer, synonym_map):
-        self.stemmer = stemmer
-        self.synonym_map = synonym_map
-        self.faculty_index = self._build_index(faculty_df)
-
-    def _tokenize(self, text):
-        norm = normalize_text(text) if text else ""
-        if not norm:
-            return []
-        stemmed = [self.stemmer.stem(w) for w in norm.split() if len(w) > 2]
-        return apply_synonym_map(stemmed, self.synonym_map)
-
-    def _build_index(self, faculty_df):
-        index = []
-        for _, row in faculty_df.iterrows():
-            name = str(row.get("name", "")).strip()
-            dept = str(row.get("department", "")).strip()
-            interests_raw = str(row.get("research_interests", ""))
-            tokens = set(self._tokenize(interests_raw))
-            if tokens:
-                index.append({"name": name, "department": dept, "tokens": tokens})
-        return index
-
-    def score(self, recommendation):
-        raw_subjects = recommendation.get("subjects", "")
-        raw_title = recommendation.get("title", "")
-        combined = f"{raw_subjects} {raw_title}"
-        rec_tokens = set(self._tokenize(combined))
-        if not rec_tokens or not self.faculty_index:
-            return 0.0, ""
-        best_score = 0.0
-        best_label = ""
-        for faculty in self.faculty_index:
-            fac_tokens = faculty["tokens"]
-            if not fac_tokens:
-                continue
-            intersection = rec_tokens & fac_tokens
-            union = rec_tokens | fac_tokens
-            if not union:
-                continue
-            jaccard = len(intersection) / len(union)
-            scaled = min(jaccard * 300, 100.0)
-            if scaled > best_score:
-                best_score = scaled
-                dept_str = f" ({faculty['department']})" if faculty["department"] else ""
-                best_label = f"{faculty['name']}{dept_str}"
-        return round(best_score, 2), best_label
-
-
-class RecommendationScorer:
-    def __init__(self, checkouts_df, synonym_map=None):
-        self.checkouts_df = checkouts_df
-        self.stemmer = SnowballStemmer("english")
-        self.synonym_map = synonym_map or {}
-        self.total_docs = len(checkouts_df)
-        self.semantic_groups = self._build_semantic_groups()
-        self.author_checkout_map = self._build_author_map()
-        self.lc_checkout_map = self._build_lc_map()
-        self.subject_terms = self._extract_subject_terms_enhanced()
-        self.term_frequencies = self._calculate_term_frequencies()
-
-    def _build_semantic_groups(self):
-        groups = {
-            "computer_science": ["comput", "programm", "softwar", "algorithm", "code"],
-            "artificial_intelligence": ["artifici", "intellig", "machin", "learn", "neural", "deep", "ai"],
-            "data_analytics": ["data", "analysi", "analyt", "statist", "visual", "databas"],
-            "psychology": ["psycholog", "mental", "health", "behavior", "cognit", "psychiatr"],
-            "sociology": ["sociolog", "social", "cultur", "commun", "society"],
-            "economics": ["econom", "market", "trade", "finance", "financi", "busi"],
-            "political_science": ["politic", "govern", "polici", "democrat", "elect", "legisl"],
-            "history": ["histor", "histori", "past", "ancient", "mediev", "modern", "war"],
-            "philosophy": ["philosoph", "ethic", "moral", "metaphys", "epistemolog"],
-            "literature": ["literatur", "novel", "fiction", "poetri", "drama", "narrat"],
-            "education": ["educ", "teach", "learn", "pedagog", "curriculum", "school"],
-            "law": ["law", "legal", "court", "justic", "judg", "attorney"],
-            "medicine": ["medicin", "medic", "health", "clinic", "hospit", "treatment", "diseas"],
-            "environmental": ["environ", "climat", "ecolog", "sustain", "conserv", "ecosyst"],
-            "biology": ["biolog", "life", "scienc", "organ", "cell", "geneti"],
-            "library_science": ["librari", "inform", "catalog", "bibliograph", "archiv", "collect"],
-            "gender_studies": ["gender", "feminis", "women", "masculin", "queer", "lgbt"],
-            "diversity": ["divers", "inclus", "equiti", "racial", "ethnic", "multicultural"],
-        }
-        term_to_group = {}
-        for group_id, terms in groups.items():
-            for term in terms:
-                term_to_group.setdefault(term, []).append(group_id)
-        return {"groups": groups, "term_to_group": term_to_group}
-
-    def _build_author_map(self):
-        author_map = defaultdict(list)
-        for _, row in self.checkouts_df.iterrows():
-            for candidate in normalize_author(row.get("author", "")):
-                author_map[candidate].append(row.get("checkouts", 0))
-        return dict(author_map)
-
-    def _build_lc_map(self):
-        lc_map = defaultdict(list)
-        for _, row in self.checkouts_df.iterrows():
-            if pd.notna(row.get("lc_classification")):
-                lc_prefix = extract_lc_prefix(row["lc_classification"])
-                if lc_prefix:
-                    lc_map[lc_prefix].append(row.get("checkouts", 0))
-        return dict(lc_map)
-
-    def _extract_subject_terms_enhanced(self):
-        all_terms = []
-        doc_term_counts = defaultdict(set)
-        unique_subject_docs = set()
-        for _, row in self.checkouts_df.iterrows():
-            if pd.notna(row.get("subjects")):
-                subjects = split_subjects(str(row["subjects"]))
-                checkouts = row.get("checkouts", 0)
-                for i, subject in enumerate(subjects):
-                    unique_subject_docs.add(subject)
-                    hw = 1.0 if i == 0 else 0.7
-                    for term in self._tokenize_and_stem(subject):
-                        all_terms.append((term, checkouts * hw, False))
-                        doc_term_counts[term].add(subject)
-                    for bigram in self._extract_bigrams(subject):
-                        all_terms.append((bigram, checkouts * hw * 1.3, True))
-                        doc_term_counts[bigram].add(subject)
-        total_subject_docs = max(len(unique_subject_docs), 1)
-        term_checkouts = defaultdict(list)
-        for term, checkout_count, _ in all_terms:
-            term_checkouts[term].append(checkout_count)
-        term_scores = {}
-        for term, counts in term_checkouts.items():
-            avg = sum(counts) / len(counts)
-            docs_with = len(doc_term_counts[term])
-            idf = np.log(total_subject_docs / (1 + docs_with))
-            term_scores[term] = avg * (1 + idf * 0.3)
-        return term_scores
-
-    def _extract_bigrams(self, text):
-        if not text:
-            return []
-        words = [w for w in text.split() if len(w) > 2]
-        return [f"{words[i]}_{words[i+1]}" for i in range(len(words) - 1)]
-
-    def _calculate_term_frequencies(self):
-        tf = Counter()
-        for _, row in self.checkouts_df.iterrows():
-            if pd.notna(row.get("subjects")):
-                norm = normalize_text(str(row["subjects"]))
-                tf.update(self._tokenize_and_stem(norm))
-        return tf
-
-    def _tokenize_and_stem(self, text):
-        norm = normalize_text(text) if text else ""
-        if not norm:
-            return []
-        stemmed = [self.stemmer.stem(w) for w in norm.split() if len(w) > 2]
-        return apply_synonym_map(stemmed, self.synonym_map)
-
-    def _get_synonyms(self, word):
-        synonyms = set()
-        for syn in wordnet.synsets(word):
-            for lemma in syn.lemmas():
-                synonyms.add(self.stemmer.stem(lemma.name().lower()))
-        return synonyms
-
-    def _get_semantic_matches(self, term):
-        matches = []
-        ttg = self.semantic_groups["term_to_group"]
-        if term in ttg:
-            groups = ttg[term]
-            for gid in groups:
-                for gt in self.semantic_groups["groups"][gid]:
-                    if gt in self.subject_terms:
-                        if gt in ttg:
-                            shared = set(groups) & set(ttg[gt])
-                            strength = len(shared) * 0.85
-                        else:
-                            strength = 0.85
-                        matches.append((gt, self.subject_terms[gt], strength))
-        return matches
-
-    def _fuzzy_match_terms(self, term, threshold=0.80):
-        max_score = 0
-        for existing_term in self.subject_terms:
-            sim = SequenceMatcher(None, term, existing_term).ratio()
-            if sim >= threshold:
-                max_score = max(max_score, self.subject_terms[existing_term])
-        return max_score
-
-    def _calculate_subject_similarity(self, recommendation):
-        raw = recommendation.get("subjects")
-        if pd.isna(raw) or not self.subject_terms:
-            return 0.0
-        norm = normalize_text(str(raw))
-        rec_terms = self._tokenize_and_stem(norm)
-        rec_bigrams = self._extract_bigrams(norm)
-        all_rec = rec_terms + rec_bigrams
-        if not all_rec:
-            return 0.0
-        total_score = 0
-        matched = 0
-        exact = 0
-        for rt in all_rec:
-            rec_syns = self._get_synonyms(rt.replace("_", " "))
-            rec_syns.add(rt)
-            max_ts = 0
-            if rt in self.subject_terms:
-                max_ts = self.subject_terms[rt] * 1.5
-                exact += 1
-            if max_ts == 0:
-                for syn in rec_syns:
-                    if syn in self.subject_terms:
-                        max_ts = max(max_ts, self.subject_terms[syn])
-            if max_ts == 0:
-                for _, ts, strength in self._get_semantic_matches(rt):
-                    max_ts = max(max_ts, ts * strength)
-            if max_ts == 0:
-                max_ts = self._fuzzy_match_terms(rt)
-            if max_ts > 0:
-                matched += 1
-                total_score += max_ts
-        if matched == 0:
-            return 0.0
-        avg = total_score / matched
-        max_c = max(self.subject_terms.values())
-        coverage = matched / len(all_rec)
-        exact_ratio = exact / len(all_rec)
-        cw = min(0.6 + 0.4 * coverage + 0.2 * exact_ratio, 1.0)
-        return (avg / max_c) * 100 * cw
-
-    def _calculate_lc_score(self, recommendation):
-        if pd.isna(recommendation.get("lc_classification")) or not self.lc_checkout_map:
-            return 0.0
-        lc_prefix = extract_lc_prefix(recommendation["lc_classification"])
-        if not lc_prefix or lc_prefix not in self.lc_checkout_map:
-            return 0.0
-        vals = self.lc_checkout_map[lc_prefix]
-        avg = sum(vals) / len(vals)
-        max_avg = max(sum(v) / len(v) for v in self.lc_checkout_map.values())
-        return (avg / max_avg) * 100
-
-    def _calculate_author_score(self, recommendation):
-        candidates = normalize_author(recommendation.get("author", ""))
-        if not candidates or not self.author_checkout_map:
-            return 0.0
-        max_avg = max(sum(v) / len(v) for v in self.author_checkout_map.values())
-        best = 0.0
-        for c in candidates:
-            if c in self.author_checkout_map:
-                vals = self.author_checkout_map[c]
-                avg = sum(vals) / len(vals)
-                best = max(best, (avg / max_avg) * 100)
-        return best
-
-    def score_recommendations(self, recommendations_df,
-                              subject_weight=0.5, lc_weight=0.3,
-                              author_weight=0.2, faculty_weight=0.0,
-                              faculty_scorer=None):
-        results = []
-        for _, rec in recommendations_df.iterrows():
-            ss = self._calculate_subject_similarity(rec)
-            ls = self._calculate_lc_score(rec)
-            aus = self._calculate_author_score(rec)
-            fs, mf = 0.0, ""
-            if faculty_scorer and faculty_weight > 0:
-                fs, mf = faculty_scorer.score(rec)
-            likelihood = ss * subject_weight + ls * lc_weight + aus * author_weight + fs * faculty_weight
-            d = rec.to_dict()
-            d["likelihood_score"] = round(likelihood, 2)
-            d["similarity_score"] = round(ss, 2)
-            d["checkout_volume_score"] = round(ls, 2)
-            d["author_popularity_score"] = round(aus, 2)
-            d["faculty_interest_score"] = round(fs, 2)
-            d["matched_faculty"] = mf
-            results.append(d)
-        rdf = pd.DataFrame(results)
-        rdf = rdf.sort_values("likelihood_score", ascending=False).reset_index(drop=True)
-        return rdf
-
-
-def generate_report(results_df):
-    lines = ["=" * 80, "LIBRARY BOOK RECOMMENDATION REPORT", "=" * 80, "",
-             "SUMMARY", "-" * 80,
-             f"Total Recommendations Analyzed: {len(results_df)}", ""]
-    high = len(results_df[results_df["likelihood_score"] >= 70])
-    medium = len(results_df[(results_df["likelihood_score"] >= 40) & (results_df["likelihood_score"] < 70)])
-    low = len(results_df[results_df["likelihood_score"] < 40])
-    lines += [
-        f"High Priority (70-100):   {high} books  ({high/max(1,len(results_df))*100:.1f}%)",
-        f"Medium Priority (40-69):  {medium} books  ({medium/max(1,len(results_df))*100:.1f}%)",
-        f"Low Priority (0-39):      {low} books  ({low/max(1,len(results_df))*100:.1f}%)",
-        "", "TOP 20 RECOMMENDATIONS", "=" * 80, "",
-    ]
-    for idx, row in results_df.head(20).iterrows():
-        lines += [
-            f"#{idx + 1}: {row['title']}",
-            f"   Author: {row.get('author', 'N/A')}",
-            f"   Overall Score: {row['likelihood_score']:.1f}/100",
-            f"   - Subject Similarity:    {row['similarity_score']:.1f}",
-            f"   - Checkout Volume:       {row['checkout_volume_score']:.1f}",
-            f"   - Author Popularity:     {row['author_popularity_score']:.1f}",
-            f"   - Faculty Interest:      {row.get('faculty_interest_score', 0.0):.1f}",
-            f"   - Matched Faculty:       {row.get('matched_faculty', 'N/A')}", "",
-        ]
-    return "\n".join(lines)
-
-
-def page_recommendation_scorer():
-    """Tool 3: Acquisition Recommendation Scorer."""
-    if not NLTK_AVAILABLE:
-        st.error("The `nltk` package is required for this tool. Install with: `pip install nltk`")
-        return
-    _ensure_nltk()
-
-    st.header("📊 Acquisition Recommendation Scorer")
-    st.markdown(
-        "**What should we buy next?** Score candidate books against your checkout "
-        "history to prioritize purchases."
-    )
-    with st.expander("ℹ️ When to use this tool"):
-        st.markdown(
-            "- **Collections:** Evaluating vendor slip lists and GOBI picks, approval-plan "
-            "exceptions, triaging faculty requests, flipping DDA candidates to purchase, "
-            "reviewing author/publisher lists for standing orders.\n"
-            "- **Instruction:** Occasionally — clusters of high-scoring recommendations in "
-            "one area can reveal curricular momentum worth a targeted info-lit session.\n"
-            "- **Outreach:** Showing faculty *why* a recommendation scored high (with "
-            "the faculty-interest score naming their research match) makes this a strong "
-            "conversation-starter at liaison meetings.\n\n"
-            "💡 For a broader view of your collection's LC distribution and subject "
-            "coverage, use the **Collection Profiler** (first tool in the sidebar)."
-        )
-
-
-    # File uploads
-    st.subheader("Step 1: Upload your data")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Checkouts File** — Required: `title`, `checkouts`; "
-                    "Recommended: `author`, `subjects`, `lc_classification`")
-        checkouts_file = st.file_uploader("Upload checkouts CSV", type=["csv"], key="rec_checkouts")
-    with c2:
-        st.markdown("**Recommendations File** — Required: `title`; "
-                    "Recommended: `author`, `subjects`, `lc_classification`")
-        recommendations_file = st.file_uploader("Upload recommendations CSV", type=["csv"], key="rec_recs")
-
-    c3, c4 = st.columns(2)
-    with c3:
-        st.markdown("**Faculty Research Interests** *(optional)* — "
-                    "Columns: `name`, `department`, `research_interests`")
-        faculty_file = st.file_uploader("Upload faculty CSV", type=["csv"], key="rec_faculty")
-    with c4:
-        st.markdown("**Custom Synonym Groups** *(optional)* — "
-                    "Columns: `term`, `group_label`")
-        synonym_file = st.file_uploader("Upload synonym CSV", type=["csv"], key="rec_synonyms")
-
-    if checkouts_file and recommendations_file:
-        try:
-            # Check session cache for each file independently (different shape/roles)
-            cached_co = _cached_df_for_tool("rec_checkouts", checkouts_file)
-            cached_rec = _cached_df_for_tool("rec_recommendations", recommendations_file)
-
-            if cached_co is not None and cached_rec is not None:
-                checkouts_df = cached_co.copy()
-                recommendations_df = cached_rec.copy()
-                st.success(f"✅ Using cached data for both files")
-            else:
-                with st.spinner("Loading and validating data..."):
-                    checkouts_df = pd.read_csv(checkouts_file)
-                    recommendations_df = pd.read_csv(recommendations_file)
-                _store_cached_df("rec_checkouts", checkouts_file, checkouts_df)
-                _store_cached_df("rec_recommendations", recommendations_file, recommendations_df)
-
-            co_valid, co_warns = validate_columns(checkouts_df, REQUIRED_CHECKOUT_COLS,
-                                                   RECOMMENDED_CHECKOUT_COLS, "Checkouts file")
-            re_valid, re_warns = validate_columns(recommendations_df, REQUIRED_REC_COLS,
-                                                   RECOMMENDED_REC_COLS, "Recommendations file")
-
-            if co_warns or re_warns:
-                with st.expander("⚠️ Column warnings"):
-                    for w in co_warns + re_warns:
-                        st.markdown(f"- {w}")
-            if not (co_valid and re_valid):
-                st.stop()
-
-            checkouts_df = validate_checkouts_numeric(checkouts_df)
-            checkouts_df = consolidate_checkouts(checkouts_df)
-            recommendations_df = check_duplicates_recommendations(recommendations_df)
-
-            # Faculty
-            faculty_df = None
-            if faculty_file:
-                faculty_df = pd.read_csv(faculty_file)
-                faculty_df.columns = faculty_df.columns.str.lower()
-                missing_fac = [c for c in ["name", "department", "research_interests"]
-                               if c not in faculty_df.columns]
-                if missing_fac:
-                    st.warning(f"⚠️ Faculty file missing: {missing_fac}. Faculty scoring disabled.")
-                    faculty_df = None
-                else:
-                    st.success(f"✅ Loaded {len(faculty_df)} faculty records")
-
-            # Synonyms
-            synonym_overrides_df = None
-            if synonym_file:
-                synonym_overrides_df = pd.read_csv(synonym_file)
-                synonym_overrides_df.columns = synonym_overrides_df.columns.str.lower()
-                if not {"term", "group_label"}.issubset(synonym_overrides_df.columns):
-                    st.warning("⚠️ Synonym file needs `term` and `group_label` columns.")
-                    synonym_overrides_df = None
-                else:
-                    st.success(f"✅ Loaded {len(synonym_overrides_df)} synonym mappings")
-
-            st.success(f"✅ Loaded {len(checkouts_df)} checkout records and "
-                       f"{len(recommendations_df)} recommendations")
-
-            with st.expander("📋 Preview Data"):
-                pc1, pc2 = st.columns(2)
-                with pc1:
-                    st.write("**Checkouts:**")
-                    st.dataframe(checkouts_df.head())
-                with pc2:
-                    st.write("**Recommendations:**")
-                    st.dataframe(recommendations_df.head())
-
-            # --- (Collection Insights panel removed — see Collection Profiler instead) ---
-
-            # Scoring configuration — preset-first, with manual override in advanced
-            st.subheader("Step 2: Choose scoring approach")
-
-            PRESETS = {
-                "Balanced": {"subject": 0.50, "lc": 0.30, "author": 0.20, "faculty": 0.00},
-                "Subject-focused": {"subject": 0.70, "lc": 0.20, "author": 0.10, "faculty": 0.00},
-                "Faculty-driven": {"subject": 0.35, "lc": 0.20, "author": 0.10, "faculty": 0.35},
-            }
-            # If faculty file is loaded, default to the preset that uses it
-            default_preset = "Faculty-driven" if faculty_df is not None else "Balanced"
-
-            # Initialize preset selection in session state
-            if "rec_preset_choice" not in st.session_state:
-                st.session_state["rec_preset_choice"] = default_preset
-
-            preset_options = list(PRESETS.keys()) + ["Advanced (custom weights)"]
-            # Disable Faculty-driven if no faculty file
-            preset_help = ("Pick how to weight the four scoring factors. "
-                           "Faculty-driven needs a faculty CSV (upload one above).")
-            preset_choice = st.radio(
-                "Scoring approach:",
-                preset_options,
-                index=preset_options.index(st.session_state["rec_preset_choice"])
-                      if st.session_state["rec_preset_choice"] in preset_options else 0,
-                horizontal=True,
-                key="rec_preset_choice",
-                help=preset_help,
-            )
-
-            if preset_choice in PRESETS:
-                w = PRESETS[preset_choice]
-                # If a preset wants faculty weight but no faculty file is loaded, warn and fall back
-                if w["faculty"] > 0 and faculty_df is None:
-                    st.warning(
-                        "**Faculty-driven** needs a faculty CSV. Upload one above or "
-                        "pick a different approach. Falling back to **Balanced** for now."
-                    )
-                    w = PRESETS["Balanced"]
-                subject_weight = w["subject"]
-                lc_weight = w["lc"]
-                author_weight = w["author"]
-                faculty_weight = w["faculty"]
-                # Show what the preset does in a compact caption
-                parts = []
-                parts.append(f"Subject {int(subject_weight*100)}%")
-                parts.append(f"LC {int(lc_weight*100)}%")
-                parts.append(f"Author {int(author_weight*100)}%")
-                if faculty_weight > 0:
-                    parts.append(f"Faculty {int(faculty_weight*100)}%")
-                st.caption(" · ".join(parts))
-            else:
-                # Advanced mode — keep the four sliders, with auto-normalize help
-                with st.container(border=True):
-                    st.caption(
-                        "Set any values you want; they'll be normalized to sum to 1.0 "
-                        "before scoring."
-                    )
-                    _fac_default = 0.15 if faculty_df is not None else 0.0
-                    wc1, wc2, wc3, wc4 = st.columns(4)
-                    with wc1:
-                        subject_weight = st.slider(
-                            "Subject Similarity", 0.0, 1.0,
-                            0.45 if faculty_df else 0.5, 0.05, key="rec_sw"
-                        )
-                    with wc2:
-                        lc_weight = st.slider(
-                            "LC Classification", 0.0, 1.0,
-                            0.25 if faculty_df else 0.3, 0.05, key="rec_lw"
-                        )
-                    with wc3:
-                        author_weight = st.slider(
-                            "Author Popularity", 0.0, 1.0,
-                            0.15 if faculty_df else 0.2, 0.05, key="rec_aw"
-                        )
-                    with wc4:
-                        faculty_weight = st.slider(
-                            "Faculty Interest", 0.0, 1.0, _fac_default, 0.05,
-                            disabled=(faculty_df is None), key="rec_fw"
-                        )
-                    raw_total = subject_weight + lc_weight + author_weight + faculty_weight
-                    if raw_total <= 0:
-                        st.error("All weights are zero — set at least one above 0.")
-                    else:
-                        # Auto-normalize silently
-                        subject_weight = subject_weight / raw_total
-                        lc_weight = lc_weight / raw_total
-                        author_weight = author_weight / raw_total
-                        faculty_weight = faculty_weight / raw_total
-                        st.caption(
-                            f"Normalized: Subject {subject_weight:.0%} · "
-                            f"LC {lc_weight:.0%} · Author {author_weight:.0%} · "
-                            f"Faculty {faculty_weight:.0%}"
-                        )
-
-            for key in ("rec_results", "rec_checkouts_scored", "rec_recs_scored",
-                        "rec_faculty_scored", "rec_weights"):
-                if key not in st.session_state:
-                    st.session_state[key] = None
-
-            if st.button("Score recommendations", type="primary", key="rec_score_btn"):
-                with st.spinner("Analyzing..."):
-                    _stemmer = SnowballStemmer("english")
-                    syn_map = build_synonym_map(_stemmer, synonym_overrides_df)
-                    scorer = RecommendationScorer(checkouts_df, synonym_map=syn_map)
-                    _faculty_scorer = None
-                    if faculty_df is not None and faculty_weight > 0:
-                        _faculty_scorer = FacultyScorer(faculty_df, _stemmer, syn_map)
-                    results_df = scorer.score_recommendations(
-                        recommendations_df,
-                        subject_weight=subject_weight, lc_weight=lc_weight,
-                        author_weight=author_weight, faculty_weight=faculty_weight,
-                        faculty_scorer=_faculty_scorer,
-                    )
-                st.success("✅ Analysis complete!")
-                st.session_state["rec_results"] = results_df
-                st.session_state["rec_checkouts_scored"] = checkouts_df
-                st.session_state["rec_recs_scored"] = recommendations_df
-                st.session_state["rec_faculty_scored"] = faculty_df
-                st.session_state["rec_weights"] = {
-                    "subject": subject_weight, "lc": lc_weight,
-                    "author": author_weight, "faculty": faculty_weight,
-                }
-
-            # Results display
-            if st.session_state["rec_results"] is not None:
-                results_df = st.session_state["rec_results"]
-                st.subheader("Step 3: Review results")
-
-                # Fresh tray for this render pass
-                _reset_tray("rec_scorer")
-
-                # Notes — annotate before downloading
-                notes = _notes_widget(
-                    "recommendation_scorer",
-                    placeholder="e.g., YBP slip list Nov 2025, sociology liaison review. "
-                                "Weights adjusted to favor faculty interest (Dr. Chen's lab)."
-                )
-
-                tab_r1, tab_r2, tab_r3, tab_r4 = st.tabs([
-                    "Scored recommendations", "Score distribution",
-                    "Subject analysis", "Faculty analysis"
-                ])
-
-                with tab_r1:
-                    high_p = results_df[results_df["likelihood_score"] >= 70]
-                    med_p = results_df[(results_df["likelihood_score"] >= 40) &
-                                        (results_df["likelihood_score"] < 70)]
-                    low_p = results_df[results_df["likelihood_score"] < 40]
-                    tc1, tc2, tc3, tc4 = st.columns(4)
-                    tc1.metric("Total Scored", len(results_df))
-                    tc2.metric("🟢 High (70+)", len(high_p))
-                    tc3.metric("🟡 Medium (40-69)", len(med_p))
-                    tc4.metric("🔴 Low (<40)", len(low_p))
-
-                    search = st.text_input("Search by title or author", "", key="rec_search")
-                    min_score = st.slider("Minimum score", 0, 100, 0, key="rec_min")
-                    filtered = results_df.copy()
-                    if search:
-                        mask = (filtered["title"].str.contains(search, case=False, na=False) |
-                                filtered.get("author", pd.Series(dtype=str))
-                                .str.contains(search, case=False, na=False))
-                        filtered = filtered[mask]
-                    filtered = filtered[filtered["likelihood_score"] >= min_score]
-
-                    def get_priority(s):
-                        if s >= 70: return "🟢 High"
-                        if s >= 40: return "🟡 Medium"
-                        return "🔴 Low"
-
-                    display = filtered.copy()
-                    display["Priority"] = display["likelihood_score"].apply(get_priority)
-                    pcols = ["Priority", "title", "author", "likelihood_score",
-                             "similarity_score", "checkout_volume_score",
-                             "author_popularity_score", "faculty_interest_score", "matched_faculty"]
-                    others = [c for c in display.columns if c not in pcols]
-                    display = display[[c for c in pcols if c in display.columns] + others]
-                    st.dataframe(display, use_container_width=True, height=600)
-
-                with tab_r2:
-                    scores = results_df["likelihood_score"]
-                    fig_hist = go.Figure()
-                    fig_hist.add_trace(go.Histogram(x=scores, nbinsx=20, marker_color="#285C4D"))
-                    fig_hist.add_vline(x=70, line_dash="dash", line_color="#2ecc71",
-                                       annotation_text="High (70)")
-                    fig_hist.add_vline(x=40, line_dash="dash", line_color="#f39c12",
-                                       annotation_text="Medium (40)")
-                    fig_hist.update_layout(title="Score Distribution",
-                                           xaxis_title="Score", yaxis_title="Count",
-                                           height=400, showlegend=False)
-                    st.plotly_chart(fig_hist, use_container_width=True)
-                    sc1, sc2, sc3 = st.columns(3)
-                    sc1.metric("Mean", f"{scores.mean():.1f}")
-                    sc2.metric("Median", f"{scores.median():.1f}")
-                    sc3.metric("Std Dev", f"{scores.std():.1f}")
-
-                with tab_r3:
-                    co_subj = extract_all_subjects(st.session_state["rec_checkouts_scored"])
-                    rec_subj = extract_all_subjects(st.session_state["rec_recs_scored"])
-                    sa1, sa2, sa3 = st.columns(3)
-                    sa1.metric("Checkout Subjects", len(co_subj))
-                    sa2.metric("Recommendation Subjects", len(rec_subj))
-                    overlap = len(set(co_subj) & set(rec_subj))
-                    sa3.metric("Common Subjects", overlap)
-
-                    common = {s: {"co": co_subj[s], "rec": rec_subj[s]}
-                              for s in set(co_subj) & set(rec_subj)}
-                    if common:
-                        cdf = pd.DataFrame([
-                            {"Subject": s, "In Checkouts": d["co"], "In Recommendations": d["rec"],
-                             "Total": d["co"] + d["rec"]}
-                            for s, d in common.items()
-                        ]).sort_values("Total", ascending=False)
-                        st.dataframe(cdf.head(30), use_container_width=True, height=400)
-
-                    gap_subj = {k: v for k, v in co_subj.items() if k not in rec_subj and v >= 2}
-                    if gap_subj:
-                        st.subheader("Recommendation gaps")
-                        st.markdown("High-circulation subjects missing from your recommendations list:")
-                        gdf = pd.DataFrame([
-                            {"Subject": s, "Checkout Occurrences": c}
-                            for s, c in sorted(gap_subj.items(), key=lambda x: -x[1])[:30]
-                        ])
-                        st.dataframe(gdf, use_container_width=True, height=300)
-
-                with tab_r4:
-                    fac_scored = st.session_state.get("rec_faculty_scored")
-                    if fac_scored is None:
-                        st.info("No faculty file uploaded. Upload one and re-score to see this analysis.")
-                    elif ("faculty_interest_score" not in results_df.columns
-                          or results_df["faculty_interest_score"].sum() == 0):
-                        st.warning("Faculty scores are zero — set faculty weight > 0 and re-score.")
-                    else:
-                        fac_results = results_df[results_df["matched_faculty"].str.strip() != ""].copy()
-                        fc1, fc2 = st.columns(2)
-                        fc1.metric("Faculty Members", len(fac_scored))
-                        fc2.metric("Matched Recommendations", len(fac_results))
-                        if len(fac_results) > 0:
-                            st.dataframe(
-                                fac_results.sort_values("faculty_interest_score", ascending=False)
-                                .head(20)[["title", "author", "likelihood_score",
-                                           "faculty_interest_score", "matched_faculty"]],
-                                use_container_width=True, height=400
-                            )
-
-                # Downloads
-                st.subheader("Downloads")
-                dc1, dc2, dc3 = st.columns(3)
-                _weights = st.session_state.get("rec_weights", {})
-                _weights_str = (f"subject={_weights.get('subject', 0)}, "
-                                f"lc={_weights.get('lc', 0)}, "
-                                f"author={_weights.get('author', 0)}, "
-                                f"faculty={_weights.get('faculty', 0)}")
-                with dc1:
-                    _full_bytes = _annotate_csv(results_df, notes,
-                                                extra_meta={'Tool': 'Recommendation Scorer',
-                                                            'View': 'Full Results',
-                                                            'Weights': _weights_str})
-                    st.download_button("📥 Full results (CSV)",
-                                       _full_bytes,
-                                       "recommendations_scored.csv", "text/csv",
-                                       key="rec_dl_full")
-                    _add_to_tray("rec_scorer", "recommendations_scored.csv", _full_bytes)
-                with dc2:
-                    high_df = results_df[results_df["likelihood_score"] >= 70]
-                    _high_bytes = _annotate_csv(high_df, notes,
-                                                extra_meta={'Tool': 'Recommendation Scorer',
-                                                            'View': 'High Priority (≥70)',
-                                                            'Weights': _weights_str})
-                    st.download_button("📥 High priority only (CSV)",
-                                       _high_bytes,
-                                       "recommendations_high_priority.csv", "text/csv",
-                                       key="rec_dl_high")
-                    _add_to_tray("rec_scorer", "recommendations_high_priority.csv", _high_bytes)
-                with dc3:
-                    # TXT report: prepend notes as a header block (not CSV, so different format)
-                    report_body = generate_report(results_df)
-                    if notes and notes.strip():
-                        from datetime import datetime
-                        notes_block = (
-                            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-                            f"Weights: {_weights_str}\n\n"
-                            f"NOTES\n{'-' * 80}\n{notes.strip()}\n\n"
-                        )
-                        report_body = notes_block + report_body
-                    st.download_button("📄 Report (TXT)", report_body,
-                                       "recommendation_report.txt", "text/plain",
-                                       key="rec_dl_txt")
-                    _add_to_tray("rec_scorer", "recommendation_report.txt", report_body)
-
-                # ZIP-all option
-                _render_download_tray("rec_scorer",
-                                      zip_filename="recommendation_scorer_results.zip")
-
-        except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
-            st.info("Check that your CSV files have the required columns.")
-    else:
-        st.info("Upload both a checkouts file and a recommendations file to begin.")
-
-    # Sidebar instructions
-    with st.sidebar:
-        st.markdown("---")
-        st.subheader("Scorer instructions")
-        st.markdown("""
-        1. Upload **checkouts CSV** *(required)*
-        2. Upload **recommendations CSV** *(required)*
-        3. Optionally add **faculty** and **synonym** CSVs
-        4. Adjust scoring weights
-        5. Click **Score Recommendations**
-
-        **Scores:** 🟢 70+ High · 🟡 40-69 Medium · 🔴 <40 Low
-        """)
-
-
-
-
-# =====================================================================
-# =====================================================================
-# TOOL 4: ZERO-USE IDENTIFIER
+# TOOL 3: ZERO-USE IDENTIFIER
 # =====================================================================
 # "What do we own that isn't being used at all?"
 # Two-file comparison: holdings universe vs. usage report.
@@ -4898,43 +5594,23 @@ def page_home():
         </div>
         """, unsafe_allow_html=True)
 
-    c3, c4 = st.columns(2)
-
-    with c3:
-        st.markdown("""
-        <div class="tool-card">
-            <h3>🔍 Zero-Use Identifier</h3>
-            <p><em>What do we own that isn't being used?</em></p>
-            <p>Compare a holdings list against a usage report to surface
-            titles, journals, or databases with no use at all.</p>
-            <hr>
-            <p><strong>Use for:</strong></p>
-            <ul>
-                <li>E-journal & database cancellation prep</li>
-                <li>Off-site storage candidates</li>
-                <li>Dead-weight in big-deal packages</li>
-                <li>Renewal evidence for admin/faculty</li>
-            </ul>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with c4:
-        st.markdown("""
-        <div class="tool-card">
-            <h3>📊 Acquisition Recommendation Scorer</h3>
-            <p><em>What should we buy next?</em></p>
-            <p>Score candidate books against checkout history +
-            faculty research interests. Subject, LC, author, faculty.</p>
-            <hr>
-            <p><strong>Use for:</strong></p>
-            <ul>
-                <li>Vendor slip list triage</li>
-                <li>Approval-plan exceptions</li>
-                <li>Faculty request review</li>
-                <li>DDA flip decisions</li>
-            </ul>
-        </div>
-        """, unsafe_allow_html=True)
+    # Zero-Use sits on its own row (wider, since it doesn't have a partner card)
+    st.markdown("""
+    <div class="tool-card">
+        <h3>🔍 Zero-Use Identifier</h3>
+        <p><em>What do we own that isn't being used?</em></p>
+        <p>Compare a holdings list against a usage report to surface
+        titles, journals, or databases with no use at all.</p>
+        <hr>
+        <p><strong>Use for:</strong></p>
+        <ul>
+            <li>E-journal & database cancellation prep</li>
+            <li>Off-site storage candidates</li>
+            <li>Dead-weight in big-deal packages</li>
+            <li>Renewal evidence for admin/faculty</li>
+        </ul>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.markdown("---")
     st.subheader("Quick decision guide")
@@ -4949,22 +5625,21 @@ def page_home():
     | Run monthly-trend analysis on formal COUNTER reports | **COUNTER Analyzer** |
     | Find what you own that's never been used | **Zero-Use Identifier** |
     | Identify e-journal/package titles with no use | **Zero-Use Identifier** (holdings vs. COUNTER) |
-    | Prioritize purchases from a vendor list | **Recommendation Scorer** |
-    | Match new books to specific faculty research | **Recommendation Scorer** (with faculty file) |
     | Find areas with strong use relative to holdings (or weak) | **Collection Profiler** → LC Analysis (Coverage vs. Use) |
-    | Find high-use areas missing from the catalog | **Recommendation Scorer** → Subject Analysis tab |
     """)
 
     st.markdown("---")
     with st.expander("ℹ️ About this dashboard"):
         st.markdown("""
-        **Version 2.3** — consolidated suite, simplified to four tools:
+        **Version 2.4 (slim)** — three collection-analysis tools:
         - **Collection Profiler** — three views (LC, Subject Term, Title) on
           catalog and admin-export files. Title Analysis absorbs the former
           Print Circulation analyzer.
         - **COUNTER Analyzer** — formal COUNTER 5 reports only.
         - **Zero-Use Identifier** — holdings vs. usage matching.
-        - **Acquisition Recommendation Scorer** — purchase prioritization.
+
+        The Acquisition Recommendation Scorer ("what should we buy next?") has
+        been extracted into its own standalone app — see `recommender_app.py`.
 
         **Design principles:**
         - Each tool answers a different decision question
@@ -4986,8 +5661,7 @@ def main():
             ["🏠 Home",
              "🗺️ Collection Profiler",
              "📊 COUNTER Analyzer",
-             "🔍 Zero-Use Identifier",
-             "🎯 Acquisition Recommendation Scorer"],
+             "🔍 Zero-Use Identifier"],
             index=0,
             key="nav"
         )
@@ -5001,8 +5675,6 @@ def main():
         page_counter_analyzer()
     elif page == "🔍 Zero-Use Identifier":
         page_zero_use_identifier()
-    elif page == "🎯 Acquisition Recommendation Scorer":
-        page_recommendation_scorer()
 
     _footer()
 
