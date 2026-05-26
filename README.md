@@ -10,8 +10,8 @@ A unified Streamlit application bundling three collection decision-support tools
 
 Coverage-led analysis across three views you move between in tabs:
 
-- **LC Analysis** — sunburst, treemap, LC × subject heatmap, gap analysis, coverage-vs-use, and sub-class range distribution (drilling below the two-letter subclass into specific LC numeric ranges like "HQ 1101–2030.7 Women, feminism, women's studies").
-- **Subject Term Analysis** — top subjects, word cloud, title-keyword n-grams. Powered by controlled-vocabulary subject headings when present.
+- **LC Analysis** — sunburst, treemap, LC × subject heatmap, gap analysis, coverage-vs-use, and sub-class range distribution (drilling below the two-letter subclass into specific LC numeric ranges like "HQ 1101–2030.7 Women, feminism, women's studies"). Every coverage-vs-use table and the range view offer a **"show the records behind this"** drill-down (see below).
+- **Subject Term Analysis** — top subjects, word cloud, title-keyword n-grams. Powered by controlled-vocabulary subject headings when present. The subject bars and subject coverage-vs-use both support the records drill-down.
 - **Title Analysis** — top titles by usage, weeding review, author summary, date-range filtering, and a yearly trends sub-tab that surfaces year-over-year shifts in usage. Activates only when a usage column is present.
 
 Accepts CSV or Excel files. Auto-detects Title, Subjects, LC Classification, usage (Loans/Checkouts/Total Accesses/Views/Downloads), Author, Location, and Date columns. Works on Alma title exports, Alma circulation exports, digital platform views, and vendor admin reports like the EBSCO Detailed Report.
@@ -29,6 +29,24 @@ If your file is a vendor *admin* export with subjects and LC (e.g., EBSCO Detail
 **What do we own that isn't being used?**
 
 Two-file comparison. Upload a holdings file (the "universe") and a usage file (what you have evidence of use for). The tool runs a multi-identifier matching cascade — ISBN, ISSN, DOI, OCLC, then title+author fallback — and surfaces holdings that don't appear in the usage data. Includes a Match Preview tab for spot-checking joins, configurable pub-year cutoff, and an optional "treat unmatched as zero-use" toggle.
+
+## Drilling into the records behind a conclusion
+
+Every analytical view in the Profiler ends at an aggregate — "HQ Women/Feminism is 738 records, 1,337 loans," or "this range is overperforming," or "usage jumped in 2025." The natural next question is always *which actual titles drive that?* The drill-downs answer it without leaving the tool.
+
+Wherever a conclusion is surfaced, a **🔎 "show the records behind this"** control appears. Pick the range, subclass, LC class, or subject you want to inspect, and the underlying titles open in an expander right there — already scoped to exactly what you clicked. Then refine within that scope:
+
+- **Usage filter** — All, zero-usage only, at-or-below a threshold, or at-or-above a threshold. (Zero-usage-only is the fast path to weeding candidates within a flagged range.)
+- **Year range** — narrow to specific years when the file carries usage dates.
+- **Sort** — by usage (either direction), title, author, call number, or year.
+- **Columns** — toggle which fields show in the table.
+- **Export** — download the refined record list as CSV (with your analysis notes baked in), automatically added to the page's download tray.
+
+The drill-down appears in five places: range-level coverage-vs-use, subclass-level coverage-vs-use, LC main-class coverage-vs-use, subject coverage-vs-use, and the top-subjects bar chart. In each coverage-vs-use view, **flagged areas (over- and underperforming) are listed first** in the picker, so auditing a signal is one click away.
+
+A worked example: the LC Analysis tab flags HQ 1101–2030.7 as a range worth examining. Open its drill-down, sort by loans descending, and you see *Bodies That Matter*, *Gender Trouble*, and the other titles actually driving the number — the difference between telling a liaison "the data says HQ feminism is strong" and "these specific Butler titles are why."
+
+**One caveat on subject drill-downs:** subject matching is a case-insensitive substring match against the raw subjects column, so it can occasionally over-match (e.g., a search for a short term catching it inside a longer word). Counts in subject drill-downs may run slightly generous; the LC-based drill-downs (range, subclass, class) are exact.
 
 ## Run locally
 
@@ -80,6 +98,7 @@ The wordcloud, matplotlib, openpyxl, and xlrd packages are soft dependencies —
 - **Download tray**: each tool bundles every artifact it produced (CSVs, images, tables) into a single ZIP at the bottom of the page. No hunting for individual download buttons.
 - **Memory-efficient loading**: large files (500K–1M+ rows) are read with `usecols` filtering to keep only relevant columns in memory.
 - **Range catalog**: the Profiler's LC Analysis tab uses a curated catalog of 212 LC subclasses with 592 ranges drawn from the LC Classification Outline. Subclasses without curated ranges fall back to hundreds-bucketing (e.g., "F 1400s").
+- **Records drill-downs**: every Profiler conclusion (coverage-vs-use signals, range distributions, subject frequencies) can be expanded into the underlying titles, filtered and sorted in place, and exported. No new upload required — drill-downs run on the file already loaded.
 
 ## Related files
 
@@ -93,6 +112,8 @@ The wordcloud, matplotlib, openpyxl, and xlrd packages are soft dependencies —
 The dashboard ships with Tulane green (`#285C4D`) and blue (`#71C5E8`) hardcoded, plus Source Serif 4 and DM Sans font references in the CSS. Edit the `<style>` block near the top of `library_dashboard_slim.py` to change colors or fonts.
 
 ## Version
+
+**v2.5 (slim)** — Added inline "show the records behind this" drill-downs across the Profiler's coverage-vs-use views, range distribution, and subject bars, with in-place usage/year filtering, sorting, and export.
 
 **v2.4 (slim)** — Acquisition Recommendation Scorer extracted to standalone app. NLTK no longer a runtime dependency. Profiler retains the full range catalog, yearly trends, and range-level Coverage-vs-Use added in v2.3.
 
