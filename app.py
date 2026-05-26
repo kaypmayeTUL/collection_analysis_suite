@@ -26,6 +26,9 @@ A unified Streamlit application bundling three collection decision-support tools
      (ISBN, ISSN, DOI, OCLC, title+author fallback). Feeds cancellation prep,
      off-site storage candidates, and renewal evidence.
 
+v2.5 (slim) — Added inline "show the records behind this" drill-downs across the
+       Profiler's coverage-vs-use views, range distribution, and subject bars,
+       with in-place usage/year filtering, sorting, and CSV export.
 v2.4 (slim) — Acquisition Recommendation Scorer extracted to its own standalone
        app (recommender_app.py). This edition focuses on the three
        collection-analysis tools. NLTK is no longer a runtime dependency.
@@ -2363,7 +2366,195 @@ def _build_cvu_table(titles_dict, usage_dict, total_titles, total_usage,
     return pd.DataFrame(rows)
 
 
-def _render_coverage_vs_use_by_subject(results, settings, notes=""):
+def _records_drilldown(records_df, key_prefix, *, title_col=None,
+                       weight_col=None, author_col=None, location_col=None,
+                       has_year=False, has_usage=False, weight_label="Usage",
+                       notes="", context_label="", expanded=False):
+    """Shared 'show the records behind this' drill-down panel.
+
+    Renders an expander containing the underlying records for whatever
+    aggregate the caller has already filtered to (an LC range, a subclass, a
+    subject term, etc.). The caller pre-filters; this helper handles the rich
+    secondary refinement that's identical everywhere:
+
+      - usage threshold slider (when a usage column exists)
+      - year range filter (when a _year column exists)
+      - sort control (by usage, title, author, call number, year)
+      - column visibility toggle
+      - record count + sortable table + CSV export to the download tray
+
+    Args:
+      records_df:    already-scoped slice (rows for the clicked aggregate).
+                     Expected to carry _weight / _year / _lc_sub / _lc_number /
+                     _lc_range where available.
+      key_prefix:    unique widget-key prefix so multiple drill-downs coexist
+                     on the same page without key collisions.
+      context_label: human-readable description of the scope (e.g.
+                     "HQ 1101–2030.7 — Women, feminism" or "Subject: sociology").
+                     Shown in the expander header and baked into export metadata.
+      expanded:      whether the expander starts open (default False).
+    """
+    n_records = len(records_df)
+    header = f"🔎 Show the {n_records:,} record{'s' if n_records != 1 else ''} behind this"
+    if context_label:
+        header += f"  ·  {context_label}"
+
+    with st.expander(header, expanded=expanded):
+        if n_records == 0:
+            st.caption("No records match this selection.")
+            return
+
+        work = records_df.copy()
+
+        # --- Secondary refinement controls ---
+        # Lay them across columns so the panel stays compact.
+        ctrl_cols = st.columns(3)
+
+        # (1) Usage threshold — only meaningful with a usage column
+        with ctrl_cols[0]:
+            if has_usage and weight_col and '_weight' in work.columns:
+                wmax = int(work['_weight'].max()) if n_records else 0
+                if wmax > 0:
+                    mode = st.selectbox(
+                        f"{weight_label} filter",
+                        ["All", "Zero only", "At or below…", "At or above…"],
+                        key=f"{key_prefix}_umode",
+                    )
+                    if mode == "Zero only":
+                        work = work[work['_weight'] <= 0]
+                    elif mode in ("At or below…", "At or above…"):
+                        thr = st.number_input(
+                            f"{weight_label} threshold",
+                            min_value=0, max_value=wmax,
+                            value=0 if mode == "At or below…" else wmax,
+                            key=f"{key_prefix}_uthr",
+                        )
+                        if mode == "At or below…":
+                            work = work[work['_weight'] <= thr]
+                        else:
+                            work = work[work['_weight'] >= thr]
+                else:
+                    st.caption("No usage values to filter.")
+            else:
+                st.caption("No usage column.")
+
+        # (2) Year range — only when a _year column exists
+        with ctrl_cols[1]:
+            if has_year and '_year' in work.columns:
+                yrs = sorted(int(y) for y in work['_year'].dropna().unique())
+                if len(yrs) > 1:
+                    y_lo, y_hi = st.select_slider(
+                        "Year range",
+                        options=yrs,
+                        value=(yrs[0], yrs[-1]),
+                        key=f"{key_prefix}_yrs",
+                    )
+                    work = work[(work['_year'] >= y_lo) & (work['_year'] <= y_hi)]
+                elif len(yrs) == 1:
+                    st.caption(f"All from {yrs[0]}.")
+                else:
+                    st.caption("No year data.")
+            else:
+                st.caption("No year column.")
+
+        # (3) Sort control
+        with ctrl_cols[2]:
+            sort_opts = []
+            if has_usage and '_weight' in work.columns:
+                sort_opts.append(f"{weight_label} (high→low)")
+                sort_opts.append(f"{weight_label} (low→high)")
+            if title_col and title_col in work.columns:
+                sort_opts.append("Title (A→Z)")
+            if author_col and author_col in work.columns:
+                sort_opts.append("Author (A→Z)")
+            if '_lc_number' in work.columns:
+                sort_opts.append("Call number")
+            if has_year and '_year' in work.columns:
+                sort_opts.append("Year (newest)")
+                sort_opts.append("Year (oldest)")
+            sort_opts = sort_opts or ["(none)"]
+            sort_choice = st.selectbox("Sort by", sort_opts, key=f"{key_prefix}_sort")
+
+        # Apply sort
+        if sort_choice.startswith(weight_label) and '_weight' in work.columns:
+            work = work.sort_values('_weight', ascending="low→high" in sort_choice)
+        elif sort_choice == "Title (A→Z)" and title_col in work.columns:
+            work = work.sort_values(title_col)
+        elif sort_choice == "Author (A→Z)" and author_col and author_col in work.columns:
+            work = work.sort_values(author_col)
+        elif sort_choice == "Call number":
+            sort_keys = [c for c in ['_lc_sub', '_lc_number'] if c in work.columns]
+            if sort_keys:
+                work = work.sort_values(sort_keys)
+        elif sort_choice.startswith("Year"):
+            work = work.sort_values('_year', ascending="oldest" in sort_choice)
+
+        # --- Build the display frame: friendly columns only ---
+        display_map = []
+        if title_col and title_col in work.columns:
+            display_map.append((title_col, 'Title'))
+        if author_col and author_col in work.columns:
+            display_map.append((author_col, 'Author'))
+        if '_lc_sub' in work.columns:
+            display_map.append(('_lc_sub', 'LC Subclass'))
+        if '_lc_number' in work.columns:
+            display_map.append(('_lc_number', 'LC Number'))
+        if '_lc_range' in work.columns:
+            display_map.append(('_lc_range', 'LC Range'))
+        if location_col and location_col in work.columns:
+            display_map.append((location_col, 'Location'))
+        if has_year and '_year' in work.columns:
+            display_map.append(('_year', 'Year'))
+        if has_usage and '_weight' in work.columns:
+            display_map.append(('_weight', weight_label))
+
+        if not display_map:
+            st.caption("No displayable columns.")
+            return
+
+        # Optional column visibility toggle
+        all_display_names = [name for _, name in display_map]
+        chosen = st.multiselect(
+            "Columns to show",
+            options=all_display_names,
+            default=all_display_names,
+            key=f"{key_prefix}_cols",
+        )
+        if not chosen:
+            chosen = all_display_names  # never show an empty table
+
+        view = work[[src for src, name in display_map if name in chosen]].copy()
+        view.columns = [name for _, name in display_map if name in chosen]
+
+        # Tidy the year column (no decimals) and LC number
+        if 'Year' in view.columns:
+            view['Year'] = view['Year'].astype('Int64')
+        if 'LC Number' in view.columns:
+            view['LC Number'] = view['LC Number'].round(2)
+
+        st.caption(f"Showing {len(view):,} record{'s' if len(view) != 1 else ''} "
+                   f"after refinement.")
+        st.dataframe(view, use_container_width=True, hide_index=True, height=360)
+
+        # Export — to the profiler tray + a direct button
+        safe_ctx = (context_label or "records").replace(' ', '_').replace('/', '-')
+        safe_ctx = ''.join(ch for ch in safe_ctx if ch.isalnum() or ch in '_-.')[:60]
+        fname = f"records_{safe_ctx}.csv"
+        _rec_bytes = _annotate_csv(
+            view, notes,
+            extra_meta={'Tool': 'Collection Profiler',
+                        'View': 'Records drill-down',
+                        'Scope': context_label or '(unscoped)',
+                        'Records': len(view)}
+        )
+        st.download_button(
+            "📥 These records (CSV)", _rec_bytes, fname, "text/csv",
+            key=f"{key_prefix}_dl",
+        )
+        _add_to_tray("profiler", fname, _rec_bytes)
+
+
+def _render_coverage_vs_use_by_subject(results, settings, notes="", records_ctx=None):
     """Coverage vs. Use broken down by Subject term.
 
     Used when the file has a usage column but no LC/call number (e.g., ProQuest
@@ -2449,9 +2640,50 @@ def _render_coverage_vs_use_by_subject(results, settings, notes=""):
                        "text/csv", key='prof_dl_cvu_subj')
     _add_to_tray("profiler", "coverage_vs_use_by_subject.csv", _bytes)
 
+    # --- Drill-down: records tagged with a chosen subject ---
+    if records_ctx is not None and records_ctx.get('subject_col'):
+        _rdf = records_ctx['df']
+        scol = records_ctx['subject_col']
+        if scol in _rdf.columns:
+            subj_options = subj_df['Subject'].dropna().tolist()
+            if subj_options:
+                pick_subj = st.selectbox(
+                    "🔎 Inspect the records tagged with a subject",
+                    options=["(choose a subject)"] + subj_options,
+                    key="prof_cvu_subj_drill_pick",
+                    help="Records whose subject field contains the chosen term "
+                         "(case-insensitive substring match).",
+                )
+                if pick_subj != "(choose a subject)":
+                    # Substring match against the raw subject column. The CVU
+                    # table's subject terms come from normalized/split subjects,
+                    # so we match case-insensitively on the contained term.
+                    mask = _rdf[scol].astype(str).str.contains(
+                        re.escape(pick_subj), case=False, na=False
+                    )
+                    scope = _rdf[mask]
+                    _records_drilldown(
+                        scope, key_prefix=f"cvu_subj_{abs(hash(pick_subj)) % 100000}",
+                        title_col=records_ctx.get('title_col'),
+                        weight_col=records_ctx.get('weight_col'),
+                        author_col=records_ctx.get('author_col'),
+                        location_col=records_ctx.get('location_col'),
+                        has_year=records_ctx.get('has_year', False),
+                        has_usage=records_ctx.get('has_usage', False),
+                        weight_label=records_ctx.get('weight_label', 'Usage'),
+                        notes=notes,
+                        context_label=f"Subject: {pick_subj}",
+                        expanded=True,
+                    )
 
-def _render_coverage_vs_use(results, settings, notes=""):
-    """Render the Coverage vs. Use section — the core 'what we have vs what's used' view."""
+
+def _render_coverage_vs_use(results, settings, notes="", records_ctx=None):
+    """Render the Coverage vs. Use section — the core 'what we have vs what's used' view.
+
+    records_ctx (optional dict) enables 'show the records behind this' drill-downs.
+    Expected keys: df, title_col, weight_col, author_col, location_col,
+    has_year, has_usage, weight_label.
+    """
     st.markdown("---")
     st.subheader("Coverage vs. use")
     st.markdown(
@@ -2519,6 +2751,44 @@ def _render_coverage_vs_use(results, settings, notes=""):
                        "coverage_vs_use_main.csv", "text/csv",
                        key='prof_dl_cvu_main')
     _add_to_tray("profiler", "coverage_vs_use_main.csv", _cvu_main_bytes)
+
+    # --- Drill-down: records behind a chosen LC main class ---
+    if records_ctx is not None and '_lc_main' in records_ctx['df'].columns:
+        _rdf = records_ctx['df']
+        # Offer the flagged (over/under) classes first since those are the
+        # ones a user most wants to audit, then any class with data.
+        flagged_first = main_df.copy()
+        flagged_first['_rank'] = flagged_first['Assessment'].map(
+            {"🟢 Overperforming": 0, "🔴 Underperforming": 1,
+             "✅ Proportional": 2, "—": 3}
+        ).fillna(4)
+        ordered_classes = (flagged_first.sort_values(['_rank'])
+                           ['LC Class'].tolist())
+        if ordered_classes:
+            pick = st.selectbox(
+                "🔎 Inspect the records behind a main class",
+                options=["(choose a class)"] + ordered_classes,
+                key="prof_cvu_main_drill_pick",
+                help="Pick an LC main class to see the underlying titles — "
+                     "useful for auditing why a class is flagged over- or "
+                     "underperforming.",
+            )
+            if pick != "(choose a class)":
+                scope = _rdf[_rdf['_lc_main'] == pick]
+                row = main_df[main_df['LC Class'] == pick]
+                assess = row['Assessment'].iloc[0] if not row.empty else ""
+                ctx_label = f"LC {pick} – {LC_CLASSES.get(pick, '?')} {assess}".strip()
+                _records_drilldown(
+                    scope, key_prefix=f"cvu_main_{pick}",
+                    title_col=records_ctx.get('title_col'),
+                    weight_col=records_ctx.get('weight_col'),
+                    author_col=records_ctx.get('author_col'),
+                    location_col=records_ctx.get('location_col'),
+                    has_year=records_ctx.get('has_year', False),
+                    has_usage=records_ctx.get('has_usage', False),
+                    weight_label=records_ctx.get('weight_label', 'Usage'),
+                    notes=notes, context_label=ctx_label, expanded=True,
+                )
 
     # Scatter plot: % titles vs % use, with diagonal reference line
     plot_df = main_df[main_df['Assessment'] != "—"].copy()
@@ -2611,6 +2881,33 @@ def _render_coverage_vs_use(results, settings, notes=""):
                                "coverage_vs_use_subclass.csv", "text/csv",
                                key='prof_dl_cvu_sub')
             _add_to_tray("profiler", "coverage_vs_use_subclass.csv", _cvu_sub_bytes)
+
+            # --- Drill-down: records behind a chosen subclass ---
+            if records_ctx is not None and '_lc_sub' in records_ctx['df'].columns:
+                _rdf = records_ctx['df']
+                sub_ordered = (sub_df_display['LC Subclass']
+                               .dropna().tolist())
+                if sub_ordered:
+                    pick_sub = st.selectbox(
+                        "🔎 Inspect the records behind a subclass",
+                        options=["(choose a subclass)"] + sub_ordered,
+                        key="prof_cvu_sub_drill_pick",
+                    )
+                    if pick_sub != "(choose a subclass)":
+                        scope = _rdf[_rdf['_lc_sub'] == pick_sub]
+                        _records_drilldown(
+                            scope, key_prefix=f"cvu_sub_{pick_sub}",
+                            title_col=records_ctx.get('title_col'),
+                            weight_col=records_ctx.get('weight_col'),
+                            author_col=records_ctx.get('author_col'),
+                            location_col=records_ctx.get('location_col'),
+                            has_year=records_ctx.get('has_year', False),
+                            has_usage=records_ctx.get('has_usage', False),
+                            weight_label=records_ctx.get('weight_label', 'Usage'),
+                            notes=notes,
+                            context_label=f"Subclass {pick_sub}",
+                            expanded=True,
+                        )
 
     # Interpretive callout
     over_count = (main_df['Assessment'] == "🟢 Overperforming").sum()
@@ -2832,7 +3129,7 @@ def _render_title_keywords(results, settings, notes=""):
 def _profiler_display_results(results, settings, df, idx,
                               title_col=None, weight_col=None,
                               author_col=None, date_col=None,
-                              location_col=None):
+                              location_col=None, subj_col=None):
     """Render Profiler results in three top-level tabs: LC Analysis, Subject
     Term Analysis, and Title Analysis.
 
@@ -2878,6 +3175,37 @@ def _profiler_display_results(results, settings, df, idx,
         placeholder="e.g., Prepared for sociology accreditation report, Nov 2025. "
                     "Follow-up: discuss HQ underperformance with Dr. Chen."
     )
+
+    # ---- Shared records context for 'show the records behind this' drill-downs ----
+    # Built once here so every analytical view can offer a drill-down into the
+    # underlying titles. The records frame is the filtered view (df.loc[idx]),
+    # augmented with a _year column when a date/year column was detected so the
+    # drill-down's year filter works. All of _lc_sub / _lc_number / _lc_range /
+    # _weight are already present from upstream processing.
+    _records_ctx = None
+    if df is not None:
+        _rec_df = df.loc[idx] if idx is not None else df
+        _ctx_has_year = False
+        if date_col and date_col in _rec_df.columns:
+            _rec_df = _rec_df.copy()
+            _src = _rec_df[date_col]
+            if pd.api.types.is_numeric_dtype(_src):
+                _rec_df['_year'] = pd.to_numeric(_src, errors='coerce').astype('Int64')
+            else:
+                _parsed = pd.to_datetime(_src, errors='coerce')
+                _rec_df['_year'] = _parsed.dt.year.astype('Int64')
+            _ctx_has_year = _rec_df['_year'].notna().any()
+        _records_ctx = {
+            'df': _rec_df,
+            'title_col': title_col,
+            'weight_col': weight_col,
+            'author_col': author_col,
+            'location_col': location_col,
+            'subject_col': subj_col,
+            'has_year': bool(_ctx_has_year),
+            'has_usage': bool(has_usage),
+            'weight_label': usage_col_label if has_usage else wl,
+        }
 
     # ---- Three top-level tabs ----
     st.markdown("---")
@@ -2944,7 +3272,8 @@ def _profiler_display_results(results, settings, df, idx,
             # --- Coverage vs. Use (LC-based, when LC + usage are both present) ---
             if settings.get('show_coverage_vs_use') and results.get('cvu_available'):
                 st.markdown("---")
-                _render_coverage_vs_use(results, settings, notes=notes)
+                _render_coverage_vs_use(results, settings, notes=notes,
+                                        records_ctx=_records_ctx)
 
             # --- Gap analysis ---
             if settings['show_gap_analysis']:
@@ -3262,6 +3591,56 @@ def _profiler_display_results(results, settings, df, idx,
                                     _add_to_tray("profiler",
                                                  "coverage_vs_use_ranges.csv",
                                                  _cvu_range_bytes)
+
+                                    # --- Drill-down: records behind a chosen range ---
+                                    if '_lc_range' in df_subs.columns:
+                                        # Order flagged ranges first for quick auditing
+                                        _rank_map = {"🟢 Overperforming": 0,
+                                                     "🔴 Underperforming": 1,
+                                                     "✅ Proportional": 2, "—": 3}
+                                        _cvu_sorted = cvu_range_df.copy()
+                                        _cvu_sorted['_rank'] = _cvu_sorted[
+                                            'Assessment'].map(_rank_map).fillna(4)
+                                        range_opts = (_cvu_sorted
+                                                      .sort_values('_rank')
+                                                      ['Range'].dropna().tolist())
+                                        if range_opts:
+                                            pick_rng = st.selectbox(
+                                                "🔎 Inspect the records behind a range",
+                                                options=["(choose a range)"] + range_opts,
+                                                key="prof_cvu_range_drill_pick",
+                                                help="Flagged ranges are listed first. "
+                                                     "Pick one to audit the titles behind "
+                                                     "the over/underperforming signal.",
+                                            )
+                                            if pick_rng != "(choose a range)":
+                                                # Pull scope from the records-ctx
+                                                # frame (it carries _year); fall
+                                                # back to df_subs if ctx absent.
+                                                _scope_src = (_records_ctx['df']
+                                                              if _records_ctx is not None
+                                                              else df_subs)
+                                                scope = _scope_src[
+                                                    _scope_src['_lc_range'] == pick_rng
+                                                ]
+                                                _arow = cvu_range_df[
+                                                    cvu_range_df['Range'] == pick_rng]
+                                                _assess = (_arow['Assessment'].iloc[0]
+                                                           if not _arow.empty else "")
+                                                _records_drilldown(
+                                                    scope,
+                                                    key_prefix=f"cvu_rng_{abs(hash(pick_rng)) % 100000}",
+                                                    title_col=title_col,
+                                                    weight_col=weight_col,
+                                                    author_col=author_col,
+                                                    location_col=location_col,
+                                                    has_year=(_records_ctx or {}).get('has_year', False),
+                                                    has_usage=has_usage,
+                                                    weight_label=usage_col_label if has_usage else wl,
+                                                    notes=notes,
+                                                    context_label=f"{pick_rng} {_assess}".strip(),
+                                                    expanded=True,
+                                                )
                             else:
                                 st.info("Need both holdings and usage data within the "
                                         "selected subclasses to compute coverage vs. use.")
@@ -3331,6 +3710,36 @@ def _profiler_display_results(results, settings, df, idx,
                                    "text/csv", key='prof_dl_subj')
                 _add_to_tray("profiler", "subject_frequencies.csv", _subj_bytes)
 
+                # --- Drill-down: records tagged with a top subject ---
+                if (_records_ctx is not None and _records_ctx.get('subject_col')
+                        and _records_ctx['subject_col'] in _records_ctx['df'].columns):
+                    subj_bar_opts = [s for s, _ in top_subjects]
+                    pick_sb = st.selectbox(
+                        "🔎 Inspect the records tagged with a subject",
+                        options=["(choose a subject)"] + subj_bar_opts,
+                        key="prof_subjbar_drill_pick",
+                        help="Records whose subject field contains the chosen term.",
+                    )
+                    if pick_sb != "(choose a subject)":
+                        _sc = _records_ctx['subject_col']
+                        _mask = _records_ctx['df'][_sc].astype(str).str.contains(
+                            re.escape(pick_sb), case=False, na=False
+                        )
+                        _records_drilldown(
+                            _records_ctx['df'][_mask],
+                            key_prefix=f"subjbar_{abs(hash(pick_sb)) % 100000}",
+                            title_col=_records_ctx.get('title_col'),
+                            weight_col=_records_ctx.get('weight_col'),
+                            author_col=_records_ctx.get('author_col'),
+                            location_col=_records_ctx.get('location_col'),
+                            has_year=_records_ctx.get('has_year', False),
+                            has_usage=_records_ctx.get('has_usage', False),
+                            weight_label=_records_ctx.get('weight_label', 'Usage'),
+                            notes=notes,
+                            context_label=f"Subject: {pick_sb}",
+                            expanded=True,
+                        )
+
             # --- Title keywords (n-gram analysis) ---
             if settings.get('show_title_keywords'):
                 st.markdown("---")
@@ -3340,7 +3749,8 @@ def _profiler_display_results(results, settings, df, idx,
             if settings.get('show_coverage_vs_use') and results.get('cvu_by_subject_available') \
                and not results.get('cvu_available'):
                 st.markdown("---")
-                _render_coverage_vs_use_by_subject(results, settings, notes=notes)
+                _render_coverage_vs_use_by_subject(results, settings, notes=notes,
+                                                   records_ctx=_records_ctx)
 
     # ======================================================================
     # TAB 3: TITLE ANALYSIS (absorbs former Print/Usage Analyzer functionality)
@@ -4198,6 +4608,7 @@ def page_collection_profiler():
             author_col=author_col,
             date_col=date_col,
             location_col=location_col,
+            subj_col=subj_col,
         )
 
 
