@@ -5710,7 +5710,7 @@ def page_zero_use_identifier():
 
         # Tabs
         st.markdown("---")
-        tabs_to_show = ["Zero/low-use list", "Unmatched items"]
+        tabs_to_show = ["Zero/low-use list", "Unmatched items", "All items (combined)"]
         if h_lc:
             tabs_to_show.append("LC breakdown")
         if h_format:
@@ -5830,8 +5830,102 @@ def page_zero_use_identifier():
                                    key="zu_dl_unmatched")
                 _add_to_tray("zero_use", "unmatched_items.csv", _um_bytes)
 
+        # --- All items (combined) ---
+        # One master list: the zero/low-use items merged with the items that
+        # actually have use, in a single table/CSV. A "Use Status" column tags
+        # each row so the groups can be filtered or sorted apart again.
+        #
+        # This view RESPECTS the sidebar toggles:
+        #   • Pub-year cutoff — when set, the list is limited to items published
+        #     before the cutoff (the same filter the Zero/low-use tab applies).
+        #   • "Treat unmatched as zero-use" — when ON, unmatched items are folded
+        #     into the zero/low-use group (no separate Unmatched bucket); when
+        #     OFF, unmatched items keep their own status.
+        with tab_objs[2]:
+            combined = matched.copy()
+
+            # Respect the optional pub-year cutoff (same filter as the first tab)
+            if pubyear_cutoff is not None and '_pubyear' in combined.columns:
+                combined = combined[combined['_pubyear'] < pubyear_cutoff].copy()
+
+            is_unm = combined['_matched_via'] == 'unmatched'
+            matched_low = (~is_unm) & (combined['_usage_total'] <= threshold)
+            has_use = (~is_unm) & (combined['_usage_total'] > threshold)
+            zero_label = f'Zero/low-use (\u2264 {threshold:g})'
+
+            if treat_unmatched_as_zero:
+                # Toggle ON: unmatched folded into zero/low-use, no separate bucket
+                combined['_use_status'] = np.where(has_use, 'Has use', zero_label)
+                n_has_use = int(has_use.sum())
+                n_zero_low = int((~has_use).sum())   # matched-low + unmatched
+                n_unm = 0
+            else:
+                # Toggle OFF: unmatched kept as their own status
+                combined['_use_status'] = np.where(
+                    is_unm, 'Unmatched',
+                    np.where(matched_low, zero_label, 'Has use')
+                )
+                n_has_use = int(has_use.sum())
+                n_zero_low = int(matched_low.sum())
+                n_unm = int(is_unm.sum())
+
+            cutoff_note = (f" published before {pubyear_cutoff}"
+                           if pubyear_cutoff is not None else "")
+            st.markdown(
+                f"**{len(combined):,} items{cutoff_note}** — zero/low-use merged "
+                f"with the items that have use, in one list."
+            )
+            if treat_unmatched_as_zero:
+                status_line = (
+                    f"📋 {n_zero_low:,} zero/low-use (\u2264 {threshold:g}, "
+                    f"includes unmatched) · {n_has_use:,} with use. "
+                    "Unmatched items are folded into the zero/low-use group "
+                    "because **Treat unmatched as zero-use** is on."
+                )
+            else:
+                status_line = (
+                    f"📋 {n_zero_low:,} zero/low-use (\u2264 {threshold:g}) · "
+                    f"{n_unm:,} unmatched · {n_has_use:,} with use. "
+                    "Sort or filter on the **Use Status** column to pull any one "
+                    "group back out."
+                )
+            if pubyear_cutoff is not None:
+                status_line += (f" Limited to items published before "
+                                f"{pubyear_cutoff} (pub-year cutoff is on).")
+            st.caption(status_line)
+
+            comb_cols = list(display_cols) + ['_use_status', '_matched_via', '_usage_total']
+            comb_cols = [c for c in comb_cols if c in combined.columns]
+            comb_display = combined[comb_cols].rename(columns={
+                '_use_status': 'Use Status',
+                '_matched_via': 'Matched Via',
+                '_usage_total': 'Total Use',
+            }).sort_values('Total Use')
+
+            st.dataframe(comb_display, use_container_width=True, height=500, hide_index=True)
+
+            _comb_bytes = _annotate_csv(
+                comb_display, notes,
+                extra_meta={'Tool': 'Zero-Use Identifier',
+                            'View': 'All Items (combined: zero/low-use + used)',
+                            'Threshold': threshold,
+                            'Pub-year cutoff': pubyear_cutoff or 'none',
+                            'Treat unmatched as zero-use': treat_unmatched_as_zero,
+                            'Holdings rows': total_holdings,
+                            'Rows in this list': len(combined),
+                            'Usage rows': len(usage_df),
+                            'Match keys': ', '.join(shared_keys),
+                            'Zero/low-use items': n_zero_low,
+                            'Unmatched items': n_unm,
+                            'Items with use': n_has_use}
+            )
+            st.download_button("📥 All items combined (CSV)",
+                               _comb_bytes, "zero_use_all_items_combined.csv", "text/csv",
+                               key="zu_dl_combined")
+            _add_to_tray("zero_use", "zero_use_all_items_combined.csv", _comb_bytes)
+
         # --- LC breakdown ---
-        idx = 2
+        idx = 3
         if h_lc:
             with tab_objs[idx]:
                 lc_summary = matched.groupby('_lc_main').agg(
