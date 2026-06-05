@@ -26,6 +26,10 @@ A unified Streamlit application bundling three collection decision-support tools
      (ISBN, ISSN, DOI, OCLC, title+author fallback). Feeds cancellation prep,
      off-site storage candidates, and renewal evidence.
 
+v2.6 (slim) — Added the Overlap & Uniqueness tool: reads an e-journal coverage /
+       A-to-Z export and classifies every title per database as sole source,
+       unique coverage, or redundant, using day-resolution interval math so
+       date coverage (not just title name) drives the cancellation picture.
 v2.5 (slim) — Added inline "show the records behind this" drill-downs across the
        Profiler's coverage-vs-use views, range distribution, and subject bars,
        with in-place usage/year filtering, sorting, and CSV export.
@@ -1814,6 +1818,19 @@ AUTHOR_ALIASES = ['Author', 'author', 'AUTHOR', 'Creator', 'Authors',
                   'Primary Author', 'Main Author']
 LOCATION_ALIASES = ['Location', 'Location Name', 'location', 'Library Location',
                     'Shelving Location', 'Holding Location']
+
+# Used by the Overlap & Uniqueness tool (e-journal coverage / A-Z exports).
+COVERAGE_ALIASES = ['Coverage Information Combined', 'Coverage Information',
+                    'Coverage Statement', 'Coverage Combined', 'Available Coverage',
+                    'Date Coverage', 'Coverage Dates', 'Coverage']
+COLLECTION_ALIASES = ['Electronic Collection Public Name', 'Electronic Collection',
+                      'Collection Public Name', 'Public Name', 'Collection Name',
+                      'Package Name', 'Database Name', 'Resource Name',
+                      'Collection', 'Package', 'Database']
+INTERFACE_ALIASES = ['Interface Name', 'Interface', 'Provider Name', 'Provider',
+                     'Platform', 'Vendor', 'Service Provider']
+NORM_TITLE_ALIASES = ['Title (Normalized)', 'Normalized Title', 'Title Normalized',
+                      'Title (normalized)']
 
 
 def find_column(df_or_cols, aliases, partial=True):
@@ -6043,6 +6060,636 @@ def page_zero_use_identifier():
 
 
 # =====================================================================
+# =====================================================================
+# TOOL 4: OVERLAP & UNIQUENESS  (e-journal package overlap analyzer)
+# =====================================================================
+# "What's unique to each database — and what would we lose by cancelling it?"
+#
+# Reads an Alma-style electronic-journal coverage / A-to-Z export where each
+# row is a Title x Electronic Collection (x Interface) with a coverage
+# statement. For any chosen database it classifies every title into:
+#
+#   • Sole source     — the title exists in NO other database in the file.
+#                       Cancelling = you lose the title outright.
+#   • Unique coverage — the title is held elsewhere too, but THIS database is
+#                       the only source for some span of years. Cancelling =
+#                       you open a coverage gap.
+#   • Redundant       — every year this database provides is also provided by
+#                       at least one other database. Cancelling = no loss.
+#
+# The coverage math (interval union + subtraction at day resolution) is what
+# makes the "consider coverage" part work: a title can be redundant by name
+# but irreplaceable by date range, and this tool tells them apart.
+# =====================================================================
+# =====================================================================
+
+
+def _ovl_parse_one_date(s, is_end):
+    """Parse a single coverage date token (YYYY, YYYY-M, or YYYY-M-D) into a
+    date. Year-only / month-only tokens expand to the start of the span for a
+    start date and the end of the span for an end date, so "1847 until 1847"
+    means the whole of 1847."""
+    from datetime import date, timedelta
+    parts = str(s).strip().split('-')
+    try:
+        y = int(parts[0])
+    except (ValueError, IndexError):
+        return None
+    if y < 1 or y > 2999:
+        return None
+    if len(parts) == 1:
+        return date(y, 12, 31) if is_end else date(y, 1, 1)
+    try:
+        m = int(parts[1])
+    except ValueError:
+        return date(y, 12, 31) if is_end else date(y, 1, 1)
+    m = min(max(m, 1), 12)
+    if len(parts) == 2:
+        if is_end:
+            nxt = date(y + (m == 12), (m % 12) + 1, 1)
+            return nxt - timedelta(days=1)
+        return date(y, m, 1)
+    try:
+        d = int(parts[2])
+        return date(y, m, d)
+    except (ValueError, IndexError):
+        # Bad day-of-month — fall back to month bounds
+        if is_end:
+            nxt = date(y + (m == 12), (m % 12) + 1, 1)
+            return nxt - timedelta(days=1)
+        return date(y, m, 1)
+
+
+def _ovl_parse_coverage(text, present):
+    """Parse a coverage statement into a list of (start_date, end_date, ongoing)
+    intervals. Handles multiple "Available from X until Y;" clauses in one cell.
+    An open-ended clause (no "until") ends at `present` and is flagged ongoing."""
+    if text is None or (isinstance(text, float)):
+        return []
+    s = str(text)
+    if not s.strip() or s.lower() == 'nan':
+        return []
+    intervals = []
+    for mm in re.finditer(r'from\s+([\d\-]+)(?:\s+until\s+([\d\-]+))?', s, re.I):
+        start = _ovl_parse_one_date(mm.group(1), is_end=False)
+        if start is None:
+            continue
+        if mm.group(2):
+            end = _ovl_parse_one_date(mm.group(2), is_end=True)
+            ongoing = False
+        else:
+            end = present
+            ongoing = True
+        if end is not None and end >= start:
+            intervals.append((start, end, ongoing))
+    return intervals
+
+
+def _ovl_merge(intervals):
+    """Merge a list of (start, end) intervals into non-overlapping, sorted pieces."""
+    from datetime import timedelta
+    segs = sorted(intervals)
+    merged = []
+    for s, e in segs:
+        if merged and s <= merged[-1][1] + timedelta(days=1):
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _ovl_subtract(target, others):
+    """Return the pieces of `target` not covered by the union of `others`.
+    Both are lists of (start, end) tuples. Target is merged first so a title
+    listed more than once in the same database isn't double-counted. Result is
+    a list of non-overlapping (start, end) pieces."""
+    from datetime import timedelta
+    merged = _ovl_merge(others)
+    target = _ovl_merge(target)
+    result = []
+    for s, e in target:
+        cur = s
+        for ms, me in merged:
+            if me < cur or ms > e:
+                continue
+            if ms > cur:
+                result.append((cur, min(ms - timedelta(days=1), e)))
+            cur = max(cur, me + timedelta(days=1))
+            if cur > e:
+                break
+        if cur <= e:
+            result.append((cur, e))
+    return [(s, e) for s, e in result if e >= s]
+
+
+def _ovl_span_years(ivs):
+    """Total span of a list of (start, end) intervals, in fractional years."""
+    return sum((e - s).days + 1 for s, e in ivs) / 365.25
+
+
+def _ovl_fmt_ranges(ivs):
+    """Render intervals as a compact human-readable string like '1925–1985; 2014–2015'."""
+    out = []
+    for s, e in ivs:
+        if s.year == e.year:
+            out.append(f"{s.year}")
+        else:
+            out.append(f"{s.year}\u2013{e.year}")
+    return "; ".join(out)
+
+
+def _ovl_classify(df, group_col, title_key_col, title_disp_col, coverage_col,
+                  min_years):
+    """Classify every (database, title) pair. Returns a long DataFrame with one
+    row per database-title combination.
+
+    Columns: database, title, status, unique_years, unique_ranges,
+             other_count, also_in.
+    """
+    from datetime import date
+
+    present = date.today()
+
+    # Parse coverage once per row.
+    parsed = df[coverage_col].apply(lambda t: _ovl_parse_coverage(t, present))
+
+    # Build title -> list of (group, [intervals]) so each title is touched once.
+    title_recs = defaultdict(list)
+    title_disp = {}
+    for grp, tkey, tdisp, ivs in zip(df[group_col], df[title_key_col],
+                                     df[title_disp_col], parsed):
+        if tkey is None or (isinstance(tkey, float) and pd.isna(tkey)):
+            continue
+        tkey = str(tkey).strip()
+        if not tkey:
+            continue
+        if pd.isna(grp) or not str(grp).strip():
+            continue
+        title_recs[tkey].append((str(grp).strip(), ivs))
+        title_disp.setdefault(tkey, tdisp)
+
+    rows = []
+    for tkey, recs in title_recs.items():
+        groups_here = {g for g, _ in recs}
+        disp = title_disp.get(tkey, tkey)
+        for g in groups_here:
+            target = [(s, e) for rg, ivs in recs if rg == g for (s, e, _) in ivs]
+            other_groups = sorted({rg for rg, _ in recs if rg != g})
+            other = [(s, e) for rg, ivs in recs if rg != g for (s, e, _) in ivs]
+            if not other_groups:
+                status = "Sole source"
+                unique = _ovl_merge(target)
+            else:
+                unique = _ovl_subtract(target, other)
+                yrs = _ovl_span_years(unique)
+                status = "Unique coverage" if yrs > min_years else "Redundant"
+            rows.append({
+                "database": g,
+                "title": disp,
+                "status": status,
+                "unique_years": round(_ovl_span_years(unique), 2),
+                "unique_ranges": _ovl_fmt_ranges(unique),
+                "other_count": len(other_groups),
+                "also_in": ", ".join(other_groups),
+            })
+    return pd.DataFrame(rows)
+
+
+# Status display order + colors (Tulane palette + neutral).
+_OVL_STATUS_ORDER = ["Sole source", "Unique coverage", "Redundant"]
+_OVL_STATUS_COLORS = {
+    "Sole source": "#285C4D",      # Tulane green — most irreplaceable
+    "Unique coverage": "#71C5E8",  # Tulane blue — partial loss if cancelled
+    "Redundant": "#C9CCCE",        # neutral gray — safe to cancel
+}
+
+
+def _ovl_cached_classification(tool_key, uploaded_file, group_col,
+                               title_key_col, title_disp_col, coverage_col,
+                               min_years, df):
+    """Memoize the (somewhat expensive) classification in session_state, keyed
+    on file + the settings that affect the result. Returns the long DataFrame."""
+    file_key = _make_file_key(uploaded_file)
+    sig = (file_key, group_col, title_key_col, coverage_col, min_years)
+    slot = st.session_state.get(f"_ovl_cache_{tool_key}")
+    if slot and slot.get("sig") == sig:
+        return slot["result"]
+    result = _ovl_classify(df, group_col, title_key_col, title_disp_col,
+                           coverage_col, min_years)
+    st.session_state[f"_ovl_cache_{tool_key}"] = {"sig": sig, "result": result}
+    return result
+
+
+def page_overlap_analyzer():
+    """Tool 4: Overlap & Uniqueness — which titles are unique to a database,
+    accounting for date coverage."""
+    TOOL = "overlap"
+    st.header("\U0001F9E9 Overlap & Uniqueness")
+    st.markdown(
+        "**What's unique to each database \u2014 and what would we lose by "
+        "cancelling it?** Upload an electronic-journal coverage / A-to-Z export "
+        "(one row per title \u00d7 database, with a coverage statement) and this "
+        "tool sorts every title into *sole source*, *unique coverage*, or "
+        "*redundant* \u2014 taking the actual date ranges into account, not just "
+        "the title name."
+    )
+
+    with st.expander("\u2139\ufe0f When to use this tool"):
+        st.markdown(
+            "- **Cancellation review:** Before dropping a package, see exactly "
+            "which titles you'd lose outright (*sole source*) and which you'd "
+            "keep but with a coverage gap (*unique coverage*).\n"
+            "- **Overlap / duplication audit:** Find titles you're paying for in "
+            "several databases at once (*redundant*) \u2014 candidates for "
+            "trimming without losing any content.\n"
+            "- **Big-deal evaluation:** Rank databases by how much irreplaceable "
+            "content they hold, so the all-or-nothing packages get scrutinized.\n"
+            "- **Pairs well with COUNTER Analyzer:** uniqueness tells you what's "
+            "*replaceable*; COUNTER tells you what's *used*. Cancel the titles "
+            "that are both redundant and unused first."
+        )
+
+    with st.expander("\U0001F4D6 How the coverage math works", expanded=False):
+        st.markdown("""
+        Each row is a **title in one database** with a coverage statement like
+        *"Available from 1925-7-19 until 1985-12-31"* (an open-ended one with no
+        *until* is treated as running to today).
+
+        For a chosen database, each of its titles is compared against **every
+        other database in the file**:
+
+        1. **Sole source** \u2014 the title appears in no other database. You'd
+           lose it entirely.
+        2. **Unique coverage** \u2014 the title is elsewhere too, but this
+           database covers a date span *no other database covers*. The years it
+           uniquely provides are listed so you can judge the gap.
+        3. **Redundant** \u2014 every year this database provides is already
+           provided elsewhere. Safe to drop on coverage grounds.
+
+        The comparison is done by **interval subtraction at day resolution**:
+        the tool builds the union of all other databases' date ranges for that
+        title, then checks whether this database's range pokes outside it.
+
+        **Caveat \u2014 metadata granularity:** coverage stated as a bare year
+        (e.g. *1847*) is treated as the whole year. If one source gives precise
+        dates and another only a year, you can see small *unique coverage* spans
+        that are really just rounding. The **materiality threshold** below lets
+        you ignore gaps under N years.
+        """)
+
+    uploaded_file = st.file_uploader(
+        "Upload coverage / A-to-Z export (CSV or Excel)",
+        type=['csv', 'xls', 'xlsx'], key="ovl_upload",
+        help="One row per title \u00d7 database, with a coverage statement "
+             "column. Alma 'Electronic Journal Coverage' exports work as-is."
+    )
+
+    if not uploaded_file:
+        st.info("Upload a coverage export to begin. It needs a **title** column, "
+                "a **coverage** column, and a **database/collection** (or "
+                "**interface**) column.")
+        return
+
+    try:
+        cached = _cached_df_for_tool(TOOL, uploaded_file)
+        if cached is not None:
+            df = cached.copy()
+        else:
+            df = _load_csv_chunked(uploaded_file.getvalue(), uploaded_file.name)
+            _store_cached_df(TOOL, uploaded_file, df)
+
+        st.success(f"\u2705 Loaded **{len(df):,}** rows.")
+
+        # ---- Column detection ----
+        coverage_col = find_column(df, COVERAGE_ALIASES)
+        collection_col = find_column(df, COLLECTION_ALIASES)
+        interface_col = find_column(df, INTERFACE_ALIASES)
+        title_disp_col = find_column(df, TITLE_ALIASES)
+        title_norm_col = find_column(df, NORM_TITLE_ALIASES)
+
+        # Which grouping dimensions are available?
+        dim_options = []
+        if collection_col:
+            dim_options.append("Database / collection")
+        if interface_col:
+            dim_options.append("Interface / provider")
+
+        with st.expander("\U0001F50D Column detection & overrides", expanded=False):
+            st.caption(
+                f"Title: `{title_disp_col}` \u00b7 Normalized title: "
+                f"`{title_norm_col}` \u00b7 Coverage: `{coverage_col}` \u00b7 "
+                f"Collection: `{collection_col}` \u00b7 Interface: `{interface_col}`"
+            )
+            cols = list(df.columns)
+
+            def _idx(col):
+                return cols.index(col) + 1 if col in cols else 0
+
+            opts = ["\u2014 none \u2014"] + cols
+            title_disp_col = st.selectbox(
+                "Title column (display)", opts, index=_idx(title_disp_col),
+                key="ovl_title_override")
+            title_disp_col = None if title_disp_col == "\u2014 none \u2014" else title_disp_col
+
+            norm_pick = st.selectbox(
+                "Normalized-title column (for matching; optional)",
+                opts, index=_idx(title_norm_col), key="ovl_norm_override")
+            title_norm_col = None if norm_pick == "\u2014 none \u2014" else norm_pick
+
+            cov_pick = st.selectbox(
+                "Coverage column", opts, index=_idx(coverage_col),
+                key="ovl_cov_override")
+            coverage_col = None if cov_pick == "\u2014 none \u2014" else cov_pick
+
+            coll_pick = st.selectbox(
+                "Database / collection column", opts, index=_idx(collection_col),
+                key="ovl_coll_override")
+            collection_col = None if coll_pick == "\u2014 none \u2014" else coll_pick
+
+            iface_pick = st.selectbox(
+                "Interface / provider column", opts, index=_idx(interface_col),
+                key="ovl_iface_override")
+            interface_col = None if iface_pick == "\u2014 none \u2014" else iface_pick
+
+        # Rebuild dimension options after any overrides.
+        dim_options = []
+        if collection_col:
+            dim_options.append("Database / collection")
+        if interface_col:
+            dim_options.append("Interface / provider")
+
+        # ---- Validation ----
+        if not title_disp_col:
+            st.error("\u274C Need a **title** column. Set one in the overrides above.")
+            return
+        if not coverage_col:
+            st.error("\u274C Need a **coverage** column (e.g. *Coverage "
+                     "Information Combined*). Set one in the overrides above.")
+            return
+        if not dim_options:
+            st.error("\u274C Need a **database/collection** or **interface** "
+                     "column to compare across. Set one in the overrides above.")
+            return
+
+        # ---- Settings ----
+        sc1, sc2 = st.columns([2, 3])
+        with sc1:
+            dim_choice = st.radio("Compare uniqueness by:", dim_options,
+                                  index=0, key="ovl_dim")
+            group_col = (collection_col if dim_choice == "Database / collection"
+                         else interface_col)
+        with sc2:
+            min_years = st.slider(
+                "Materiality threshold \u2014 minimum unique span to count as "
+                "*unique coverage* (years)",
+                0.0, 5.0, 0.0, 0.25, key="ovl_minyears",
+                help="A title held elsewhere counts as 'unique coverage' only if "
+                     "this database uniquely provides at least this many years. "
+                     "Raise it to ignore tiny gaps from year-level metadata. "
+                     "0 = flag any unique span.")
+
+        # ---- Title matching key ----
+        # Prefer a normalized-title column; otherwise normalize the display title.
+        df = df.copy()
+        if title_norm_col and title_norm_col in df.columns:
+            df["_ovl_key"] = df[title_norm_col].apply(
+                lambda v: normalize_text(v) if pd.notna(v) and str(v).strip()
+                else None)
+            # Fall back to display title where the normalized cell is blank.
+            blank = df["_ovl_key"].isna() | (df["_ovl_key"] == "")
+            df.loc[blank, "_ovl_key"] = df.loc[blank, title_disp_col].apply(
+                lambda v: normalize_text(v) if pd.notna(v) else None)
+        else:
+            df["_ovl_key"] = df[title_disp_col].apply(
+                lambda v: normalize_text(v) if pd.notna(v) else None)
+
+        # ---- Classify (memoized) ----
+        with st.spinner("Comparing coverage across databases\u2026"):
+            long_df = _ovl_cached_classification(
+                TOOL, uploaded_file, group_col, "_ovl_key", title_disp_col,
+                coverage_col, min_years, df)
+
+        if long_df.empty:
+            st.warning("No title/database pairs could be built. Check that the "
+                       "title and coverage columns are mapped correctly.")
+            return
+
+        notes = _notes_widget(
+            TOOL,
+            placeholder="e.g., July cancellation review. America's Historical "
+                        "Newspapers holds 'Advocate' 1925\u20131985 \u2014 "
+                        "no replacement; flag for retention.")
+        _reset_tray(TOOL)
+
+        n_databases = long_df["database"].nunique()
+        n_titles = long_df["title"].nunique()
+        meta = {"Compared by": dim_choice, "Group column": group_col,
+                "Materiality threshold (yrs)": min_years,
+                "Databases": n_databases, "Distinct titles": n_titles}
+
+        st.markdown("---")
+        tab_profile, tab_drill, tab_lookup = st.tabs([
+            "\U0001F4CA Uniqueness by database",
+            "\U0001F50E Drill into one database",
+            "\U0001F50D Title lookup",
+        ])
+
+        # =============================================================
+        # TAB 1 — Uniqueness profile across all databases
+        # =============================================================
+        with tab_profile:
+            prof = (long_df.groupby("database")
+                    .agg(Titles=("title", "count"),
+                         Sole_source=("status",
+                                      lambda s: int((s == "Sole source").sum())),
+                         Unique_coverage=("status",
+                                          lambda s: int((s == "Unique coverage").sum())),
+                         Redundant=("status",
+                                    lambda s: int((s == "Redundant").sum())))
+                    .reset_index())
+            prof["Irreplaceable"] = prof["Sole_source"] + prof["Unique_coverage"]
+            prof["% redundant"] = (prof["Redundant"] / prof["Titles"] * 100).round(0)
+            prof = prof.sort_values(["Irreplaceable", "Titles"],
+                                    ascending=False).reset_index(drop=True)
+
+            total_redundant = int((long_df["status"] == "Redundant").sum())
+            total_pairs = len(long_df)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Databases", f"{n_databases:,}")
+            k2.metric("Distinct titles", f"{n_titles:,}")
+            k3.metric("Title placements", f"{total_pairs:,}",
+                      help="Title \u00d7 database combinations across the file.")
+            k4.metric("Redundant placements",
+                      f"{total_redundant/max(1,total_pairs)*100:.0f}%",
+                      help="Share of placements whose coverage is fully duplicated "
+                           "elsewhere \u2014 the raw overlap in the file.")
+
+            st.markdown("##### How irreplaceable is each database?")
+            st.caption("Sorted by *irreplaceable* (sole source + unique coverage). "
+                       "A database that's mostly redundant is the safest to cancel; "
+                       "one with many sole-source titles is the costliest to lose.")
+
+            display_prof = prof.rename(columns={
+                "database": "Database", "Sole_source": "Sole source",
+                "Unique_coverage": "Unique coverage"})
+            st.dataframe(
+                display_prof[["Database", "Titles", "Sole source",
+                              "Unique coverage", "Redundant", "Irreplaceable",
+                              "% redundant"]],
+                use_container_width=True, hide_index=True)
+
+            # Stacked bar — top N databases by title count.
+            top_n = min(20, len(prof))
+            bar_df = prof.head(top_n).iloc[::-1]  # reverse so largest at top
+            fig = go.Figure()
+            for status, col in [("Sole_source", "Sole source"),
+                                ("Unique_coverage", "Unique coverage"),
+                                ("Redundant", "Redundant")]:
+                fig.add_trace(go.Bar(
+                    y=bar_df["database"], x=bar_df[status], name=col,
+                    orientation="h",
+                    marker_color=_OVL_STATUS_COLORS[col],
+                    hovertemplate="%{y}<br>" + col + ": %{x}<extra></extra>"))
+            fig.update_layout(
+                barmode="stack", height=max(320, 26 * top_n + 120),
+                margin=dict(l=10, r=10, t=30, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="left", x=0),
+                xaxis_title="Titles", yaxis_title=None,
+                font=dict(family="DM Sans, sans-serif"))
+            st.plotly_chart(fig, use_container_width=True)
+
+            _decision_box(
+                "Reading this",
+                "- **Lots of green (sole source)** \u2192 irreplaceable content; "
+                "cancelling means buying the titles back elsewhere or losing them.\n"
+                "- **Lots of blue (unique coverage)** \u2192 you'd keep the titles "
+                "but open date gaps; check the drill-down for which years.\n"
+                "- **Mostly gray (redundant)** \u2192 the database duplicates "
+                "coverage you already have \u2014 the cleanest cancellation "
+                "candidate on content grounds (still check usage in COUNTER).")
+
+            csv = _annotate_csv(display_prof, notes, extra_meta=meta)
+            _dl("\U0001F4E5 Uniqueness profile (CSV)", csv,
+                "uniqueness_profile.csv", "text/csv",
+                key="ovl_dl_profile", tool_key=TOOL)
+
+        # =============================================================
+        # TAB 2 — Drill into one database
+        # =============================================================
+        with tab_drill:
+            db_list = sorted(long_df["database"].unique())
+            pick = st.selectbox("Database to examine", db_list, key="ovl_pick_db")
+            sub = long_df[long_df["database"] == pick].copy()
+
+            n_sole = int((sub["status"] == "Sole source").sum())
+            n_uniq = int((sub["status"] == "Unique coverage").sum())
+            n_red = int((sub["status"] == "Redundant").sum())
+
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Titles", f"{len(sub):,}")
+            d2.metric("Sole source", f"{n_sole:,}",
+                      help="Lost entirely if cancelled.")
+            d3.metric("Unique coverage", f"{n_uniq:,}",
+                      help="Kept, but with a date gap if cancelled.")
+            d4.metric("Redundant", f"{n_red:,}",
+                      help="Fully duplicated elsewhere.")
+
+            irreplaceable = n_sole + n_uniq
+            if irreplaceable == 0:
+                st.success(
+                    f"\u2705 **Every title in *{pick}* is fully covered by other "
+                    f"databases in this file.** On coverage grounds, cancelling it "
+                    f"loses no content. (Confirm usage and any non-journal content "
+                    f"separately.)")
+            else:
+                st.warning(
+                    f"\u26A0\ufe0f Cancelling **{pick}** would lose **{n_sole}** "
+                    f"title(s) outright and open coverage gaps on **{n_uniq}** "
+                    f"more. **{n_red}** of its {len(sub)} titles are safely "
+                    f"duplicated elsewhere.")
+
+            status_filter = st.radio(
+                "Show", ["All", "Sole source", "Unique coverage", "Redundant"],
+                horizontal=True, key="ovl_status_filter")
+            view = sub if status_filter == "All" else sub[sub["status"] == status_filter]
+
+            # Order: sole source first, then unique coverage (by span desc), then redundant.
+            order_map = {"Sole source": 0, "Unique coverage": 1, "Redundant": 2}
+            view = view.assign(_o=view["status"].map(order_map)).sort_values(
+                ["_o", "unique_years"], ascending=[True, False]).drop(columns="_o")
+
+            display = view.rename(columns={
+                "title": "Title", "status": "Status",
+                "unique_years": "Unique years",
+                "unique_ranges": "Unique coverage (years)",
+                "also_in": "Also available in"})
+            st.dataframe(
+                display[["Title", "Status", "Unique years",
+                         "Unique coverage (years)", "Also available in"]],
+                use_container_width=True, hide_index=True)
+
+            safe_name = re.sub(r'[^\w\-]+', '_', pick)[:60].strip('_') or "database"
+            csv = _annotate_csv(
+                display[["Title", "Status", "Unique years",
+                         "Unique coverage (years)", "Also available in"]],
+                notes, extra_meta={**meta, "Database examined": pick})
+            _dl(f"\U0001F4E5 {pick[:40]} \u2014 title classification (CSV)", csv,
+                f"uniqueness_{safe_name}.csv", "text/csv",
+                key="ovl_dl_drill", tool_key=TOOL)
+
+        # =============================================================
+        # TAB 3 — Title lookup
+        # =============================================================
+        with tab_lookup:
+            st.caption("Search a title to see every database that holds it, the "
+                       "coverage each provides, and where the unique years sit.")
+            q = st.text_input("Title contains", key="ovl_lookup_q",
+                              placeholder="e.g., Advocate")
+            if q and q.strip():
+                ql = q.strip().lower()
+                hits = long_df[long_df["title"].str.lower().str.contains(
+                    re.escape(ql), na=False)]
+                titles_found = sorted(hits["title"].unique())
+                if not titles_found:
+                    st.info("No titles match that search.")
+                else:
+                    if len(titles_found) > 1:
+                        chosen = st.selectbox(
+                            f"{len(titles_found)} matching titles",
+                            titles_found, key="ovl_lookup_pick")
+                    else:
+                        chosen = titles_found[0]
+                    rows = long_df[long_df["title"] == chosen].copy()
+                    order_map = {"Sole source": 0, "Unique coverage": 1, "Redundant": 2}
+                    rows = rows.assign(_o=rows["status"].map(order_map)).sort_values(
+                        ["_o", "unique_years"], ascending=[True, False]).drop(columns="_o")
+                    n_db = rows["database"].nunique()
+                    st.markdown(f"**{chosen}** \u2014 held in **{n_db}** "
+                                f"database{'s' if n_db != 1 else ''}.")
+                    disp = rows.rename(columns={
+                        "database": "Database", "status": "Status in this database",
+                        "unique_years": "Unique years",
+                        "unique_ranges": "Unique coverage (years)"})
+                    st.dataframe(
+                        disp[["Database", "Status in this database",
+                              "Unique years", "Unique coverage (years)"]],
+                        use_container_width=True, hide_index=True)
+                    if (rows["status"] == "Redundant").all():
+                        st.caption("Every copy of this title is duplicated \u2014 "
+                                   "no single database is the sole source for any year.")
+
+        st.markdown("---")
+        _render_download_tray(TOOL, zip_filename="overlap_uniqueness.zip")
+
+    except Exception as e:
+        st.error(f"\u274C Error: {e}")
+        st.info("Check that the file has a title column, a coverage column, and "
+                "a database/collection (or interface) column. Alma 'Electronic "
+                "Journal Coverage' exports work without changes.")
+
+
+# =====================================================================
 # HOME PAGE & MAIN NAVIGATION
 # =====================================================================
 
@@ -6117,6 +6764,25 @@ def page_home():
     </div>
     """, unsafe_allow_html=True)
 
+    st.markdown("""
+    <div class="tool-card">
+        <h3>🧩 Overlap & Uniqueness</h3>
+        <p><em>What's unique to each database — and what would we lose by cancelling it?</em></p>
+        <p>Read an e-journal coverage / A-to-Z export and classify every title
+        per database as <strong>sole source</strong>, <strong>unique
+        coverage</strong>, or <strong>redundant</strong> — accounting for the
+        actual date ranges, not just the title name.</p>
+        <hr>
+        <p><strong>Use for:</strong></p>
+        <ul>
+            <li>Package cancellation impact (what's truly lost)</li>
+            <li>Overlap / duplication audits across databases</li>
+            <li>Coverage-gap analysis before dropping a source</li>
+            <li>Ranking databases by irreplaceable content</li>
+        </ul>
+    </div>
+    """, unsafe_allow_html=True)
+
     st.markdown("---")
     st.subheader("Quick decision guide")
     st.markdown("""
@@ -6131,17 +6797,22 @@ def page_home():
     | Find what you own that's never been used | **Zero-Use Identifier** |
     | Identify e-journal/package titles with no use | **Zero-Use Identifier** (holdings vs. COUNTER) |
     | Find areas with strong use relative to holdings (or weak) | **Collection Profiler** → LC Analysis (Coverage vs. Use) |
+    | See which titles are unique to a database (by coverage) | **Overlap & Uniqueness** |
+    | Estimate what content a package cancellation would lose | **Overlap & Uniqueness** |
+    | Find titles duplicated across several databases | **Overlap & Uniqueness** (Redundant) |
     """)
 
     st.markdown("---")
     with st.expander("ℹ️ About this dashboard"):
         st.markdown("""
-        **Version 2.4 (slim)** — three collection-analysis tools:
+        **Version 2.6 (slim)** — four collection-analysis tools:
         - **Collection Profiler** — three views (LC, Subject Term, Title) on
           catalog and admin-export files. Title Analysis absorbs the former
           Print Circulation analyzer.
         - **COUNTER Analyzer** — formal COUNTER 5 reports only.
         - **Zero-Use Identifier** — holdings vs. usage matching.
+        - **Overlap & Uniqueness** — e-journal coverage overlap; classifies
+          titles per database as sole source / unique coverage / redundant.
 
         The Acquisition Recommendation Scorer ("what should we buy next?") has
         been extracted into its own standalone app — see `recommender_app.py`.
@@ -6166,7 +6837,8 @@ def main():
             ["🏠 Home",
              "🗺️ Collection Profiler",
              "📊 COUNTER Analyzer",
-             "🔍 Zero-Use Identifier"],
+             "🔍 Zero-Use Identifier",
+             "🧩 Overlap & Uniqueness"],
             index=0,
             key="nav"
         )
@@ -6180,6 +6852,8 @@ def main():
         page_counter_analyzer()
     elif page == "🔍 Zero-Use Identifier":
         page_zero_use_identifier()
+    elif page == "🧩 Overlap & Uniqueness":
+        page_overlap_analyzer()
 
     _footer()
 
