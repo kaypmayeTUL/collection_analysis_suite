@@ -1857,6 +1857,29 @@ def find_column(df_or_cols, aliases, partial=True):
     return None
 
 
+def _count_leading_comment_lines(file_bytes, comment='#'):
+    """Count contiguous leading '#'-comment lines (a provenance header).
+
+    Our exports — e.g. the Zero-Use explicit-zero master — prepend a '#' metadata
+    block via _annotate_csv. Counting only *leading* comment lines lets the loaders
+    skip that block when the file is re-ingested, without disturbing a '#' that
+    appears inside a real data field. The blank separator after the block is
+    handled by pandas' skip_blank_lines.
+    """
+    head = file_bytes[:65536]
+    try:
+        text = head.decode('utf-8-sig', errors='replace')
+    except Exception:
+        text = head.decode('latin-1', errors='replace')
+    n = 0
+    for line in text.splitlines():
+        if line.lstrip('\ufeff').lstrip().startswith(comment):
+            n += 1
+        else:
+            break
+    return n
+
+
 def _detect_columns_from_header(file_bytes, filename=None):
     """Read only the header row to detect column names without loading all data.
 
@@ -1869,10 +1892,11 @@ def _detect_columns_from_header(file_bytes, filename=None):
             return [c.strip() if isinstance(c, str) else c for c in header.columns]
         except Exception:
             pass  # fall through to CSV attempt
+    skip = _count_leading_comment_lines(file_bytes)
     try:
-        header = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', nrows=0)
+        header = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', nrows=0, skiprows=skip)
     except Exception:
-        header = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', nrows=0)
+        header = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', nrows=0, skiprows=skip)
     return [c.strip() for c in header.columns]
 
 
@@ -1894,19 +1918,25 @@ def _load_csv_chunked(file_bytes, filename, cols_to_keep=None):
         df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
         return df
 
-    # CSV path (original behavior)
+    # CSV path (original behavior). Our own exports (e.g. the Zero-Use
+    # explicit-zero master) carry a leading '#'-comment provenance block from
+    # _annotate_csv; skip those lines so the file round-trips cleanly. Only
+    # *leading* comment lines are skipped, so a '#' inside a data field survives.
+    skip = _count_leading_comment_lines(file_bytes)
     try:
         df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False,
-                         usecols=cols_to_keep)
+                         skiprows=skip, usecols=cols_to_keep)
     except Exception:
         try:
             df = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', low_memory=False,
-                             usecols=cols_to_keep)
+                             skiprows=skip, usecols=cols_to_keep)
         except Exception:
             try:
-                df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False)
+                df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False,
+                                 skiprows=skip)
             except Exception:
-                df = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', low_memory=False)
+                df = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', low_memory=False,
+                                 skiprows=skip)
     df.columns = df.columns.str.strip()
     return df
 
@@ -4798,11 +4828,15 @@ def _load_counter_csv(file_bytes, filename):
 
 @st.cache_data(show_spinner=False)
 def _load_print_csv(file_bytes, filename):
-    """Load a print circulation CSV (flat file, no metadata header)."""
+    """Load a print circulation CSV. Tolerates a leading '#' provenance block
+    (e.g. when re-feeding the Zero-Use explicit-zero master)."""
+    skip = _count_leading_comment_lines(file_bytes)
     try:
-        df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False)
+        df = pd.read_csv(BytesIO(file_bytes), encoding='utf-8-sig', low_memory=False,
+                         skiprows=skip)
     except Exception:
-        df = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', low_memory=False)
+        df = pd.read_csv(BytesIO(file_bytes), encoding='latin-1', low_memory=False,
+                         skiprows=skip)
     df.columns = df.columns.str.strip()
     return df
 
