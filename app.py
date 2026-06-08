@@ -1,31 +1,43 @@
 """
 Library Collection Dashboard (slim edition)
 ===========================================
-A unified Streamlit application bundling three collection decision-support tools:
+A unified Streamlit application bundling four collection decision-support tools:
 
-  1. Collection Profiler — "What does our collection look like, and what's used?"
-     Three views in one tool:
-       • LC Analysis — sunburst, treemap, LC × subject heatmap, gap analysis,
-         coverage-vs-use, sub-class range distribution. Feeds collection
-         assessment and accreditation work.
+  1. Collection Profiler — "What does our collection look like?"
+     Holdings structure only:
+       • LC Analysis — sunburst, treemap, LC × subject heatmap, sub-class range
+         distribution. Feeds collection assessment and accreditation work.
        • Subject Term Analysis — top subjects, word cloud, title-keyword n-grams.
          Feeds policy revision, liaison conversations, marketing planning.
-       • Title Analysis — top titles by usage, weeding review, author summary,
-         date-range filtering, yearly trends. Feeds print weeding and
-         circulation triage. (Absorbs the former standalone Print Circulation
-         analyzer.)
+     Usage-driven views (Coverage-vs-Use, top titles, gap, weeding triage) moved
+     to Use Analysis as of v2.7.
 
-  2. COUNTER Analyzer — "Which e-resources are pulling their weight?"
-     Formal COUNTER 5 reports only (TR/TR_J3/TR_B1/DR/PR/IR with the standard
-     12–13 row metadata header and monthly columns). Top titles, cancellation
-     review, publisher rollups, monthly trends. Vendor admin exports with
-     subjects/LC (e.g., EBSCO Detailed Report) belong in the Profiler instead.
+  2. Use Analysis — "What's getting used, and is it worth keeping?"
+     One tool for all usage-driven work, branching by data type:
+       • Print circulation (subject + usage) — profiler engine with usage on:
+         Coverage-vs-Use, top titles, gap-vs-use, weeding triage.
+       • Electronic / COUNTER 5 — formal COUNTER reports (TR/TR_J3/TR_B1/DR/PR/IR)
+         via the COUNTER reader: cost-per-use, dead weight, monthly trends.
+       • Electronic / other usage — any title-level usage export.
+     The print and other-usage branches expect the synced explicit-zero master
+     from the Zero-Use Identifier so unused titles count as 0.
 
   3. Zero-Use Identifier — "What do we own that isn't being used?"
-     Holdings vs. usage comparison with multi-identifier matching cascade
-     (ISBN, ISSN, DOI, OCLC, title+author fallback). Feeds cancellation prep,
-     off-site storage candidates, and renewal evidence.
+     Holdings vs. usage comparison with a multi-identifier matching cascade
+     (ISBN, ISSN, DOI, OCLC, title+author fallback). Retains subject metadata and
+     emits two outputs: the zero-use title list, and the explicit-zero master
+     (every title with a numeric use value, 0 where unused) that feeds Use Analysis.
 
+  4. Overlap & Uniqueness — "What's unique to each database?"
+     Reads an e-journal coverage / A-to-Z export and classifies every title per
+     database as sole source, unique coverage, or redundant, using day-resolution
+     interval math so date coverage (not just title name) drives the picture.
+
+v2.7 (slim) — Full cut: usage analysis consolidated into a single Use Analysis
+       tool (print circulation, COUNTER 5, and other usage data). The Collection
+       Profiler is now structure-only; the standalone COUNTER Analyzer is retired
+       as a top-level tool (its reader is the Use Analysis COUNTER branch). The
+       Zero-Use Identifier retains subjects and emits two outputs only.
 v2.6 (slim) — Added the Overlap & Uniqueness tool: reads an e-journal coverage /
        A-to-Z export and classifies every title per database as sole source,
        unique coverage, or redundant, using day-resolution interval math so
@@ -34,8 +46,7 @@ v2.5 (slim) — Added inline "show the records behind this" drill-downs across t
        Profiler's coverage-vs-use views, range distribution, and subject bars,
        with in-place usage/year filtering, sorting, and CSV export.
 v2.4 (slim) — Acquisition Recommendation Scorer extracted to its own standalone
-       app (recommender_app.py). This edition focuses on the three
-       collection-analysis tools. NLTK is no longer a runtime dependency.
+       app (recommender_app.py). NLTK is no longer a runtime dependency.
 Contact: Kay P Maye (kmaye@tulane.edu)
 """
 
@@ -4168,48 +4179,84 @@ def _profiler_display_results(results, settings, df, idx,
     _render_download_tray("profiler", zip_filename="collection_profiler_results.zip")
 
 
-def page_collection_profiler():
-    """Tool 1: Collection Profiler."""
-    if 'prof_results' not in st.session_state:
-        st.session_state['prof_results'] = None
-    if 'prof_filtered_idx' not in st.session_state:
-        st.session_state['prof_filtered_idx'] = None
+def _profiler_ui(mode="structure", flavor="print"):
+    """Shared collection-analysis UI, parameterized by mode.
 
-    st.header("🗺️ Collection Profiler")
-    st.markdown(
-        "**What does our collection look like?** Upload a title list from Alma or a vendor with subject terms "
-        "and/or LC call numbers to map disciplinary strengths, spot gaps, and explore "
-        "subject coverage. If usage data is included, you will also be able to analyze Coverage vs.Usage trends"
-    )
-    with st.expander("ℹ️ When to use this tool"):
+    mode="structure"  -> Collection Profiler page: holdings structure only
+        (LC, Subject Term, sub-class ranges, distribution). No usage views.
+    mode="usage"      -> Use Analysis tool (print / other-usage branch): the
+        same engine with usage on, exposing Coverage-vs-Use, gap, and
+        usage-weighted title analysis. Expects the synced explicit-zero
+        master from the Zero-Use Identifier as input.
+
+    Widget/session/cache keys carry the `KP` prefix so the two modes keep
+    independent state when the user switches between tools.
+    """
+    KP = "" if mode == "structure" else "use_"
+
+    if f'{KP}prof_results' not in st.session_state:
+        st.session_state[f'{KP}prof_results'] = None
+    if f'{KP}prof_filtered_idx' not in st.session_state:
+        st.session_state[f'{KP}prof_filtered_idx'] = None
+
+    if mode == "structure":
+        st.header("\U0001F5FA\uFE0F Collection Profiler")
         st.markdown(
-            "- **Collections:** Baseline assessment, accreditation self-studies, weeding prep "
-            "(find thin/missing areas), justifying budget asks by showing strengths.\n"
-            "- **Instruction:** Prepare for a liaison session — see at a glance what you "
-            "actually have in HQ or PN before walking into the class.\n"
-            "- **Outreach:** Quick visuals for faculty meetings and annual reports "
-            "(\"here's what sociology looks like in our collection\")."
+            "**What does our collection look like?** Upload a title list from "
+            "Alma or a vendor with subject terms and/or LC call numbers to map "
+            "disciplinary strengths and explore subject coverage. This view is "
+            "structure-only \u2014 for usage-driven analysis (Coverage vs. Use, "
+            "cost-per-use, dead weight) use the **Use Analysis** tool."
         )
-
+        with st.expander("\u2139\uFE0F When to use this tool"):
+            st.markdown(
+                "- **Collections:** Baseline assessment, accreditation self-studies, "
+                "weeding prep (find thin/missing areas), justifying budget asks by "
+                "showing strengths.\n"
+                "- **Instruction:** Prepare for a liaison session \u2014 see at a glance "
+                "what you actually have in HQ or PN before walking into the class.\n"
+                "- **Outreach:** Quick visuals for faculty meetings and annual reports "
+                "(\"here's what sociology looks like in our collection\")."
+            )
+        _uploader_label = "\U0001F4C2 Upload title list (CSV or Excel)"
+        _uploader_help = ("Needs Subjects and/or LC Classification. Optimized for "
+                          "500K\u20131M+ records. Excel (XLS, XLSX) also supported "
+                          "\u2014 useful for vendor admin exports.")
+        _empty_hint = ("\U0001F4A1 Your file should have some combination of "
+                       "**Subjects**, **LC Classification** or **Call Number**, "
+                       "and **Title**.")
+    else:
+        if flavor == "print":
+            st.markdown(
+                "**Print circulation.** Upload the synced **explicit-zero master** "
+                "from the Zero-Use Identifier (Title + Subjects/LC + circulation, with "
+                "unused titles carried as 0). You'll get Coverage vs. Use, top titles, "
+                "and gap-vs-use across LC and subject."
+            )
+        else:
+            st.markdown(
+                "**Other usage data.** Upload a synced title-level file with a usage "
+                "column (plus Subjects/LC if you have them) \u2014 ideally the "
+                "explicit-zero master from the Zero-Use Identifier so unused titles "
+                "count as 0. Coverage vs. Use unlocks when Subjects/LC are present."
+            )
+        _uploader_label = "\U0001F4C2 Upload synced usage file (CSV or Excel)"
+        _uploader_help = ("Title-level file with a usage column. Include Subjects "
+                          "and/or LC to unlock Coverage vs. Use. The **All titles "
+                          "(explicit zeros)** output from the Zero-Use Identifier is "
+                          "the intended input.")
+        _empty_hint = ("\U0001F4A1 Feed the **All titles (explicit zeros)** output "
+                       "from the Zero-Use Identifier: Title + a usage column, plus "
+                       "Subjects/LC to unlock Coverage vs. Use.")
 
     uploaded_file = st.file_uploader(
-        "📂 Upload title list (CSV or Excel)", type=['csv', 'xls', 'xlsx'],
-        help="Needs Subjects and/or LC Classification; usage columns (Loans, "
-             "Checkouts, Total Accesses, Downloads, etc.) are optional. "
-             "Optimized for 500K–1M+ records. Excel files (XLS, XLSX) are also "
-             "supported — useful for vendor admin exports like the EBSCO "
-             "Detailed Report.",
-        key="prof_upload"
+        _uploader_label, type=['csv', 'xls', 'xlsx'],
+        help=_uploader_help,
+        key=f"{KP}prof_upload"
     )
 
     if uploaded_file is None:
-        st.caption(
-            "💡 Your file should have some combination of **Subjects**, "
-            "**LC Classification** or **Call Number**, **Title**, "
-            "and optionally a usage column. Vendor admin exports with rich "
-            "metadata (e.g., EBSCO Detailed Report with subjects + LC + usage) "
-            "work especially well here."
-        )
+        st.caption(_empty_hint)
         return
 
     # Friendly error if user uploaded an Excel file but the required library
@@ -4228,7 +4275,7 @@ def page_collection_profiler():
 
     # Check session cache first — if we've already processed this file in
     # this session, skip the load + LC extraction + weight coercion entirely
-    cached_df = _cached_df_for_tool("profiler", uploaded_file)
+    cached_df = _cached_df_for_tool(f"{KP}profiler", uploaded_file)
     if cached_df is not None:
         df = cached_df
         st.success(f"✅ Using cached data for *{uploaded_file.name}* "
@@ -4283,7 +4330,7 @@ def page_collection_profiler():
             df['_lc_range'] = None
 
         # Save to cache for future tool switches
-        _store_cached_df("profiler", uploaded_file, df)
+        _store_cached_df(f"{KP}profiler", uploaded_file, df)
 
     # Track prior LC column so we re-extract if user changes it
     _original_lc_col = find_column(df, LC_ALIASES)
@@ -4312,11 +4359,11 @@ def page_collection_profiler():
 
         mc1, mc2 = st.columns(2)
         with mc1:
-            subj_pick = st.selectbox("Subjects column", options, index=_idx(subj_col), key="prof_map_subj")
-            title_pick = st.selectbox("Title column (optional)", options, index=_idx(title_col), key="prof_map_title")
+            subj_pick = st.selectbox("Subjects column", options, index=_idx(subj_col), key=f"{KP}prof_map_subj")
+            title_pick = st.selectbox("Title column (optional)", options, index=_idx(title_col), key=f"{KP}prof_map_title")
         with mc2:
-            lc_pick = st.selectbox("LC / Call Number column", options, index=_idx(lc_col), key="prof_map_lc")
-            weight_pick = st.selectbox("Usage / weight column (optional)", options, index=_idx(weight_col), key="prof_map_weight")
+            lc_pick = st.selectbox("LC / Call Number column", options, index=_idx(lc_col), key=f"{KP}prof_map_lc")
+            weight_pick = st.selectbox("Usage / weight column (optional)", options, index=_idx(weight_col), key=f"{KP}prof_map_weight")
 
         subj_col = None if subj_pick == none_opt else subj_pick
         lc_col = None if lc_pick == none_opt else lc_pick
@@ -4362,15 +4409,23 @@ def page_collection_profiler():
         weight_options = ["Title count (1 per title)"]
         if weight_col:
             weight_options.append(f"Usage metric ({weight_label})")
-        analysis_mode = st.radio("Weight titles by:", weight_options, index=0, key="prof_mode")
-        use_weight = weight_col and "Usage" in analysis_mode
+        if mode == "usage":
+            # Usage analysis: default to weighting by the usage column when present
+            _w_idx = 1 if (weight_col and len(weight_options) > 1) else 0
+            analysis_mode = st.radio("Weight titles by:", weight_options,
+                                     index=_w_idx, key=f"{KP}prof_mode")
+            use_weight = weight_col and "Usage" in analysis_mode
+        else:
+            # Structure-only profiling: usage never drives the analysis
+            analysis_mode = weight_options[0]
+            use_weight = False
 
         if lc_col:
             st.markdown("---")
             st.subheader("Filter by LC class")
             avail = sorted(df['_lc_main'].dropna().unique())
             labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in avail]
-            sel_labels = st.multiselect("Include:", labels, default=labels, key="prof_lc_filter")
+            sel_labels = st.multiselect("Include:", labels, default=labels, key=f"{KP}prof_lc_filter")
             sel_classes = [l.split(' –')[0] for l in sel_labels]
         else:
             sel_classes = None
@@ -4379,35 +4434,39 @@ def page_collection_profiler():
     with st.expander("🎨 Customize view (visualizations, word cloud, thresholds)", expanded=False):
         vc1, vc2 = st.columns(2)
         with vc1:
-            top_n = st.slider("Top N subjects", 10, 100, 30, 5, key="prof_topn")
-            show_sunburst = st.checkbox("LC sunburst", True, key="prof_sun")
-            show_treemap = st.checkbox("LC treemap", True, key="prof_tree")
-            show_bars = st.checkbox("Top subjects bar chart", True, key="prof_bars")
-            show_wordcloud = st.checkbox("Subject word cloud", True, key="prof_wc")
+            top_n = st.slider("Top N subjects", 10, 100, 30, 5, key=f"{KP}prof_topn")
+            show_sunburst = st.checkbox("LC sunburst", True, key=f"{KP}prof_sun")
+            show_treemap = st.checkbox("LC treemap", True, key=f"{KP}prof_tree")
+            show_bars = st.checkbox("Top subjects bar chart", True, key=f"{KP}prof_bars")
+            show_wordcloud = st.checkbox("Subject word cloud", True, key=f"{KP}prof_wc")
         with vc2:
-            show_heatmap = st.checkbox("LC × subject heatmap", True, key="prof_heat")
+            show_heatmap = st.checkbox("LC × subject heatmap", True, key=f"{KP}prof_heat")
             show_title_keywords = st.checkbox(
                 "Title keywords (uncontrolled vocabulary)",
                 value=bool(title_col),
                 disabled=not title_col,
-                key="prof_tk",
+                key=f"{KP}prof_tk",
                 help="A supplementary lens that tokenizes title text (with stopwords "
                      "stripped) — useful for surfacing terminology that subject "
                      "headings may have missed. Requires a Title column. Distinct "
                      "from the subject view above."
             )
-            show_coverage_vs_use = st.checkbox(
-                "Coverage vs. Use (requires usage column)",
-                value=bool(weight_col),
-                disabled=not weight_col,
-                key="prof_cvu",
-                help="Compare what % of the collection each area holds vs. what % "
-                     "of use it drives. Shows overperforming (small but heavily used) "
-                     "and underperforming (large but lightly used) areas. "
-                     "Uses LC class when available; falls back to subject terms otherwise."
-            )
-            show_gap = st.checkbox("Gap analysis", True, key="prof_gap")
-            show_detail = st.checkbox("Title detail table", False, key="prof_detail")
+            if mode == "usage":
+                show_coverage_vs_use = st.checkbox(
+                    "Coverage vs. Use (requires usage column)",
+                    value=bool(weight_col),
+                    disabled=not weight_col,
+                    key=f"{KP}prof_cvu",
+                    help="Compare what % of the collection each area holds vs. what % "
+                         "of use it drives. Shows overperforming (small but heavily used) "
+                         "and underperforming (large but lightly used) areas. "
+                         "Uses LC class when available; falls back to subject terms otherwise."
+                )
+                show_gap = st.checkbox("Gap analysis", True, key=f"{KP}prof_gap")
+            else:
+                show_coverage_vs_use = False
+                show_gap = False
+            show_detail = st.checkbox("Title detail table", False, key=f"{KP}prof_detail")
 
         # Coverage-vs-Use threshold configuration
         if show_coverage_vs_use and weight_col:
@@ -4417,21 +4476,21 @@ def page_collection_profiler():
                 cvu_over = st.slider(
                     "Overperforming threshold (≥)",
                     min_value=1.1, max_value=5.0, value=2.0, step=0.1,
-                    key="prof_cvu_over",
+                    key=f"{KP}prof_cvu_over",
                     help="Ratio at or above this flags an area as overperforming "
                          "(higher % of use than of holdings). Lower = more areas flagged."
                 )
                 cvu_under = st.slider(
                     "Underperforming threshold (≤)",
                     min_value=0.1, max_value=0.9, value=0.5, step=0.05,
-                    key="prof_cvu_under",
+                    key=f"{KP}prof_cvu_under",
                     help="Ratio at or below this flags an area as underperforming "
                          "(lower % of use than of holdings). Higher = more areas flagged."
                 )
                 cvu_min_titles = st.number_input(
                     "Minimum titles to include in signal",
                     min_value=1, max_value=1000, value=10,
-                    key="prof_cvu_min",
+                    key=f"{KP}prof_cvu_min",
                     help="LC areas with fewer titles than this won't get a signal "
                          "label (too little data to draw conclusions). They still appear "
                          "in the table marked as '—'."
@@ -4439,7 +4498,7 @@ def page_collection_profiler():
                 cvu_show_sub = st.checkbox(
                     "Also break down by LC subclass",
                     value=True,
-                    key="prof_cvu_sub",
+                    key=f"{KP}prof_cvu_sub",
                     help="Shows e.g. HQ1000s separately from HQ750s."
                 )
         else:
@@ -4448,12 +4507,12 @@ def page_collection_profiler():
         # Word cloud sub-options (only shown when word cloud is on)
         if show_wordcloud:
             with st.expander("☁️ Word cloud options"):
-                wc_max_words = st.slider("Max words", 20, 200, 100, 10, key="prof_wc_max")
-                wc_min_len = st.slider("Min word length", 1, 10, 3, key="prof_wc_min")
+                wc_max_words = st.slider("Max words", 20, 200, 100, 10, key=f"{KP}prof_wc_max")
+                wc_min_len = st.slider("Min word length", 1, 10, 3, key=f"{KP}prof_wc_min")
                 wc_color = st.selectbox(
                     "Color scheme",
                     ["viridis", "plasma", "inferno", "magma", "cividis", "twilight", "rainbow"],
-                    key="prof_wc_color"
+                    key=f"{KP}prof_wc_color"
                 )
         else:
             wc_max_words, wc_min_len, wc_color = 100, 3, "viridis"
@@ -4462,7 +4521,7 @@ def page_collection_profiler():
         if show_title_keywords:
             with st.expander("🔤 Title keyword options"):
                 tk_top_n = st.slider(
-                    "Top N keywords (per n-gram size)", 10, 100, 30, 5, key="prof_tk_topn",
+                    "Top N keywords (per n-gram size)", 10, 100, 30, 5, key=f"{KP}prof_tk_topn",
                     help="Number of keywords/phrases to chart and include in the "
                          "table for each n-gram size you've selected."
                 )
@@ -4473,7 +4532,7 @@ def page_collection_profiler():
                              "Three-word phrases (trigrams)"],
                     default=["Single words (unigrams)",
                              "Two-word phrases (bigrams)"],
-                    key="prof_tk_ngrams",
+                    key=f"{KP}prof_tk_ngrams",
                     help="Phrases preserve concepts that single words split apart "
                          "(e.g., 'data science' as a unit, not 'data' + 'science'). "
                          "N-grams don't cross subtitle punctuation, and stopwords "
@@ -4491,27 +4550,27 @@ def page_collection_profiler():
                 tk_min_freq = st.number_input(
                     "Min distinct titles (for bigrams/trigrams)",
                     min_value=1, max_value=20, value=2, step=1,
-                    key="prof_tk_minfreq",
+                    key=f"{KP}prof_tk_minfreq",
                     help="Multi-word phrases that appear in only one title are "
                          "usually noise (or a duplicate record). Set to 1 to "
                          "include them anyway. Doesn't apply to single-word "
                          "keywords."
                 )
                 tk_show_wordcloud = st.checkbox(
-                    "Also show keyword word cloud", value=False, key="prof_tk_wc",
+                    "Also show keyword word cloud", value=False, key=f"{KP}prof_tk_wc",
                     help="A separate cloud from the subject one — built from title "
                          "tokens, not subject headings. Uses unigrams only "
                          "(word clouds don't render multi-word phrases well)."
                 )
                 if tk_show_wordcloud:
                     tk_wc_max_words = st.slider(
-                        "Cloud: max words", 20, 200, 100, 10, key="prof_tk_wc_max"
+                        "Cloud: max words", 20, 200, 100, 10, key=f"{KP}prof_tk_wc_max"
                     )
                     tk_wc_color = st.selectbox(
                         "Cloud: color scheme",
                         ["plasma", "viridis", "inferno", "magma", "cividis",
                          "twilight", "rainbow"],
-                        key="prof_tk_wc_color"
+                        key=f"{KP}prof_tk_wc_color"
                     )
                 else:
                     tk_wc_max_words, tk_wc_color = 100, "plasma"
@@ -4519,7 +4578,7 @@ def page_collection_profiler():
                     "Extra stopwords (comma- or newline-separated)",
                     value="",
                     height=80,
-                    key="prof_tk_stops",
+                    key=f"{KP}prof_tk_stops",
                     help="Add domain-specific words to ignore — e.g., your "
                          "publisher's series name, or a recurring genre word that "
                          "isn't analytically interesting. Applied before n-grams "
@@ -4543,43 +4602,46 @@ def page_collection_profiler():
             "Changes here apply the next time you click **Re-run analysis** "
             "(or the main button below)."
         )
-        rerun_clicked = st.button("🔄 Re-run analysis", key="prof_rerun", use_container_width=True)
+        rerun_clicked = st.button("🔄 Re-run analysis", key=f"{KP}prof_rerun", use_container_width=True)
 
     # Decide whether to run analysis:
     # - Always run on first upload of a file (no cached results for this file)
     # - Re-run if user clicks the rerun button inside the expander
     # - Re-run if user explicitly clicks the main Analyze button (shown below)
     file_key = _make_file_key(uploaded_file)
-    last_run_key = st.session_state.get('prof_last_run_file_key')
-    needs_autorun = st.session_state.get('prof_results') is None or last_run_key != file_key
+    last_run_key = st.session_state.get(f'{KP}prof_last_run_file_key')
+    needs_autorun = st.session_state.get(f'{KP}prof_results') is None or last_run_key != file_key
 
     main_run_clicked = st.button(
         "🔍 Re-analyze collection",
         type="secondary",
         use_container_width=True,
-        key="prof_run",
+        key=f"{KP}prof_run",
         help="Click to re-run with current settings."
     )
 
     if needs_autorun or rerun_clicked or main_run_clicked:
         w_key = '_weight' if use_weight else None
+        # Structure mode is usage-free: never expose usage columns or
+        # usage-weighted views even if the file happens to carry a usage column.
+        eff_weight_col = weight_col if mode == "usage" else None
         pbar = st.progress(0, "Starting analysis...")
         results = _profiler_run_analysis(
             df, subj_col, lc_col, title_col, w_key, sel_classes, pbar,
-            has_usage_col=bool(weight_col),
+            has_usage_col=bool(eff_weight_col),
             ngram_sizes=tk_ngram_sizes,
         )
-        st.session_state['prof_results'] = results
-        st.session_state['prof_last_run_file_key'] = file_key
+        st.session_state[f'{KP}prof_results'] = results
+        st.session_state[f'{KP}prof_last_run_file_key'] = file_key
         if sel_classes is not None and lc_col:
             mask = df['_lc_main'].isin(sel_classes) | df['_lc_main'].isna()
-            st.session_state['prof_filtered_idx'] = df.index[mask]
+            st.session_state[f'{KP}prof_filtered_idx'] = df.index[mask]
         else:
-            st.session_state['prof_filtered_idx'] = df.index
-        st.session_state['prof_settings'] = {
+            st.session_state[f'{KP}prof_filtered_idx'] = df.index
+        st.session_state[f'{KP}prof_settings'] = {
             'weight_label': weight_label if use_weight else 'Title Count',
-            'usage_col_label': weight_col or 'Usage',
-            'has_usage_col': bool(weight_col),
+            'usage_col_label': eff_weight_col or 'Usage',
+            'has_usage_col': bool(eff_weight_col),
             'top_n_subjects': top_n,
             'show_sunburst': show_sunburst, 'show_treemap': show_treemap,
             'show_subject_bars': show_bars,
@@ -4598,10 +4660,10 @@ def page_collection_profiler():
         }
         pbar.empty()
 
-    if st.session_state['prof_results']:
+    if st.session_state[f'{KP}prof_results']:
         _profiler_display_results(
-            st.session_state['prof_results'],
-            st.session_state.get('prof_settings', {
+            st.session_state[f'{KP}prof_results'],
+            st.session_state.get(f'{KP}prof_settings', {
                 'weight_label': 'Title Count', 'usage_col_label': 'Usage',
                 'top_n_subjects': 30,
                 'show_sunburst': True, 'show_treemap': True,
@@ -4619,14 +4681,62 @@ def page_collection_profiler():
                 'show_gap_analysis': True, 'show_detail_table': False,
             }),
             df,
-            st.session_state.get('prof_filtered_idx', df.index),
+            st.session_state.get(f'{KP}prof_filtered_idx', df.index),
             title_col=title_col,
-            weight_col=weight_col,
+            weight_col=(weight_col if mode == "usage" else None),
             author_col=author_col,
             date_col=date_col,
             location_col=location_col,
             subj_col=subj_col,
         )
+
+
+def page_collection_profiler():
+    """Collection Profiler page — holdings structure only (no usage views)."""
+    _profiler_ui(mode="structure")
+
+
+def page_use_analysis():
+    """Use Analysis — one tool for all usage-driven analysis, print and electronic.
+
+    Branches by data type:
+      • Print circulation (subject + usage) -> profiler engine, usage on
+      • Electronic / COUNTER 5 report       -> the COUNTER reader (native file)
+      • Electronic / other usage data       -> profiler engine, usage on (generic)
+
+    The print and other-usage branches expect the synced explicit-zero master
+    from the Zero-Use Identifier so titles with no recorded use count as 0.
+    """
+    st.header("\U0001F4C8 Use Analysis")
+    st.markdown(
+        "**What's getting used \u2014 and is it worth keeping?** One place for "
+        "usage-driven analysis across print and electronic. Most branches expect "
+        "the synced **explicit-zero master** from the Zero-Use Identifier, so "
+        "titles with no recorded use are counted as 0 rather than dropped."
+    )
+    data_type = st.radio(
+        "What kind of usage data are you analyzing?",
+        ["Print circulation (subject + usage)",
+         "Electronic \u2014 COUNTER 5 report",
+         "Electronic \u2014 other usage data"],
+        index=0, key="use_data_type",
+    )
+    st.markdown("---")
+
+    if data_type.startswith("Electronic \u2014 COUNTER"):
+        st.info(
+            "\u26A0\uFE0F COUNTER 5 reports list only titles that were used. Cost-per-use "
+            "and dead-weight percentages need the full title universe as the "
+            "denominator. Before relying on those figures, reconcile the vendor's "
+            "Portfolio List (Alma) or supplied title list against this report in the "
+            "**Zero-Use Identifier** first \u2014 the native COUNTER file below still "
+            "drives the monthly-trend and per-title views."
+        )
+        _render_counter_mode()
+    elif data_type.startswith("Print"):
+        _profiler_ui(mode="usage", flavor="print")
+    else:
+        _profiler_ui(mode="usage", flavor="other")
 
 
 # =====================================================================
@@ -5426,6 +5536,7 @@ def page_zero_use_identifier():
         h_ids = _detect_id_columns(holdings_df)
         u_ids = _detect_id_columns(usage_df)
         h_lc = find_column(holdings_df, LC_ALIASES)
+        h_subj = find_column(holdings_df, SUBJECT_ALIASES)
         h_loc = find_column(holdings_df, ['Location', 'Location Name', 'location',
                                           'Library', 'Branch'])
         h_format = find_column(holdings_df, ['Format', 'Material Type', 'Resource Type',
@@ -5440,7 +5551,7 @@ def page_zero_use_identifier():
             hcols_text = " · ".join([f"{k.upper()}: `{v}`" if v else f"{k.upper()}: —"
                                      for k, v in h_ids.items()])
             st.caption(hcols_text)
-            st.caption(f"LC: `{h_lc}` · Location: `{h_loc}` · "
+            st.caption(f"LC: `{h_lc}` · Subjects: `{h_subj}` · Location: `{h_loc}` · "
                        f"Format: `{h_format}` · Pub Year: `{h_pubyear}`")
 
             st.markdown("**Usage file:**")
@@ -5725,18 +5836,7 @@ def page_zero_use_identifier():
         if pubyear_cutoff is not None and '_pubyear' in zero_use.columns:
             zero_use = zero_use[zero_use['_pubyear'] < pubyear_cutoff]
 
-        # Tabs
-        st.markdown("---")
-        tabs_to_show = ["Zero/low-use list", "Unmatched items", "All items (combined)"]
-        if h_lc:
-            tabs_to_show.append("LC breakdown")
-        if h_format:
-            tabs_to_show.append("Format breakdown")
-        if h_pubyear:
-            tabs_to_show.append("Age distribution")
-        tab_objs = st.tabs(tabs_to_show)
-
-        # Build display columns once (used by Zero/low-use and Unmatched tabs)
+        # Build display columns once (carried into both outputs, incl. subjects)
         display_cols = []
         if h_ids.get('title'):
             display_cols.append(h_ids['title'])
@@ -5747,6 +5847,8 @@ def page_zero_use_identifier():
                 display_cols.append(h_ids[k])
         if h_lc:
             display_cols.append(h_lc)
+        if h_subj:
+            display_cols.append(h_subj)
         if h_loc:
             display_cols.append(h_loc)
         if h_format:
@@ -5757,296 +5859,143 @@ def page_zero_use_identifier():
         seen = set()
         display_cols = [c for c in display_cols if not (c in seen or seen.add(c))]
 
-        # --- Zero/low-use list ---
-        with tab_objs[0]:
+        # ---------------------------------------------------------------
+        # Outputs — exactly two title-level deliverables:
+        #   1. Zero-use titles            -> the flagged zero/low-use list.
+        #   2. All titles (explicit zeros) -> every holdings title with a
+        #      numeric use value; titles with no recorded use carry an
+        #      explicit 0. This is the synced universe you feed to the
+        #      Collection Profiler (Coverage-vs-Use) or COUNTER triage.
+        # Both outputs retain subject metadata when the holdings file has it.
+        # Structural breakdowns (LC / format / age) intentionally live in the
+        # Collection Profiler, which is built to map the collection; that keeps
+        # this tool to one job — reconcile holdings against usage.
+        # ---------------------------------------------------------------
+        st.markdown("---")
+        out_tab1, out_tab2 = st.tabs(["Zero-use titles",
+                                      "All titles (explicit zeros)"])
+
+        # --- Output 1: Zero-use titles ---
+        with out_tab1:
             cutoff_msg = (' AND were published before ' + str(pubyear_cutoff)
                           if pubyear_cutoff else '')
             if treat_unmatched_as_zero:
                 st.markdown(
-                    f"**{len(zero_use):,} items** flagged as zero/low-use "
-                    f"(matched ≤ {threshold:g} use **plus** unmatched "
-                    f"items){cutoff_msg}."
+                    f"**{len(zero_use):,} titles** flagged as zero/low-use "
+                    f"(matched \u2264 {threshold:g} use **plus** unmatched "
+                    f"titles){cutoff_msg}."
                 )
                 st.caption(
-                    "📌 Combining matched-low and unmatched items because "
-                    "**Treat unmatched as zero-use** is on in the sidebar. "
-                    "The `Matched Via` column shows which group each item "
-                    "came from."
+                    "\U0001F4CC Unmatched titles are folded in because **Treat "
+                    "unmatched as zero-use** is on. The `Matched Via` column shows "
+                    "which group each title came from."
                 )
             else:
                 st.markdown(
-                    f"**{len(zero_use):,} items** in your holdings have ≤ "
-                    f"{threshold:g} use{cutoff_msg}."
+                    f"**{len(zero_use):,} titles** in your holdings have \u2264 "
+                    f"{threshold:g} recorded use{cutoff_msg}."
                 )
                 if n_unmatched > 0:
                     st.caption(
-                        f"📌 This list excludes the **{n_unmatched:,} unmatched** "
-                        "items (see the next tab). To merge them in, turn on "
-                        "**Treat unmatched as zero-use** in the sidebar."
+                        f"\U0001F4CC This list excludes the **{n_unmatched:,} "
+                        "unmatched** titles. They still appear in the All-titles "
+                        "output below, tagged `Unmatched`. To treat them as zero-use "
+                        "here, turn on **Treat unmatched as zero-use** in the sidebar."
                     )
-            zero_cols = list(display_cols) + ['_matched_via', '_usage_total']
-            zero_cols = [c for c in zero_cols if c in zero_use.columns]
+            zero_cols = [c for c in (list(display_cols) + ['_matched_via', '_usage_total'])
+                         if c in zero_use.columns]
             display_df = zero_use[zero_cols].rename(columns={
                 '_matched_via': 'Matched Via',
                 '_usage_total': 'Total Use',
             }).sort_values('Total Use')
-
             st.dataframe(display_df, use_container_width=True, height=500, hide_index=True)
 
-            _zu_fname = ("zero_use_items_combined.csv" if treat_unmatched_as_zero
-                         else "zero_use_items.csv")
-            _zu_view = ("Zero/Low-Use List (combined with unmatched)"
-                        if treat_unmatched_as_zero else "Zero/Low-Use List")
             _zu_bytes = _annotate_csv(
                 display_df, notes,
                 extra_meta={'Tool': 'Zero-Use Identifier',
-                            'View': _zu_view,
+                            'View': 'Zero-use titles'
+                                    + (' (incl. unmatched)' if treat_unmatched_as_zero else ''),
                             'Threshold': threshold,
                             'Pub-year cutoff': pubyear_cutoff or 'none',
                             'Treat unmatched as zero-use': treat_unmatched_as_zero,
                             'Holdings rows': total_holdings,
                             'Usage rows': len(usage_df),
+                            'Subjects retained': bool(h_subj),
                             'Match keys': ', '.join(shared_keys)}
             )
-            st.download_button("📥 Zero/low-use list (CSV)",
-                               _zu_bytes, _zu_fname, "text/csv",
-                               key="zu_dl_main")
-            _add_to_tray("zero_use", _zu_fname, _zu_bytes)
+            _dl("\U0001F4E5 Zero-use titles (CSV)", _zu_bytes,
+                "zero_use_titles.csv", "text/csv",
+                key="zu_dl_zero", tool_key="zero_use")
 
-        # --- Unmatched items ---
-        with tab_objs[1]:
-            unmatched_df = matched[matched['_matched_via'] == 'unmatched'].copy()
-            if treat_unmatched_as_zero:
-                st.success(
-                    f"📌 The **{len(unmatched_df):,} unmatched items** below are "
-                    "also included in the Zero/low-use list (combined view is on)."
-                )
-            st.markdown(
-                f"**{len(unmatched_df):,} items** in holdings could not be matched "
-                "to any usage row. These are *probably* zero-use, but they could "
-                "also indicate a coverage gap in the usage report (e.g., a vendor "
-                "that didn't return a row at all for a title with zero use)."
-            )
-            st.caption(
-                "Spot-check a few: if you find titles that *should* have appeared "
-                "in the usage file, your usage report is incomplete and the match "
-                "may be underestimating zero-use."
-            )
-            if not unmatched_df.empty:
-                um_cols = [c for c in display_cols if c in unmatched_df.columns]
-                um_display = unmatched_df[um_cols]
-                st.dataframe(um_display, use_container_width=True, height=400, hide_index=True)
-                _um_bytes = _annotate_csv(
-                    um_display, notes,
-                    extra_meta={'Tool': 'Zero-Use Identifier',
-                                'View': 'Unmatched Items',
-                                'Note': 'Items in holdings with no row in usage file'}
-                )
-                st.download_button("📥 Unmatched items (CSV)",
-                                   _um_bytes, "unmatched_items.csv", "text/csv",
-                                   key="zu_dl_unmatched")
-                _add_to_tray("zero_use", "unmatched_items.csv", _um_bytes)
-
-        # --- All items (combined) ---
-        # One master list: the zero/low-use items merged with the items that
-        # actually have use, in a single table/CSV. A "Use Status" column tags
-        # each row so the groups can be filtered or sorted apart again.
-        #
-        # This view RESPECTS the sidebar toggles:
-        #   • Pub-year cutoff — when set, the list is limited to items published
-        #     before the cutoff (the same filter the Zero/low-use tab applies).
-        #   • "Treat unmatched as zero-use" — when ON, unmatched items are folded
-        #     into the zero/low-use group (no separate Unmatched bucket); when
-        #     OFF, unmatched items keep their own status.
-        with tab_objs[2]:
-            combined = matched.copy()
-
-            # Respect the optional pub-year cutoff (same filter as the first tab)
-            if pubyear_cutoff is not None and '_pubyear' in combined.columns:
-                combined = combined[combined['_pubyear'] < pubyear_cutoff].copy()
-
-            is_unm = combined['_matched_via'] == 'unmatched'
-            matched_low = (~is_unm) & (combined['_usage_total'] <= threshold)
-            has_use = (~is_unm) & (combined['_usage_total'] > threshold)
+        # --- Output 2: All titles with explicit zeros ---
+        # Every holdings title with a numeric use value (0 where unused). No
+        # pub-year cutoff here: this is the full synced universe meant to feed
+        # Coverage-vs-Use / COUNTER triage. The cutoff only narrows the flagged
+        # zero-use list above.
+        with out_tab2:
+            allt = matched.copy()
+            is_unm = allt['_matched_via'] == 'unmatched'
+            matched_low = (~is_unm) & (allt['_usage_total'] <= threshold)
+            has_use = (~is_unm) & (allt['_usage_total'] > threshold)
             zero_label = f'Zero/low-use (\u2264 {threshold:g})'
-
             if treat_unmatched_as_zero:
-                # Toggle ON: unmatched folded into zero/low-use, no separate bucket
-                combined['_use_status'] = np.where(has_use, 'Has use', zero_label)
-                n_has_use = int(has_use.sum())
-                n_zero_low = int((~has_use).sum())   # matched-low + unmatched
+                # Unmatched folded into zero/low-use, no separate bucket
+                allt['_use_status'] = np.where(has_use, 'Has use', zero_label)
+                n_zero = int((~has_use).sum())   # matched-low + unmatched
                 n_unm = 0
             else:
-                # Toggle OFF: unmatched kept as their own status
-                combined['_use_status'] = np.where(
+                allt['_use_status'] = np.where(
                     is_unm, 'Unmatched',
-                    np.where(matched_low, zero_label, 'Has use')
-                )
-                n_has_use = int(has_use.sum())
-                n_zero_low = int(matched_low.sum())
+                    np.where(matched_low, zero_label, 'Has use'))
+                n_zero = int(matched_low.sum())
                 n_unm = int(is_unm.sum())
+            n_has_use = int(has_use.sum())
 
-            cutoff_note = (f" published before {pubyear_cutoff}"
-                           if pubyear_cutoff is not None else "")
             st.markdown(
-                f"**{len(combined):,} items{cutoff_note}** — zero/low-use merged "
-                f"with the items that have use, in one list."
+                f"**{len(allt):,} titles** — every holdings title with an explicit "
+                "use value (titles with no recorded use carry **0**). This is the "
+                "synced file to feed the Collection Profiler (Coverage-vs-Use) or "
+                "COUNTER triage."
             )
             if treat_unmatched_as_zero:
-                status_line = (
-                    f"📋 {n_zero_low:,} zero/low-use (\u2264 {threshold:g}, "
-                    f"includes unmatched) · {n_has_use:,} with use. "
-                    "Unmatched items are folded into the zero/low-use group "
-                    "because **Treat unmatched as zero-use** is on."
+                st.caption(
+                    f"\U0001F4CB {n_zero:,} zero/low-use (incl. unmatched) \u00b7 "
+                    f"{n_has_use:,} with use. Sort or filter on **Use Status**."
                 )
             else:
-                status_line = (
-                    f"📋 {n_zero_low:,} zero/low-use (\u2264 {threshold:g}) · "
-                    f"{n_unm:,} unmatched · {n_has_use:,} with use. "
-                    "Sort or filter on the **Use Status** column to pull any one "
-                    "group back out."
+                st.caption(
+                    f"\U0001F4CB {n_zero:,} zero/low-use \u00b7 {n_unm:,} unmatched "
+                    "(inferred 0 \u2014 could be a usage-report gap) \u00b7 "
+                    f"{n_has_use:,} with use. Sort or filter on **Use Status**."
                 )
-            if pubyear_cutoff is not None:
-                status_line += (f" Limited to items published before "
-                                f"{pubyear_cutoff} (pub-year cutoff is on).")
-            st.caption(status_line)
 
-            comb_cols = list(display_cols) + ['_use_status', '_matched_via', '_usage_total']
-            comb_cols = [c for c in comb_cols if c in combined.columns]
-            comb_display = combined[comb_cols].rename(columns={
+            comb_cols = [c for c in (list(display_cols)
+                         + ['_use_status', '_matched_via', '_usage_total'])
+                         if c in allt.columns]
+            comb_display = allt[comb_cols].rename(columns={
                 '_use_status': 'Use Status',
                 '_matched_via': 'Matched Via',
                 '_usage_total': 'Total Use',
             }).sort_values('Total Use')
-
             st.dataframe(comb_display, use_container_width=True, height=500, hide_index=True)
 
-            _comb_bytes = _annotate_csv(
+            _all_bytes = _annotate_csv(
                 comb_display, notes,
                 extra_meta={'Tool': 'Zero-Use Identifier',
-                            'View': 'All Items (combined: zero/low-use + used)',
+                            'View': 'All titles (explicit zeros)',
                             'Threshold': threshold,
-                            'Pub-year cutoff': pubyear_cutoff or 'none',
                             'Treat unmatched as zero-use': treat_unmatched_as_zero,
                             'Holdings rows': total_holdings,
-                            'Rows in this list': len(combined),
                             'Usage rows': len(usage_df),
+                            'Subjects retained': bool(h_subj),
                             'Match keys': ', '.join(shared_keys),
-                            'Zero/low-use items': n_zero_low,
-                            'Unmatched items': n_unm,
-                            'Items with use': n_has_use}
+                            'Zero/low-use titles': n_zero,
+                            'Unmatched titles': n_unm,
+                            'Titles with use': n_has_use}
             )
-            st.download_button("📥 All items combined (CSV)",
-                               _comb_bytes, "zero_use_all_items_combined.csv", "text/csv",
-                               key="zu_dl_combined")
-            _add_to_tray("zero_use", "zero_use_all_items_combined.csv", _comb_bytes)
-
-        # --- LC breakdown ---
-        idx = 3
-        if h_lc:
-            with tab_objs[idx]:
-                lc_summary = matched.groupby('_lc_main').agg(
-                    **{
-                        'Total Holdings': (h_lc, 'count'),
-                        'Total Use': ('_usage_total', 'sum'),
-                    }
-                ).reset_index().rename(columns={'_lc_main': 'LC Class'})
-                low_per_lc = matched[matched['_usage_total'] <= threshold].groupby('_lc_main').size()
-                lc_summary['Zero/Low-Use Items'] = lc_summary['LC Class'].map(low_per_lc).fillna(0).astype(int)
-                lc_summary['% Zero/Low-Use'] = (
-                    lc_summary['Zero/Low-Use Items'] / lc_summary['Total Holdings'] * 100
-                ).round(1)
-                lc_summary['Description'] = lc_summary['LC Class'].map(
-                    lambda c: LC_CLASSES.get(c, '?')
-                )
-                lc_summary = lc_summary[['LC Class', 'Description', 'Total Holdings',
-                                         'Total Use', 'Zero/Low-Use Items', '% Zero/Low-Use']]
-                lc_summary = lc_summary.sort_values('Zero/Low-Use Items', ascending=False)
-
-                st.markdown("**Where is the dead weight concentrated?**")
-                st.dataframe(lc_summary, use_container_width=True, hide_index=True, height=500)
-
-                fig = px.bar(
-                    lc_summary.head(15), x='% Zero/Low-Use', y='LC Class',
-                    orientation='h', color='% Zero/Low-Use',
-                    color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
-                    hover_data=['Description', 'Total Holdings', 'Zero/Low-Use Items'],
-                    title='% Zero/Low-Use by LC Class (top 15)',
-                )
-                fig.update_layout(yaxis={'categoryorder': 'total ascending'},
-                                  height=500, showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-
-                _lc_bytes = _annotate_csv(
-                    lc_summary, notes,
-                    extra_meta={'Tool': 'Zero-Use Identifier', 'View': 'LC Breakdown',
-                                'Threshold': threshold}
-                )
-                st.download_button("📥 LC breakdown (CSV)",
-                                   _lc_bytes, "zero_use_by_lc.csv", "text/csv",
-                                   key="zu_dl_lc")
-                _add_to_tray("zero_use", "zero_use_by_lc.csv", _lc_bytes)
-            idx += 1
-
-        # --- Format breakdown ---
-        if h_format:
-            with tab_objs[idx]:
-                fmt_summary = matched.groupby(h_format).agg(
-                    **{
-                        'Total Holdings': (h_format, 'count'),
-                        'Total Use': ('_usage_total', 'sum'),
-                    }
-                ).reset_index()
-                low_per_fmt = matched[matched['_usage_total'] <= threshold].groupby(h_format).size()
-                fmt_summary['Zero/Low-Use Items'] = fmt_summary[h_format].map(low_per_fmt).fillna(0).astype(int)
-                fmt_summary['% Zero/Low-Use'] = (
-                    fmt_summary['Zero/Low-Use Items'] / fmt_summary['Total Holdings'] * 100
-                ).round(1)
-                fmt_summary = fmt_summary.sort_values('Zero/Low-Use Items', ascending=False)
-                st.dataframe(fmt_summary, use_container_width=True, hide_index=True)
-                _fmt_bytes = _annotate_csv(
-                    fmt_summary, notes,
-                    extra_meta={'Tool': 'Zero-Use Identifier', 'View': 'Format Breakdown',
-                                'Threshold': threshold}
-                )
-                st.download_button("📥 Format breakdown (CSV)",
-                                   _fmt_bytes, "zero_use_by_format.csv", "text/csv",
-                                   key="zu_dl_fmt")
-                _add_to_tray("zero_use", "zero_use_by_format.csv", _fmt_bytes)
-            idx += 1
-
-        # --- Age distribution ---
-        if h_pubyear:
-            with tab_objs[idx]:
-                # Ensure _pubyear exists (only added when optional cutoff is enabled)
-                if '_pubyear' not in matched.columns:
-                    matched['_pubyear'] = pd.to_numeric(matched[h_pubyear], errors='coerce')
-                age_df = matched.dropna(subset=['_pubyear']).copy()
-                if age_df.empty:
-                    st.info(f"Could not parse any values from `{h_pubyear}` as years.")
-                else:
-                    age_df['_pubyear'] = age_df['_pubyear'].astype(int)
-                    age_df['_is_zero'] = age_df['_usage_total'] <= threshold
-                    age_df['Decade'] = (age_df['_pubyear'] // 10 * 10).astype(int).astype(str) + 's'
-                    decade_summary = age_df.groupby('Decade').agg(
-                        Total=('_pubyear', 'count'),
-                        ZeroLowUse=('_is_zero', 'sum'),
-                    ).reset_index()
-                    decade_summary['% Zero/Low-Use'] = (
-                        decade_summary['ZeroLowUse'] / decade_summary['Total'] * 100
-                    ).round(1)
-                    decade_summary = decade_summary.sort_values('Decade')
-                    st.markdown("**Older items are more likely to sit unused — but how much?**")
-                    fig = px.bar(
-                        decade_summary, x='Decade', y='% Zero/Low-Use',
-                        color='% Zero/Low-Use',
-                        color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
-                        hover_data=['Total', 'ZeroLowUse'],
-                        title='% Zero/Low-Use by Publication Decade',
-                    )
-                    fig.update_layout(height=400, showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.dataframe(decade_summary, use_container_width=True, hide_index=True)
+            _dl("\U0001F4E5 All titles, explicit zeros (CSV)", _all_bytes,
+                "all_titles_explicit_zeros.csv", "text/csv",
+                key="zu_dl_all", tool_key="zero_use")
 
         # Download tray
         st.markdown("---")
@@ -6304,9 +6253,9 @@ def page_overlap_analyzer():
             "trimming without losing any content.\n"
             "- **Big-deal evaluation:** Rank databases by how much irreplaceable "
             "content they hold, so the all-or-nothing packages get scrutinized.\n"
-            "- **Pairs well with COUNTER Analyzer:** uniqueness tells you what's "
-            "*replaceable*; COUNTER tells you what's *used*. Cancel the titles "
-            "that are both redundant and unused first."
+            "- **Pairs well with Use Analysis:** uniqueness tells you what's "
+            "*replaceable*; usage (COUNTER or other) tells you what's *used*. Cancel "
+            "the titles that are both redundant and unused first."
         )
 
     with st.expander("\U0001F4D6 How the coverage math works", expanded=False):
@@ -6711,18 +6660,17 @@ def page_home():
         <div class="tool-card">
             <h3>🗺️ Collection Profiler</h3>
             <p><em>What does our collection look like?</em></p>
-            <p>LC sunburst, treemap, subject word cloud, gap analysis.
-            Map disciplinary strengths across 1M+ records via three views:
-            LC Analysis, Subject Term Analysis, and Title Analysis (which
-            absorbs circulation-style usage triage when usage data is present).</p>
+            <p>Structure only — LC sunburst, treemap, subject word cloud, and
+            sub-class range analysis. Map disciplinary strengths across 1M+ records
+            via LC Analysis and Subject Term Analysis. Usage-driven views live in
+            Use Analysis.</p>
             <hr>
             <p><strong>Use for:</strong></p>
             <ul>
                 <li>Baseline & accreditation reports</li>
                 <li>Liaison prep & subject policy revision</li>
                 <li>Budget justifications</li>
-                <li>Print weeding by low circulation</li>
-                <li>Coverage vs. Use (when usage column present)</li>
+                <li>Holdings distribution by LC & subject</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -6730,18 +6678,20 @@ def page_home():
     with c2:
         st.markdown("""
         <div class="tool-card">
-            <h3>📊 COUNTER Analyzer</h3>
-            <p><em>Which e-resources are pulling their weight?</em></p>
-            <p>Title-level usage from formal COUNTER 5 reports (TR/TR_J3/TR_B1/
-            DR/PR/IR). Cancellation candidates, publisher rollups, monthly trends.
-            Vendor admin exports with subjects/LC go to the Profiler instead.</p>
+            <h3>📈 Use Analysis</h3>
+            <p><em>What's getting used — and is it worth keeping?</em></p>
+            <p>One tool for all usage-driven analysis. Print circulation
+            (subject + usage), formal COUNTER 5 reports, or any other usage data.
+            Coverage vs. Use, top titles, gap-vs-use, cost-per-use, monthly trends,
+            and dead-weight titles. Feed it the explicit-zero master from the
+            Zero-Use Identifier.</p>
             <hr>
             <p><strong>Use for:</strong></p>
             <ul>
-                <li>Annual database renewals (Sept)</li>
-                <li>Cancellation review (July → Aug 1 deadline)</li>
-                <li>Big Deal evaluation (Dec renewals)</li>
-                <li>Annual watchlist refresh (May)</li>
+                <li>Coverage vs. Use (print or e-resource Branch A)</li>
+                <li>Database renewals & cancellation review</li>
+                <li>Big Deal evaluation, monthly trends</li>
+                <li>Print weeding by low circulation</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -6790,13 +6740,15 @@ def page_home():
     |---|---|
     | Show what the collection covers (or doesn't) | **Collection Profiler** → LC Analysis |
     | Map disciplinary strengths via subject terms | **Collection Profiler** → Subject Term Analysis |
-    | Pick books to weed from the stacks | **Collection Profiler** → Title Analysis |
-    | Analyze a vendor admin export with subjects + LC + usage | **Collection Profiler** (e.g., EBSCO Detailed Report) |
-    | Decide which databases to renew or cancel | **COUNTER Analyzer** |
-    | Run monthly-trend analysis on formal COUNTER reports | **COUNTER Analyzer** |
+    | See holdings distribution by LC sub-class range | **Collection Profiler** |
+    | Pick books to weed by low circulation | **Use Analysis** → Print circulation |
+    | Analyze print circulation against subject + LC | **Use Analysis** → Print circulation |
+    | Decide which databases to renew or cancel | **Use Analysis** → COUNTER 5 |
+    | Run monthly-trend / cost-per-use on COUNTER reports | **Use Analysis** → COUNTER 5 |
+    | Analyze any other (non-COUNTER) usage export | **Use Analysis** → Other usage data |
+    | Find areas with strong use relative to holdings (or weak) | **Use Analysis** (Coverage vs. Use) |
     | Find what you own that's never been used | **Zero-Use Identifier** |
     | Identify e-journal/package titles with no use | **Zero-Use Identifier** (holdings vs. COUNTER) |
-    | Find areas with strong use relative to holdings (or weak) | **Collection Profiler** → LC Analysis (Coverage vs. Use) |
     | See which titles are unique to a database (by coverage) | **Overlap & Uniqueness** |
     | Estimate what content a package cancellation would lose | **Overlap & Uniqueness** |
     | Find titles duplicated across several databases | **Overlap & Uniqueness** (Redundant) |
@@ -6805,12 +6757,15 @@ def page_home():
     st.markdown("---")
     with st.expander("ℹ️ About this dashboard"):
         st.markdown("""
-        **Version 2.6 (slim)** — four collection-analysis tools:
-        - **Collection Profiler** — three views (LC, Subject Term, Title) on
-          catalog and admin-export files. Title Analysis absorbs the former
-          Print Circulation analyzer.
-        - **COUNTER Analyzer** — formal COUNTER 5 reports only.
-        - **Zero-Use Identifier** — holdings vs. usage matching.
+        **Version 2.7 (slim)** — four collection-analysis tools:
+        - **Collection Profiler** — holdings structure only (LC, Subject Term,
+          sub-class ranges, distribution). Usage views moved to Use Analysis.
+        - **Use Analysis** — all usage-driven work in one place: print
+          circulation (subject + usage), formal COUNTER 5 reports, and other
+          usage data. Owns Coverage vs. Use, cost-per-use, monthly trends, and
+          dead-weight triage.
+        - **Zero-Use Identifier** — holdings vs. usage matching; emits the
+          explicit-zero master that feeds Use Analysis.
         - **Overlap & Uniqueness** — e-journal coverage overlap; classifies
           titles per database as sole source / unique coverage / redundant.
 
@@ -6836,7 +6791,7 @@ def main():
             "Select a tool:",
             ["🏠 Home",
              "🗺️ Collection Profiler",
-             "📊 COUNTER Analyzer",
+             "📈 Use Analysis",
              "🔍 Zero-Use Identifier",
              "🧩 Overlap & Uniqueness"],
             index=0,
@@ -6848,8 +6803,8 @@ def main():
         page_home()
     elif page == "🗺️ Collection Profiler":
         page_collection_profiler()
-    elif page == "📊 COUNTER Analyzer":
-        page_counter_analyzer()
+    elif page == "📈 Use Analysis":
+        page_use_analysis()
     elif page == "🔍 Zero-Use Identifier":
         page_zero_use_identifier()
     elif page == "🧩 Overlap & Uniqueness":
