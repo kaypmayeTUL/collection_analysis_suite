@@ -2042,6 +2042,23 @@ def _annotate_csv(df, notes, extra_meta=None):
     return buf.getvalue()
 
 
+def _zip_one_csv(csv_data, inner_filename):
+    """Wrap a single CSV (str or bytes) into deflated ZIP bytes.
+
+    Compressing the download shrinks a large title-level export to a small
+    fraction of its raw size, keeping transfers reliable on memory-capped
+    hosts. A single-file .zip stays friendly for Excel users on Windows.
+    """
+    import zipfile
+    from io import BytesIO as _BIO
+    if isinstance(csv_data, str):
+        csv_data = csv_data.encode("utf-8")
+    buf = _BIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(inner_filename, csv_data)
+    return buf.getvalue()
+
+
 # =====================================================================
 # SHARED: Download tray
 # =====================================================================
@@ -5872,74 +5889,40 @@ def page_zero_use_identifier():
         # this tool to one job — reconcile holdings against usage.
         # ---------------------------------------------------------------
         st.markdown("---")
-        out_tab1, out_tab2 = st.tabs(["Zero-use titles",
-                                      "All titles (explicit zeros)"])
 
-        # --- Output 1: Zero-use titles ---
-        with out_tab1:
-            cutoff_msg = (' AND were published before ' + str(pubyear_cutoff)
-                          if pubyear_cutoff else '')
-            if treat_unmatched_as_zero:
-                st.markdown(
-                    f"**{len(zero_use):,} titles** flagged as zero/low-use "
-                    f"(matched \u2264 {threshold:g} use **plus** unmatched "
-                    f"titles){cutoff_msg}."
-                )
-                st.caption(
-                    "\U0001F4CC Unmatched titles are folded in because **Treat "
-                    "unmatched as zero-use** is on. The `Matched Via` column shows "
-                    "which group each title came from."
-                )
-            else:
-                st.markdown(
-                    f"**{len(zero_use):,} titles** in your holdings have \u2264 "
-                    f"{threshold:g} recorded use{cutoff_msg}."
-                )
-                if n_unmatched > 0:
-                    st.caption(
-                        f"\U0001F4CC This list excludes the **{n_unmatched:,} "
-                        "unmatched** titles. They still appear in the All-titles "
-                        "output below, tagged `Unmatched`. To treat them as zero-use "
-                        "here, turn on **Treat unmatched as zero-use** in the sidebar."
-                    )
-            zero_cols = [c for c in (list(display_cols) + ['_matched_via', '_usage_total'])
-                         if c in zero_use.columns]
-            display_df = zero_use[zero_cols].rename(columns={
-                '_matched_via': 'Matched Via',
-                '_usage_total': 'Total Use',
-            }).sort_values('Total Use')
-            st.dataframe(display_df, use_container_width=True, height=500, hide_index=True)
+        # Downloads serve as zipped CSVs: a 1M-row export compresses to a small
+        # fraction of its raw size, so transfers stay reliable on memory-capped
+        # hosts. The master (all titles, explicit zeros) is the default and the
+        # handoff into Use Analysis. The zero-use-only list is opt-in because it
+        # is just a filter on the master's Use Status column, so building it is
+        # extra memory + transfer for something derivable from the master.
+        also_zero_list = st.checkbox(
+            "Also generate the zero-use-only list (separate download)",
+            value=False, key="zu_gen_zerolist",
+            help="The master file already contains the zero-use rows (tagged in "
+                 "Use Status). Turn this on only if you also want a ready-made "
+                 "zero-use-only file.")
 
-            _zu_bytes = _annotate_csv(
-                display_df, notes,
-                extra_meta={'Tool': 'Zero-Use Identifier',
-                            'View': 'Zero-use titles'
-                                    + (' (incl. unmatched)' if treat_unmatched_as_zero else ''),
-                            'Threshold': threshold,
-                            'Pub-year cutoff': pubyear_cutoff or 'none',
-                            'Treat unmatched as zero-use': treat_unmatched_as_zero,
-                            'Holdings rows': total_holdings,
-                            'Usage rows': len(usage_df),
-                            'Subjects retained': bool(h_subj),
-                            'Match keys': ', '.join(shared_keys)}
-            )
-            _dl("\U0001F4E5 Zero-use titles (CSV)", _zu_bytes,
-                "zero_use_titles.csv", "text/csv",
-                key="zu_dl_zero", tool_key="zero_use")
+        tab_labels = ["All titles (explicit zeros)"]
+        if also_zero_list:
+            tab_labels.append("Zero-use titles")
+        out_tabs = st.tabs(tab_labels)
 
-        # --- Output 2: All titles with explicit zeros ---
+        cutoff_msg = (' AND were published before ' + str(pubyear_cutoff)
+                      if pubyear_cutoff else '')
+
+        # --- Primary output: All titles with explicit zeros (the master) ---
         # Every holdings title with a numeric use value (0 where unused). No
         # pub-year cutoff here: this is the full synced universe meant to feed
-        # Coverage-vs-Use / COUNTER triage. The cutoff only narrows the flagged
-        # zero-use list above.
-        with out_tab2:
+        # Coverage-vs-Use / COUNTER triage. The cutoff only narrows the optional
+        # zero-use list.
+        with out_tabs[0]:
             allt = matched.copy()
             is_unm = allt['_matched_via'] == 'unmatched'
             matched_low = (~is_unm) & (allt['_usage_total'] <= threshold)
             has_use = (~is_unm) & (allt['_usage_total'] > threshold)
             zero_label = f'Zero/low-use (\u2264 {threshold:g})'
             if treat_unmatched_as_zero:
-                # Unmatched folded into zero/low-use, no separate bucket
                 allt['_use_status'] = np.where(has_use, 'Has use', zero_label)
                 n_zero = int((~has_use).sum())   # matched-low + unmatched
                 n_unm = 0
@@ -5952,10 +5935,9 @@ def page_zero_use_identifier():
             n_has_use = int(has_use.sum())
 
             st.markdown(
-                f"**{len(allt):,} titles** — every holdings title with an explicit "
+                f"**{len(allt):,} titles** \u2014 every holdings title with an explicit "
                 "use value (titles with no recorded use carry **0**). This is the "
-                "synced file to feed the Collection Profiler (Coverage-vs-Use) or "
-                "COUNTER triage."
+                "synced file to feed Use Analysis (Coverage-vs-Use) or COUNTER triage."
             )
             if treat_unmatched_as_zero:
                 st.caption(
@@ -5979,7 +5961,7 @@ def page_zero_use_identifier():
             }).sort_values('Total Use')
             st.dataframe(comb_display, use_container_width=True, height=500, hide_index=True)
 
-            _all_bytes = _annotate_csv(
+            _all_csv = _annotate_csv(
                 comb_display, notes,
                 extra_meta={'Tool': 'Zero-Use Identifier',
                             'View': 'All titles (explicit zeros)',
@@ -5993,14 +5975,66 @@ def page_zero_use_identifier():
                             'Unmatched titles': n_unm,
                             'Titles with use': n_has_use}
             )
-            _dl("\U0001F4E5 All titles, explicit zeros (CSV)", _all_bytes,
-                "all_titles_explicit_zeros.csv", "text/csv",
-                key="zu_dl_all", tool_key="zero_use")
+            st.download_button(
+                "\U0001F4E5 All titles, explicit zeros (zipped CSV)",
+                _zip_one_csv(_all_csv, "all_titles_explicit_zeros.csv"),
+                "all_titles_explicit_zeros.zip", "application/zip",
+                key="zu_dl_all")
+            st.caption("Downloads as a zipped CSV \u2014 unzip to open the CSV in Excel.")
 
-        # Download tray
-        st.markdown("---")
-        st.subheader("Downloads")
-        _render_download_tray("zero_use", zip_filename="zero_use_results.zip")
+        # --- Optional output: Zero-use-only list (opt-in) ---
+        if also_zero_list:
+            with out_tabs[1]:
+                if treat_unmatched_as_zero:
+                    st.markdown(
+                        f"**{len(zero_use):,} titles** flagged as zero/low-use "
+                        f"(matched \u2264 {threshold:g} use **plus** unmatched "
+                        f"titles){cutoff_msg}."
+                    )
+                    st.caption(
+                        "\U0001F4CC Unmatched titles are folded in because **Treat "
+                        "unmatched as zero-use** is on. The `Matched Via` column "
+                        "shows which group each title came from."
+                    )
+                else:
+                    st.markdown(
+                        f"**{len(zero_use):,} titles** in your holdings have \u2264 "
+                        f"{threshold:g} recorded use{cutoff_msg}."
+                    )
+                    if n_unmatched > 0:
+                        st.caption(
+                            f"\U0001F4CC This list excludes the **{n_unmatched:,} "
+                            "unmatched** titles (they appear in the master, tagged "
+                            "`Unmatched`). To treat them as zero-use here, turn on "
+                            "**Treat unmatched as zero-use** in the sidebar."
+                        )
+                zero_cols = [c for c in (list(display_cols) + ['_matched_via', '_usage_total'])
+                             if c in zero_use.columns]
+                display_df = zero_use[zero_cols].rename(columns={
+                    '_matched_via': 'Matched Via',
+                    '_usage_total': 'Total Use',
+                }).sort_values('Total Use')
+                st.dataframe(display_df, use_container_width=True, height=500, hide_index=True)
+
+                _zu_csv = _annotate_csv(
+                    display_df, notes,
+                    extra_meta={'Tool': 'Zero-Use Identifier',
+                                'View': 'Zero-use titles'
+                                        + (' (incl. unmatched)' if treat_unmatched_as_zero else ''),
+                                'Threshold': threshold,
+                                'Pub-year cutoff': pubyear_cutoff or 'none',
+                                'Treat unmatched as zero-use': treat_unmatched_as_zero,
+                                'Holdings rows': total_holdings,
+                                'Usage rows': len(usage_df),
+                                'Subjects retained': bool(h_subj),
+                                'Match keys': ', '.join(shared_keys)}
+                )
+                st.download_button(
+                    "\U0001F4E5 Zero-use titles (zipped CSV)",
+                    _zip_one_csv(_zu_csv, "zero_use_titles.csv"),
+                    "zero_use_titles.zip", "application/zip",
+                    key="zu_dl_zero")
+                st.caption("Downloads as a zipped CSV \u2014 unzip to open the CSV in Excel.")
 
     except Exception as e:
         st.error(f"❌ Error: {e}")
