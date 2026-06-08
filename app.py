@@ -3214,7 +3214,8 @@ def _render_title_keywords(results, settings, notes=""):
 def _profiler_display_results(results, settings, df, idx,
                               title_col=None, weight_col=None,
                               author_col=None, date_col=None,
-                              location_col=None, subj_col=None):
+                              location_col=None, subj_col=None,
+                              lc_col=None):
     """Render Profiler results in three top-level tabs: LC Analysis, Subject
     Term Analysis, and Title Analysis.
 
@@ -4130,16 +4131,34 @@ def _profiler_display_results(results, settings, df, idx,
                         min_value=0, max_value=max_w, value=0,
                         key="prof_title_thr",
                     )
+                    cand = df_view[df_view['_weight'] <= threshold].copy()
+
+                    sort_choice = st.radio(
+                        "Sort candidates by",
+                        ["Lowest use first", "Call number (shelf order)"],
+                        horizontal=True, key="prof_title_weed_sort",
+                        help="Shelf order sorts by LC subclass then number, so the "
+                             "list doubles as a shelf-ready pull sheet.")
+                    if (sort_choice.startswith("Call number")
+                            and '_lc_sub' in cand.columns):
+                        cand = cand.sort_values(['_lc_sub', '_lc_number', '_weight'],
+                                                na_position='last')
+                    else:
+                        cand = cand.sort_values('_weight')
+
                     low_cols = [title_col, '_weight']
-                    if author_col and author_col in df_view.columns:
+                    if author_col and author_col in cand.columns:
                         low_cols.insert(1, author_col)
-                    if '_lc_main' in df_view.columns:
+                    if lc_col and lc_col in cand.columns:
+                        low_cols.append(lc_col)            # full call number (shelf-ready)
+                    if '_lc_main' in cand.columns:
                         low_cols.append('_lc_main')
-                    if location_col and location_col in df_view.columns:
+                    if location_col and location_col in cand.columns:
                         low_cols.append(location_col)
-                    low_use = df_view[df_view['_weight'] <= threshold][low_cols].sort_values('_weight')
                     rename_map = {'_weight': weight_col, '_lc_main': 'LC Class'}
-                    low_use = low_use.rename(columns=rename_map)
+                    if lc_col:
+                        rename_map[lc_col] = 'Call Number'
+                    low_use = cand[low_cols].rename(columns=rename_map)
 
                     cc1, cc2 = st.columns(2)
                     cc1.metric("Titles ≤ Threshold", f"{len(low_use):,}")
@@ -4151,10 +4170,24 @@ def _profiler_display_results(results, settings, df, idx,
                     if len(low_use):
                         st.markdown("---")
                         st.markdown("**Where the weeding candidates cluster**")
-                        cand = df_view[df_view['_weight'] <= threshold]
                         tcol1, tcol2 = st.columns(2)
                         with tcol1:
-                            if '_lc_main' in cand.columns and cand['_lc_main'].notna().any():
+                            # Finer granularity: break candidates by LC sub-class
+                            # range (e.g., HQ1101–2030.7) when available; fall back
+                            # to the two-letter class.
+                            if '_lc_range' in cand.columns and cand['_lc_range'].notna().any():
+                                rc = cand['_lc_range'].dropna().value_counts().head(15)
+                                rdf = pd.DataFrame({'Sub-class range': rc.index,
+                                                    'Candidates': rc.values})
+                                figL = px.bar(rdf, x='Candidates', y='Sub-class range',
+                                              orientation='h', color='Candidates',
+                                              color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                                              title="Candidates by LC sub-class range")
+                                figL.update_layout(yaxis={'categoryorder': 'total ascending'},
+                                                   height=max(300, len(rdf) * 26),
+                                                   showlegend=False, margin=dict(l=4, r=4, t=40, b=4))
+                                st.plotly_chart(figL, use_container_width=True)
+                            elif '_lc_main' in cand.columns and cand['_lc_main'].notna().any():
                                 lc_counts = cand['_lc_main'].dropna().value_counts().head(15)
                                 lcdf = pd.DataFrame({
                                     'LC Class': [f"{c} – {LC_CLASSES.get(c, '?')}"
@@ -4170,7 +4203,7 @@ def _profiler_display_results(results, settings, df, idx,
                                                    showlegend=False, margin=dict(l=4, r=4, t=40, b=4))
                                 st.plotly_chart(figL, use_container_width=True)
                             else:
-                                st.caption("No LC class data for these candidates.")
+                                st.caption("No LC data for these candidates.")
                         with tcol2:
                             cand_subj = Counter()
                             if subj_col and subj_col in cand.columns and cand[subj_col].notna().any():
@@ -4195,7 +4228,11 @@ def _profiler_display_results(results, settings, df, idx,
 
                         # Concentration summary
                         bits = []
-                        if '_lc_main' in cand.columns and cand['_lc_main'].notna().any():
+                        if '_lc_range' in cand.columns and cand['_lc_range'].notna().any():
+                            rr = cand['_lc_range'].dropna().value_counts()
+                            bits.append(f"the **{rr.index[0]}** range "
+                                        f"({int(rr.iloc[0]):,} titles)")
+                        elif '_lc_main' in cand.columns and cand['_lc_main'].notna().any():
                             tl = cand['_lc_main'].dropna().value_counts()
                             bits.append(f"the **{tl.index[0]} – {LC_CLASSES.get(tl.index[0], '?')}** "
                                         f"class ({int(tl.iloc[0]):,} titles, "
@@ -4207,8 +4244,12 @@ def _profiler_display_results(results, settings, df, idx,
                             st.caption("Weeding candidates concentrate most in "
                                        + " and ".join(bits) + ".")
 
-                        # Downloadable breakdowns (subject + LC) for these candidates
+                        # Downloadable breakdowns for these candidates
                         breakdowns = []
+                        if '_lc_range' in cand.columns and cand['_lc_range'].notna().any():
+                            rng_tab = (cand['_lc_range'].dropna().value_counts()
+                                       .rename_axis('Sub-class range').reset_index(name='Candidates'))
+                            breakdowns.append(("by sub-class range", rng_tab))
                         if '_lc_main' in cand.columns and cand['_lc_main'].notna().any():
                             lc_tab = (cand['_lc_main'].dropna().value_counts()
                                       .rename_axis('LC Class').reset_index(name='Candidates'))
@@ -4836,6 +4877,7 @@ def _profiler_ui(mode="structure", flavor="print"):
             date_col=date_col,
             location_col=location_col,
             subj_col=subj_col,
+            lc_col=lc_col,
         )
 
 
