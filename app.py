@@ -2203,7 +2203,8 @@ def _profiler_process_subjects_chunk(subj_series, weight_series, lc_series,
 
 def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
                            selected_classes, progress_bar,
-                           has_usage_col=False, ngram_sizes=(1, 2, 3)):
+                           has_usage_col=False, ngram_sizes=(1, 2, 3),
+                           lc_filter_active=False):
     """Single pass that builds everything: LC counts, subject counter, subject-by-LC, gaps.
 
     When a usage column is present in the dataframe (indicated by `has_usage_col=True`),
@@ -2217,7 +2218,13 @@ def _profiler_run_analysis(df, subj_col, lc_col, title_col, weight_col,
     """
     n_total = len(df)
     if selected_classes is not None and lc_col:
-        mask = df['_lc_main'].isin(selected_classes) | df['_lc_main'].isna()
+        mask = df['_lc_main'].isin(selected_classes)
+        # When the filter isn't actively narrowed (all classes selected), also let
+        # unclassified records through so the default view covers everything. When
+        # the user HAS narrowed it, exclude unclassified so every view — including
+        # the subject word cloud — strictly reflects the chosen classes.
+        if not lc_filter_active:
+            mask = mask | df['_lc_main'].isna()
         idx = df.index[mask]
     else:
         idx = df.index
@@ -4140,6 +4147,89 @@ def _profiler_display_results(results, settings, df, idx,
                                f"{len(low_use) / max(1, len(df_view)) * 100:.1f}%")
                     st.dataframe(low_use, use_container_width=True, height=400)
 
+                    # ---- Where the weeding candidates cluster (subject + LC) ----
+                    if len(low_use):
+                        st.markdown("---")
+                        st.markdown("**Where the weeding candidates cluster**")
+                        cand = df_view[df_view['_weight'] <= threshold]
+                        tcol1, tcol2 = st.columns(2)
+                        with tcol1:
+                            if '_lc_main' in cand.columns and cand['_lc_main'].notna().any():
+                                lc_counts = cand['_lc_main'].dropna().value_counts().head(15)
+                                lcdf = pd.DataFrame({
+                                    'LC Class': [f"{c} – {LC_CLASSES.get(c, '?')}"
+                                                 for c in lc_counts.index],
+                                    'Candidates': lc_counts.values,
+                                })
+                                figL = px.bar(lcdf, x='Candidates', y='LC Class',
+                                              orientation='h', color='Candidates',
+                                              color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                                              title="Candidates by LC class")
+                                figL.update_layout(yaxis={'categoryorder': 'total ascending'},
+                                                   height=max(300, len(lcdf) * 26),
+                                                   showlegend=False, margin=dict(l=4, r=4, t=40, b=4))
+                                st.plotly_chart(figL, use_container_width=True)
+                            else:
+                                st.caption("No LC class data for these candidates.")
+                        with tcol2:
+                            cand_subj = Counter()
+                            if subj_col and subj_col in cand.columns and cand[subj_col].notna().any():
+                                _profiler_process_subjects_chunk(
+                                    cand[subj_col], pd.Series(1.0, index=cand.index),
+                                    pd.Series(None, index=cand.index),
+                                    cand_subj, defaultdict(Counter))
+                            top_cs = cand_subj.most_common(15)
+                            if top_cs:
+                                csdf = pd.DataFrame(top_cs, columns=['Subject', 'Candidates'])
+                                figS = px.bar(csdf, x='Candidates', y='Subject',
+                                              orientation='h', color='Candidates',
+                                              color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                                              title="Candidates by subject term")
+                                figS.update_layout(yaxis={'categoryorder': 'total ascending'},
+                                                   height=max(300, len(csdf) * 26),
+                                                   showlegend=False, margin=dict(l=4, r=4, t=40, b=4))
+                                st.plotly_chart(figS, use_container_width=True)
+                            else:
+                                st.caption("No subject data for these candidates "
+                                           "(map a Subjects column to enable this).")
+
+                        # Concentration summary
+                        bits = []
+                        if '_lc_main' in cand.columns and cand['_lc_main'].notna().any():
+                            tl = cand['_lc_main'].dropna().value_counts()
+                            bits.append(f"the **{tl.index[0]} – {LC_CLASSES.get(tl.index[0], '?')}** "
+                                        f"class ({int(tl.iloc[0]):,} titles, "
+                                        f"{tl.iloc[0] / max(1, len(cand)) * 100:.0f}%)")
+                        if top_cs:
+                            bits.append(f"the subject **{top_cs[0][0]}** "
+                                        f"({int(top_cs[0][1]):,} titles)")
+                        if bits:
+                            st.caption("Weeding candidates concentrate most in "
+                                       + " and ".join(bits) + ".")
+
+                        # Downloadable breakdowns (subject + LC) for these candidates
+                        breakdowns = []
+                        if '_lc_main' in cand.columns and cand['_lc_main'].notna().any():
+                            lc_tab = (cand['_lc_main'].dropna().value_counts()
+                                      .rename_axis('LC Class').reset_index(name='Candidates'))
+                            lc_tab['LC Class'] = lc_tab['LC Class'].map(
+                                lambda c: f"{c} – {LC_CLASSES.get(c, '?')}")
+                            breakdowns.append(("by LC class", lc_tab))
+                        if top_cs:
+                            breakdowns.append(("by subject",
+                                               pd.DataFrame(cand_subj.most_common(),
+                                                            columns=['Subject', 'Candidates'])))
+                        for blabel, btab in breakdowns:
+                            _bd_bytes = _annotate_csv(
+                                btab, notes,
+                                extra_meta={'Tool': 'Use Analysis', 'View': f'Weeding candidates {blabel}',
+                                            'Metric': weight_col, 'Threshold': threshold,
+                                            'Period': period_label})
+                            st.download_button(
+                                f"📥 Candidate breakdown {blabel} (CSV)", _bd_bytes,
+                                f"weeding_candidates_{blabel.replace(' ', '_')}.csv", "text/csv",
+                                key=f"prof_weed_bd_{blabel.replace(' ', '_')}")
+
                     _weed_fname = f"weeding_review_{_slug_period(period_label)}.csv".replace('_.', '.')
                     _weed_bytes = _annotate_csv(
                         low_use, notes,
@@ -4477,8 +4567,13 @@ def _profiler_ui(mode="structure", flavor="print"):
             labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in avail]
             sel_labels = st.multiselect("Include:", labels, default=labels, key=f"{KP}prof_lc_filter")
             sel_classes = [l.split(' –')[0] for l in sel_labels]
+            # "Active" = the user has actually narrowed the selection. When active,
+            # filtering is strict (unclassified records are excluded too); when all
+            # classes are selected, everything passes through including unclassified.
+            lc_filter_active = bool(avail) and set(sel_classes) != set(avail)
         else:
             sel_classes = None
+            lc_filter_active = False
 
     # Main-body: visualization toggles in a collapsed "Customize view" expander
     with st.expander("🎨 Customize view (visualizations, word cloud, thresholds)", expanded=False):
@@ -4680,11 +4775,14 @@ def _profiler_ui(mode="structure", flavor="print"):
             df, subj_col, lc_col, title_col, w_key, sel_classes, pbar,
             has_usage_col=bool(eff_weight_col),
             ngram_sizes=tk_ngram_sizes,
+            lc_filter_active=lc_filter_active,
         )
         st.session_state[f'{KP}prof_results'] = results
         st.session_state[f'{KP}prof_last_run_file_key'] = file_key
         if sel_classes is not None and lc_col:
-            mask = df['_lc_main'].isin(sel_classes) | df['_lc_main'].isna()
+            mask = df['_lc_main'].isin(sel_classes)
+            if not lc_filter_active:
+                mask = mask | df['_lc_main'].isna()
             st.session_state[f'{KP}prof_filtered_idx'] = df.index[mask]
         else:
             st.session_state[f'{KP}prof_filtered_idx'] = df.index
@@ -5697,8 +5795,7 @@ def page_zero_use_identifier():
         h_keys = _build_match_keys(holdings_df, h_ids)
         u_keys = _build_match_keys(usage_df, u_ids)
 
-        # Carry subjects/LC from the usage file onto matched rows (zero-use rows
-        # stay blank — they have no usage row to read a subject from).
+        # Carry subjects/LC from the usage file onto matched rows.
         usage_carry_cols = [c for c in (u_subj, u_lc) if c]
 
         # Run match
@@ -5708,9 +5805,27 @@ def page_zero_use_identifier():
                 usage_weight_col=weight_for_match,
                 usage_carry_cols=usage_carry_cols,
             )
-        carried_cols = list(carry_out.values())   # usage-derived columns now on `matched`
-        # Effective LC column: prefer holdings LC, else the carried usage LC
-        eff_lc = h_lc or (carry_out.get(u_lc) if u_lc else None)
+
+        # Coalesce descriptive metadata from BOTH sides into one column each.
+        # Holdings wins (so a zero-use title keeps its holdings subject/LC); blanks
+        # are then filled from the usage-carried value (so a used title with no
+        # holdings subject still gets one). The redundant carried column is dropped.
+        def _coalesce_meta(primary, secondary):
+            if (primary and secondary and primary != secondary
+                    and primary in matched.columns and secondary in matched.columns):
+                s = matched[primary].astype('object')
+                blank = s.isna() | s.astype(str).str.strip().isin(['', 'nan', 'None', '<NA>'])
+                matched.loc[blank, primary] = matched.loc[blank, secondary]
+                matched.drop(columns=[secondary], inplace=True)
+                return primary
+            return primary or secondary
+
+        subj_carry = carry_out.get(u_subj) if u_subj else None
+        lc_carry = carry_out.get(u_lc) if u_lc else None
+        subject_col_final = _coalesce_meta(h_subj, subj_carry)
+        lc_col_final = _coalesce_meta(h_lc, lc_carry)
+        # Effective LC column for filtering/extraction: the unified one
+        eff_lc = lc_col_final
 
         # Sidebar filters
         st.sidebar.markdown("---")
@@ -5952,9 +6067,11 @@ def page_zero_use_identifier():
             display_cols.append(h_lc)
         if h_subj:
             display_cols.append(h_subj)
-        # Subject/LC carried over from the usage file (blank for zero-use rows)
-        for c in carried_cols:
-            display_cols.append(c)
+        # Unified subject/LC (holdings preferred, usage-filled) — ensure present
+        # even when the column came only from the usage side.
+        for c in (subject_col_final, lc_col_final):
+            if c and c not in display_cols:
+                display_cols.append(c)
         if h_loc:
             display_cols.append(h_loc)
         if h_format:
