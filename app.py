@@ -5443,24 +5443,42 @@ def _build_match_keys(df, id_cols):
 
 
 def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
-                              usage_weight_col=None):
+                              usage_weight_col=None, usage_carry_cols=None):
     """Cascade-match each holdings row against the usage file.
 
     Returns the holdings_df with two new columns:
         _matched_via : str (which key matched, or 'unmatched')
         _usage_total : float (sum of usage from matched usage rows, or 0)
 
+    If `usage_carry_cols` is given, each of those usage-file columns (e.g.
+    Subjects, LC when they live on the usage side) is also carried onto the
+    matched holdings rows. Carried values are taken from the matched usage
+    row(s); unmatched / zero-use rows are left blank, because by definition
+    they have no usage row to read metadata from.
+
     Matching cascades by reliability: ISBN > DOI > OCLC > ISSN > title+author.
     A holdings row counts as 'matched' on the first key that finds at least
     one usage row.
+
+    Returns (matched_df, carry_out_names) where carry_out_names maps each
+    requested usage column to the output column name actually used (renamed to
+    avoid clobbering an identically named holdings column).
     """
     holdings_df = holdings_df.copy()
     holdings_df['_matched_via'] = 'unmatched'
     holdings_df['_usage_total'] = 0.0
 
-    # Build per-key lookup tables from usage side: key_value → total_usage.
-    # Done once per key type to avoid row-by-row iteration on the usage df.
+    carry_cols = [c for c in (usage_carry_cols or []) if c in usage_df.columns]
+    carry_out = {}
+    for c in carry_cols:
+        out = c if c not in holdings_df.columns else f"{c} (from usage)"
+        carry_out[c] = out
+        holdings_df[out] = pd.NA
+
+    # Build per-key lookup tables from usage side: key_value → total_usage,
+    # plus (optionally) key_value → {carry_col: first non-null value}.
     usage_lookups = {}
+    carry_lookups = {}
     for key_type, key_col in usage_keys:
         if key_col not in usage_df.columns:
             continue
@@ -5473,6 +5491,11 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
             # No weight column → just count rows per key
             grouped = valid.groupby(key_col).size().astype(float)
         usage_lookups[key_type] = grouped.to_dict()
+        if carry_cols:
+            # First non-null value of each carry column per key
+            carry_lookups[key_type] = (
+                valid.groupby(key_col)[carry_cols].first().to_dict('index')
+            )
 
     # Identifiers first (most reliable), title+author last
     priority = ['isbn', 'doi', 'oclc', 'issn', 'title+author']
@@ -5481,6 +5504,7 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
         if h_col is None or key_type not in usage_lookups:
             continue
         lookup = usage_lookups[key_type]
+        clook = carry_lookups.get(key_type, {})
         # Only fill rows still unmatched — keeps higher-priority matches sticky
         unmatched_mask = holdings_df['_matched_via'] == 'unmatched'
         h_values = holdings_df.loc[unmatched_mask, h_col]
@@ -5488,8 +5512,14 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
             if val and val in lookup:
                 holdings_df.at[idx, '_matched_via'] = key_type
                 holdings_df.at[idx, '_usage_total'] = lookup[val]
+                if val in clook:
+                    row = clook[val]
+                    for c in carry_cols:
+                        v = row.get(c)
+                        if pd.notna(v):
+                            holdings_df.at[idx, carry_out[c]] = v
 
-    return holdings_df
+    return holdings_df, carry_out
 
 
 def page_zero_use_identifier():
@@ -5599,6 +5629,10 @@ def page_zero_use_identifier():
                                               'pub_year', 'Publication Date',
                                               'Date of Publication'])
         u_weight = find_column(usage_df, WEIGHT_ALIASES)
+        # Subjects (and sometimes LC) often live on the usage file rather than
+        # holdings — e.g. an Alma Analytics usage export or EBSCO Detailed Report.
+        u_subj = find_column(usage_df, SUBJECT_ALIASES)
+        u_lc = find_column(usage_df, LC_ALIASES)
 
         # Capture the user's original holdings columns now, before key-building
         # and matching add internal helpers. Every one of these is carried into
@@ -5619,7 +5653,7 @@ def page_zero_use_identifier():
             ucols_text = " · ".join([f"{k.upper()}: `{v}`" if v else f"{k.upper()}: —"
                                      for k, v in u_ids.items()])
             st.caption(ucols_text)
-            st.caption(f"Usage metric: `{u_weight}`")
+            st.caption(f"Usage metric: `{u_weight}` · Subjects: `{u_subj}` · LC: `{u_lc}`")
 
             none_opt = "— count rows (no weighting) —"
             usage_cols = [none_opt] + list(usage_df.columns)
@@ -5663,20 +5697,28 @@ def page_zero_use_identifier():
         h_keys = _build_match_keys(holdings_df, h_ids)
         u_keys = _build_match_keys(usage_df, u_ids)
 
+        # Carry subjects/LC from the usage file onto matched rows (zero-use rows
+        # stay blank — they have no usage row to read a subject from).
+        usage_carry_cols = [c for c in (u_subj, u_lc) if c]
+
         # Run match
         with st.spinner("Matching holdings against usage..."):
-            matched = _match_holdings_to_usage(
+            matched, carry_out = _match_holdings_to_usage(
                 holdings_df, usage_df, h_keys, u_keys,
-                usage_weight_col=weight_for_match
+                usage_weight_col=weight_for_match,
+                usage_carry_cols=usage_carry_cols,
             )
+        carried_cols = list(carry_out.values())   # usage-derived columns now on `matched`
+        # Effective LC column: prefer holdings LC, else the carried usage LC
+        eff_lc = h_lc or (carry_out.get(u_lc) if u_lc else None)
 
         # Sidebar filters
         st.sidebar.markdown("---")
         st.sidebar.subheader("🔎 Zero-Use Filters")
 
         # LC filter
-        if h_lc:
-            matched['_lc_main'] = matched[h_lc].apply(extract_lc_prefix)
+        if eff_lc:
+            matched['_lc_main'] = matched[eff_lc].apply(extract_lc_prefix)
             lc_avail = sorted(matched['_lc_main'].dropna().unique())
             if lc_avail:
                 lc_labels = [f"{c} – {LC_CLASSES.get(c, '?')}" for c in lc_avail]
@@ -5910,6 +5952,9 @@ def page_zero_use_identifier():
             display_cols.append(h_lc)
         if h_subj:
             display_cols.append(h_subj)
+        # Subject/LC carried over from the usage file (blank for zero-use rows)
+        for c in carried_cols:
+            display_cols.append(c)
         if h_loc:
             display_cols.append(h_loc)
         if h_format:
