@@ -1,0 +1,10 @@
+# Streamlit configuration for the COC Collection Analysis Dashboard
+# Place this file at:  <your app folder>/.streamlit/config.toml
+# (the folder that contains app.py, i.e. where you run `streamlit run app.py`)
+# Restart the app after adding or changing this file.
+
+[server]
+# Max size per uploaded file, in MB (1024 = 1 GB). Raise if your Alma exports are larger.
+maxUploadSize = 1024
+# Websocket message limit, in MB. Must be >= maxUploadSize or large files still get rejected.
+maxMessageSize = 1024
