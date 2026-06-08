@@ -1783,11 +1783,14 @@ def _extract_ngrams(segments, n_values=(1,)):
 # =====================================================================
 
 SUBJECT_ALIASES = ['Subjects', 'Subject', 'Subject Terms', 'Subject Headings',
-                   'SUBJECT', 'subject_terms', 'Topics', 'subjects']
+                   'SUBJECT', 'subject_terms', 'Topics', 'subjects', 'Topic',
+                   'LCSH', 'Library of Congress Subject', 'Subject (LCSH)']
 LC_ALIASES = ['LC Classification Code', 'LC Classification', 'LC Class',
               'LC Subclass', 'LCC',
               'Call Number', 'CallNumber', 'call_number', 'Call #',
-              'LC Call Number', 'Classification', 'lc_classification']
+              'Permanent Call Number', 'Normalized Call Number',
+              'LC Call Number', 'Classification', 'lc_classification',
+              'Library of Congress Classification']
 TITLE_ALIASES = ['Title', 'title', 'TITLE', 'Book Title', 'Item Title',
                  'Title (Normalized)', 'File Name', 'Filename',
                  'Item Name', 'Resource Title', 'Object Title']
@@ -5597,6 +5600,13 @@ def page_zero_use_identifier():
                                               'Date of Publication'])
         u_weight = find_column(usage_df, WEIGHT_ALIASES)
 
+        # Capture the user's original holdings columns now, before key-building
+        # and matching add internal helpers. Every one of these is carried into
+        # the outputs so nothing from the source file — subjects, call numbers,
+        # or any other metadata — is silently dropped by the curated projection.
+        orig_holdings_cols = [c for c in holdings_df.columns
+                              if not str(c).startswith('_')]
+
         with st.expander("🔍 Column detection & overrides", expanded=False):
             st.markdown("**Holdings file:**")
             hcols_text = " · ".join([f"{k.upper()}: `{v}`" if v else f"{k.upper()}: —"
@@ -5906,6 +5916,12 @@ def page_zero_use_identifier():
             display_cols.append(h_format)
         if h_pubyear:
             display_cols.append(h_pubyear)
+        # Pass through every other original holdings column so nothing the user
+        # supplied (subjects, call numbers, notes, edition, etc.) is dropped —
+        # the recognized columns above just get ordered first.
+        for c in orig_holdings_cols:
+            if c not in display_cols:
+                display_cols.append(c)
         # De-dup in case of overlap
         seen = set()
         display_cols = [c for c in display_cols if not (c in seen or seen.add(c))]
