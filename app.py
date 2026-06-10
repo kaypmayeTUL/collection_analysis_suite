@@ -1587,7 +1587,10 @@ def lookup_lc_range(subclass, number):
     if matches:
         # Sort by width ascending — narrower range wins
         matches.sort(key=lambda r: r[1] - r[0])
-        return matches[0][2]
+        start, end, label = matches[0]
+        sub = subclass.upper()
+        rng = f"{sub}{start}" if start == end else f"{sub}{start}\u2013{end}"
+        return f"{rng} {label}"
 
     # No curated range matched; fall back to hundreds-bucketing
     bucket = _bucket_by_hundreds(number)
@@ -3211,6 +3214,79 @@ def _render_title_keywords(results, settings, notes=""):
         st.info("Install `wordcloud` and `matplotlib` to enable the keyword cloud.")
 
 
+_PERYEAR_RE = re.compile(r'^\s*use\s*(?:fy)?\s*(\d{4})\s*$', re.IGNORECASE)
+
+
+def _detect_per_year_usage_columns(df):
+    """Find per-year usage columns like 'Use FY2023' / 'Use 2023'.
+
+    Returns {column_name: year_int} for columns that match the pattern and hold
+    numeric values. These are produced by the Zero-Use Identifier so the master
+    can plot true usage volumes per (fiscal) year.
+    """
+    out = {}
+    for c in df.columns:
+        if not isinstance(c, str):
+            continue
+        m = _PERYEAR_RE.match(c)
+        if m and pd.api.types.is_numeric_dtype(df[c]):
+            yr = int(m.group(1))
+            if 1500 <= yr <= 2100:
+                out[c] = yr
+    return out
+
+
+def _render_peryear_trends(df_view, peryear_map, weight_col, notes):
+    """Plot true usage volume per year from per-year usage columns.
+
+    Sums each year's usage column across the (already LC/year-filtered) titles,
+    so each bar is that year's real total — not a single year a title's lifetime
+    usage was pinned to.
+    """
+    import plotly.express as px
+    items = sorted(peryear_map.items(), key=lambda kv: kv[1])  # (col, year) ascending
+    all_years = [y for _, y in items]
+    st.info("Each bar is that year's actual usage total, summed across titles "
+            "from the per-year columns in the file.")
+    sel = st.multiselect("Years to include", all_years, default=all_years,
+                         key="prof_peryear_filter")
+    items = [(c, y) for c, y in items if y in sel]
+    if not items:
+        st.warning("Select at least one year.")
+        return
+    rows = []
+    for col, yr in items:
+        series = pd.to_numeric(df_view[col], errors='coerce').fillna(0)
+        rows.append({'Year': yr,
+                     f'Total {weight_col}': float(series.sum()),
+                     'Titles used': int((series > 0).sum())})
+    ydf = pd.DataFrame(rows)
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Years", f"{len(ydf)}")
+    k2.metric(f"Total {weight_col}", f"{int(ydf[f'Total {weight_col}'].sum()):,}")
+    if len(ydf):
+        peak = ydf.loc[ydf[f'Total {weight_col}'].idxmax(), 'Year']
+        k3.metric("Peak year", str(int(peak)))
+
+    fig = px.bar(ydf, x='Year', y=f'Total {weight_col}',
+                 color=f'Total {weight_col}',
+                 color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
+                 title=f"{weight_col} by year")
+    fig.update_layout(xaxis=dict(type='category'), showlegend=False,
+                      coloraxis_showscale=False)
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(ydf, use_container_width=True, hide_index=True)
+
+    _yb = _annotate_csv(ydf, notes,
+                        extra_meta={'Tool': 'Use Analysis',
+                                    'View': 'Yearly trends (per-year usage)',
+                                    'Metric': weight_col})
+    st.download_button("📥 Yearly totals (CSV)", _yb,
+                       "yearly_usage_totals.csv", "text/csv",
+                       key="prof_peryear_dl")
+
+
 def _profiler_display_results(results, settings, df, idx,
                               title_col=None, weight_col=None,
                               author_col=None, date_col=None,
@@ -3799,12 +3875,16 @@ def _profiler_display_results(results, settings, df, idx,
                 # --- Drill-down: records tagged with a top subject ---
                 if (_records_ctx is not None and _records_ctx.get('subject_col')
                         and _records_ctx['subject_col'] in _records_ctx['df'].columns):
-                    subj_bar_opts = [s for s, _ in top_subjects]
+                    # Offer EVERY subject term here (sorted by frequency), not
+                    # just the top-N shown in the bar chart, so any term is
+                    # searchable. The selectbox filters as you type.
+                    subj_bar_opts = [s for s, _ in results['subject_counts'].most_common()]
                     pick_sb = st.selectbox(
                         "🔎 Inspect the records tagged with a subject",
                         options=["(choose a subject)"] + subj_bar_opts,
                         key="prof_subjbar_drill_pick",
-                        help="Records whose subject field contains the chosen term.",
+                        help="Searches all subject terms (type to filter), not just "
+                             "the top ones charted above.",
                     )
                     if pick_sb != "(choose a subject)":
                         _sc = _records_ctx['subject_col']
@@ -3948,10 +4028,16 @@ def _profiler_display_results(results, settings, df, idx,
 
             # ---- Sub-tabs within Title Analysis ----
             if has_usage and weight_col and '_weight' in df_view.columns:
+                # Per-year usage columns (from the Zero-Use master) let us plot
+                # true volume per year; otherwise fall back to grouping a single
+                # date column.
+                peryear_map = _detect_per_year_usage_columns(df_view)
+                use_peryear = len(peryear_map) > 1
                 # Yearly trends appears first when we have >1 year of data —
                 # multi-year files want this view as the headline.
                 title_subtabs = []
-                show_yearly = len(years_in_data) > 1 and '_year' in df_view.columns
+                show_yearly = use_peryear or (len(years_in_data) > 1
+                                              and '_year' in df_view.columns)
                 if show_yearly:
                     title_subtabs.append("Yearly trends")
                 title_subtabs.extend(["Top titles", "Weeding review"])
@@ -3961,8 +4047,11 @@ def _profiler_display_results(results, settings, df, idx,
                 ts_objs = st.tabs(title_subtabs)
                 ts_idx = {label: i for i, label in enumerate(title_subtabs)}
 
-                # ---- Yearly trends (only when >1 year of data) ----
-                if show_yearly:
+                # ---- Yearly trends ----
+                if show_yearly and use_peryear:
+                    with ts_objs[ts_idx["Yearly trends"]]:
+                        _render_peryear_trends(df_view, peryear_map, weight_col, notes)
+                elif show_yearly:
                     with ts_objs[ts_idx["Yearly trends"]]:
                         st.info("How usage shifts year-over-year. Useful for "
                                 "spotting growing or declining areas across multi-year datasets.")
@@ -4092,7 +4181,17 @@ def _profiler_display_results(results, settings, df, idx,
                         cols_show.insert(1, author_col)
                     if location_col and location_col in df_view.columns:
                         cols_show.append(location_col)
-                    top_titles = df_view.nlargest(n_top, '_weight')[cols_show].rename(
+                    # Collapse to one row per title so duplicate holdings rows
+                    # (multiple copies of a title) don't appear multiple times or
+                    # break the ranking. The matcher replicates a title's TOTAL
+                    # usage onto every copy row, so take the max per title (= the
+                    # title total); author/location come from the top copy.
+                    other_cols = [c for c in cols_show if c not in (title_col, '_weight')]
+                    tt = (df_view.sort_values('_weight', ascending=False)
+                                 .groupby(title_col, as_index=False)
+                                 .agg({'_weight': 'max',
+                                       **{c: 'first' for c in other_cols}}))
+                    top_titles = tt.nlargest(n_top, '_weight')[cols_show].rename(
                         columns={'_weight': weight_col}
                     )
                     fig_top = px.bar(
@@ -4151,11 +4250,14 @@ def _profiler_display_results(results, settings, df, idx,
                         low_cols.insert(1, author_col)
                     if lc_col and lc_col in cand.columns:
                         low_cols.append(lc_col)            # full call number (shelf-ready)
+                    if '_lc_sub' in cand.columns:
+                        low_cols.append('_lc_sub')         # subclass abbreviation (e.g., HQ)
                     if '_lc_main' in cand.columns:
                         low_cols.append('_lc_main')
                     if location_col and location_col in cand.columns:
                         low_cols.append(location_col)
-                    rename_map = {'_weight': weight_col, '_lc_main': 'LC Class'}
+                    rename_map = {'_weight': weight_col, '_lc_main': 'LC Class',
+                                  '_lc_sub': 'LC Subclass'}
                     if lc_col:
                         rename_map[lc_col] = 'Call Number'
                     low_use = cand[low_cols].rename(columns=rename_map)
@@ -5013,6 +5115,7 @@ def _detect_counter_date_range(month_cols):
 
 
 DATE_COL_ALIASES = [
+    'Use Year', 'Last Use Year', 'Use_Year', 'Usage Year',
     'Checkout Date', 'checkout_date', 'Loan Date', 'loan_date',
     'Transaction Date', 'transaction_date', 'Last Charge Date', 'last_charge_date',
     'Last Used', 'last_used', 'Last Checkout', 'last_checkout',
@@ -5583,7 +5686,8 @@ def _build_match_keys(df, id_cols):
 
 
 def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
-                              usage_weight_col=None, usage_carry_cols=None):
+                              usage_weight_col=None, usage_carry_cols=None,
+                              usage_year_col=None, year_col_prefix="Use "):
     """Cascade-match each holdings row against the usage file.
 
     Returns the holdings_df with two new columns:
@@ -5592,17 +5696,19 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
 
     If `usage_carry_cols` is given, each of those usage-file columns (e.g.
     Subjects, LC when they live on the usage side) is also carried onto the
-    matched holdings rows. Carried values are taken from the matched usage
-    row(s); unmatched / zero-use rows are left blank, because by definition
-    they have no usage row to read metadata from.
+    matched holdings rows. If `usage_year_col` is given, the most recent use
+    year per title is carried as a 'Use Year' column (so the master can drive
+    year-over-year trends downstream). Carried values come from the matched
+    usage row(s); unmatched / zero-use rows are left blank, because by
+    definition they have no usage row — a zero-use title has no use year.
 
     Matching cascades by reliability: ISBN > DOI > OCLC > ISSN > title+author.
-    A holdings row counts as 'matched' on the first key that finds at least
-    one usage row.
 
-    Returns (matched_df, carry_out_names) where carry_out_names maps each
-    requested usage column to the output column name actually used (renamed to
-    avoid clobbering an identically named holdings column).
+    Returns (matched_df, carry_out_names, year_out_name, years_out_name).
+    carry_out_names maps each requested usage column to the output column name
+    used; year_out is the 'Use Year' (most recent) column; years_out is the
+    'Use Years' (every year used, joined) column. Year columns are None when no
+    usage_year_col is supplied.
     """
     holdings_df = holdings_df.copy()
     holdings_df['_matched_via'] = 'unmatched'
@@ -5615,10 +5721,36 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
         carry_out[c] = out
         holdings_df[out] = pd.NA
 
+    year_out = None
+    years_out = None
+    peryear_cols = []          # output column names, e.g. ['Use FY2021', ...]
+    peryear_year_by_col = {}   # column name → year int
+    if usage_year_col and usage_year_col in usage_df.columns:
+        year_out = 'Use Year' if 'Use Year' not in holdings_df.columns else 'Use Year (from usage)'
+        years_out = 'Use Years' if 'Use Years' not in holdings_df.columns else 'Use Years (from usage)'
+        holdings_df[year_out] = pd.NA
+        holdings_df[years_out] = pd.NA
+        # One usage column per year present, so trends can plot true per-year
+        # volumes. Default 0 everywhere (a title not used in a year used it 0
+        # times; a zero-use title used everything 0 times).
+        _allyrs = sorted(int(y) for y in
+                         pd.to_numeric(usage_df[usage_year_col], errors='coerce').dropna().unique())
+        for y in _allyrs:
+            col = f"{year_col_prefix}{y}"
+            if col in holdings_df.columns:
+                col = f"{col} (usage)"
+            peryear_cols.append(col)
+            peryear_year_by_col[col] = y
+            holdings_df[col] = 0.0
+
     # Build per-key lookup tables from usage side: key_value → total_usage,
-    # plus (optionally) key_value → {carry_col: first non-null value}.
+    # plus (optionally) key_value → {carry_col: first non-null value}, the
+    # most recent use year, the full list of years used, and per-year usage.
     usage_lookups = {}
     carry_lookups = {}
+    year_lookups = {}
+    years_list_lookups = {}
+    peryear_lookups = {}
     for key_type, key_col in usage_keys:
         if key_col not in usage_df.columns:
             continue
@@ -5636,6 +5768,25 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
             carry_lookups[key_type] = (
                 valid.groupby(key_col)[carry_cols].first().to_dict('index')
             )
+        if year_out:
+            yv = pd.to_numeric(valid[usage_year_col], errors='coerce')
+            year_lookups[key_type] = yv.groupby(valid[key_col]).max().dropna().to_dict()
+            # Every distinct year a title was used, ascending, joined as a string
+            years_list_lookups[key_type] = (
+                yv.groupby(valid[key_col])
+                  .apply(lambda s: '; '.join(str(int(y)) for y in sorted(s.dropna().unique())))
+                  .replace('', pd.NA).dropna().to_dict()
+            )
+            # Per-key, per-year usage sums → {key_value: {year: usage}}
+            _wv = (valid[usage_weight_col]
+                   if (usage_weight_col and usage_weight_col in valid.columns)
+                   else pd.Series(1.0, index=valid.index))
+            _tmp = pd.DataFrame({'_k': valid[key_col], '_y': yv,
+                                 '_w': pd.to_numeric(_wv, errors='coerce').fillna(0)}).dropna(subset=['_y'])
+            if not _tmp.empty:
+                _tmp['_y'] = _tmp['_y'].astype(int)
+                _piv = _tmp.groupby(['_k', '_y'])['_w'].sum().unstack(fill_value=0.0)
+                peryear_lookups[key_type] = _piv.to_dict('index')
 
     # Identifiers first (most reliable), title+author last
     priority = ['isbn', 'doi', 'oclc', 'issn', 'title+author']
@@ -5645,6 +5796,9 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
             continue
         lookup = usage_lookups[key_type]
         clook = carry_lookups.get(key_type, {})
+        ylook = year_lookups.get(key_type, {})
+        yslook = years_list_lookups.get(key_type, {})
+        pylook = peryear_lookups.get(key_type, {})
         # Only fill rows still unmatched — keeps higher-priority matches sticky
         unmatched_mask = holdings_df['_matched_via'] == 'unmatched'
         h_values = holdings_df.loc[unmatched_mask, h_col]
@@ -5658,8 +5812,19 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
                         v = row.get(c)
                         if pd.notna(v):
                             holdings_df.at[idx, carry_out[c]] = v
+                if year_out and val in ylook and pd.notna(ylook[val]):
+                    holdings_df.at[idx, year_out] = ylook[val]
+                if years_out and val in yslook and pd.notna(yslook[val]):
+                    holdings_df.at[idx, years_out] = yslook[val]
+                if peryear_cols and val in pylook:
+                    yrow = pylook[val]
+                    for col in peryear_cols:
+                        y = peryear_year_by_col[col]
+                        if y in yrow:
+                            holdings_df.at[idx, col] = yrow[y]
 
-    return holdings_df, carry_out
+    year_meta = {'recent': year_out, 'all': years_out, 'peryear': peryear_cols}
+    return holdings_df, carry_out, year_meta
 
 
 def page_zero_use_identifier():
@@ -5773,6 +5938,7 @@ def page_zero_use_identifier():
         # holdings — e.g. an Alma Analytics usage export or EBSCO Detailed Report.
         u_subj = find_column(usage_df, SUBJECT_ALIASES)
         u_lc = find_column(usage_df, LC_ALIASES)
+        u_date = _detect_print_date_column(usage_df)
 
         # Capture the user's original holdings columns now, before key-building
         # and matching add internal helpers. Every one of these is carried into
@@ -5793,7 +5959,8 @@ def page_zero_use_identifier():
             ucols_text = " · ".join([f"{k.upper()}: `{v}`" if v else f"{k.upper()}: —"
                                      for k, v in u_ids.items()])
             st.caption(ucols_text)
-            st.caption(f"Usage metric: `{u_weight}` · Subjects: `{u_subj}` · LC: `{u_lc}`")
+            st.caption(f"Usage metric: `{u_weight}` · Subjects: `{u_subj}` · "
+                       f"LC: `{u_lc}` · Use date/year: `{u_date}`")
 
             none_opt = "— count rows (no weighting) —"
             usage_cols = [none_opt] + list(usage_df.columns)
@@ -5826,14 +5993,55 @@ def page_zero_use_identifier():
         st.info(f"🔗 Will match using: **{', '.join(shared_keys)}** "
                 f"(cascading from most reliable to fallback)")
 
-        # Coerce usage weight to numeric (or use row counts if no weight col)
+        # ---- Use-year derivation + fiscal-year filter (#1, #2) ----
+        # Derive a use year from the detected use-date column. Optionally bucket
+        # into the July–June fiscal year, and let the user scope which years count.
+        usage_year_arg = None
+        if u_date and u_date in usage_df.columns:
+            _src = usage_df[u_date]
+            if pd.api.types.is_numeric_dtype(_src):
+                _yr = pd.to_numeric(_src, errors='coerce')
+                _month = None
+            else:
+                _dt = pd.to_datetime(_src, errors='coerce')
+                _yr = _dt.dt.year
+                _month = _dt.dt.month
+            fiscal = st.checkbox(
+                "Bucket use dates by fiscal year (Jul–Jun)", value=True,
+                key="zu_fiscal",
+                help="FY2023 = Jul 2022–Jun 2023 (Tulane's July baseline / June "
+                     "retrospective). Uncheck for calendar year.")
+            if fiscal and _month is not None:
+                # FY label = ending calendar year; July onward rolls into next FY
+                usage_df['_use_year'] = (
+                    _yr + (_month >= 7).astype('Int64')).astype('Int64')
+                year_prefix = "Use FY"
+            else:
+                usage_df['_use_year'] = pd.to_numeric(_yr, errors='coerce').astype('Int64')
+                year_prefix = "Use "
+
+            yrs_present = sorted(int(y) for y in usage_df['_use_year'].dropna().unique())
+            if yrs_present:
+                ylabel = "fiscal years" if (fiscal and _month is not None) else "years"
+                picked = st.multiselect(
+                    f"Include {ylabel}", yrs_present, default=yrs_present,
+                    key="zu_year_filter",
+                    help="Limits the usage that counts toward totals and the "
+                         "zero-use test. Pick a single year for that year's picture.")
+                if picked and set(picked) != set(yrs_present):
+                    # Strict: rows without a parseable year can't be placed here
+                    usage_df = usage_df[usage_df['_use_year'].isin(picked)].copy()
+                if usage_df['_use_year'].notna().any():
+                    usage_year_arg = '_use_year'
+
+        # Coerce usage weight to numeric (after any year filter)
         if u_weight and u_weight in usage_df.columns:
             usage_df['_weight'] = pd.to_numeric(usage_df[u_weight], errors='coerce').fillna(0)
             weight_for_match = '_weight'
         else:
             weight_for_match = None
 
-        # Build match keys on both sides
+        # Build match keys on both sides (after the year filter trims usage rows)
         h_keys = _build_match_keys(holdings_df, h_ids)
         u_keys = _build_match_keys(usage_df, u_ids)
 
@@ -5842,11 +6050,21 @@ def page_zero_use_identifier():
 
         # Run match
         with st.spinner("Matching holdings against usage..."):
-            matched, carry_out = _match_holdings_to_usage(
+            matched, carry_out, year_meta = _match_holdings_to_usage(
                 holdings_df, usage_df, h_keys, u_keys,
                 usage_weight_col=weight_for_match,
                 usage_carry_cols=usage_carry_cols,
+                usage_year_col=usage_year_arg,
+                year_col_prefix=(year_prefix if usage_year_arg else "Use "),
             )
+        use_year_col = year_meta['recent']
+        use_years_col = year_meta['all']
+        peryear_cols = year_meta['peryear']
+        # Make the carried Use Year a clean nullable integer so it's recognized
+        # as a numeric year column (and round-trips through CSV that way).
+        if use_year_col and use_year_col in matched.columns:
+            matched[use_year_col] = pd.to_numeric(
+                matched[use_year_col], errors='coerce').astype('Int64')
 
         # Coalesce descriptive metadata from BOTH sides into one column each.
         # Holdings wins (so a zero-use title keeps its holdings subject/LC); blanks
@@ -6109,9 +6327,11 @@ def page_zero_use_identifier():
             display_cols.append(h_lc)
         if h_subj:
             display_cols.append(h_subj)
-        # Unified subject/LC (holdings preferred, usage-filled) — ensure present
-        # even when the column came only from the usage side.
-        for c in (subject_col_final, lc_col_final):
+        # Unified subject/LC (holdings preferred, usage-filled) + the carried
+        # Use Year (most recent), Use Years (every year used), and one usage
+        # column per year — ensure present in the output.
+        for c in ([subject_col_final, lc_col_final, use_year_col, use_years_col]
+                  + list(peryear_cols or [])):
             if c and c not in display_cols:
                 display_cols.append(c)
         if h_loc:
