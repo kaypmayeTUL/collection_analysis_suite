@@ -33,6 +33,16 @@ A unified Streamlit application bundling four collection decision-support tools:
      database as sole source, unique coverage, or redundant, using day-resolution
      interval math so date coverage (not just title name) drives the picture.
 
+v2.8 (slim) — Top-level year filter in Use Analysis + recent-vs-baseline compare
+       mode that maps to Workflow A (recent FY vs three-year historical baseline).
+       Year filter recomputes `_weight` from per-year usage columns, so downstream
+       views (Coverage-vs-Use, top titles, LC profile, weeding) all reflect the
+       selection. Yearly trends now shows color-coded periods, a trend line,
+       year-over-year delta bars, a baseline-average reference line, and an
+       LC-level shifts view surfacing the biggest movers between periods.
+       Also added a top-level publication-year filter (range slider) that
+       propagates to every view in Use Analysis and Collection Profiler; handy
+       for weeding reviews that need to exclude recent acquisitions.
 v2.7 (slim) — Full cut: usage analysis consolidated into a single Use Analysis
        tool (print circulation, COUNTER 5, and other usage data). The Collection
        Profiler is now structure-only; the standalone COUNTER Analyzer is retired
@@ -1835,6 +1845,13 @@ AUTHOR_ALIASES = ['Author', 'author', 'AUTHOR', 'Creator', 'Authors',
                   'Primary Author', 'Main Author']
 LOCATION_ALIASES = ['Location', 'Location Name', 'location', 'Library Location',
                     'Shelving Location', 'Holding Location']
+# Publication-year column (used for the top-level pub-year filter in Use Analysis
+# and Collection Profiler; the Zero-Use Identifier has its own inline detection
+# using this same list). "Publication Date" and "Date of Publication" may be
+# full dates or year-only — the helper coerces both.
+PUBYEAR_ALIASES = ['Publication Year', 'Pub Year', 'pub_year', 'PubYear',
+                   'Year of Publication', 'Publication Date',
+                   'Date of Publication', 'Copyright Year', 'Year']
 
 # Used by the Overlap & Uniqueness tool (e-journal coverage / A-Z exports).
 COVERAGE_ALIASES = ['Coverage Information Combined', 'Coverage Information',
@@ -3236,55 +3253,336 @@ def _detect_per_year_usage_columns(df):
     return out
 
 
-def _render_peryear_trends(df_view, peryear_map, weight_col, notes):
-    """Plot true usage volume per year from per-year usage columns.
+def _recompute_weight_from_years(df, peryear_map, selected_years, aggregate="sum"):
+    """Recompute `_weight` as a per-row aggregate of selected per-year usage columns.
+
+    When the top-level year filter narrows analysis to a subset of years, downstream
+    views (Coverage-vs-Use, top titles, LC profile, weeding review) all read from
+    `_weight` — so updating it once here propagates the filter everywhere without
+    each view needing to know about years.
+
+    aggregate="sum"  → row usage across selected years (default; matches Workflow A's
+                       "combined 3 prior FY as historical baseline" semantics when
+                       the baseline is chosen)
+    aggregate="mean" → per-year average of usage across selected years (useful for
+                       computing a fair baseline average against a single recent FY)
+
+    Returns a copy of df with `_weight` recomputed. Safe to call repeatedly.
+    """
+    if not selected_years or not peryear_map:
+        return df
+    cols = [c for c, y in peryear_map.items() if y in selected_years]
+    if not cols:
+        return df
+    df = df.copy()
+    values = df[cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+    if aggregate == "mean":
+        df['_weight'] = values.mean(axis=1)
+    else:
+        df['_weight'] = values.sum(axis=1)
+    return df
+
+
+def _extract_pubyear_series(series):
+    """Coerce a pub-year column to numeric years.
+
+    Handles both plain year values ("2015" / 2015) and full date strings
+    ("2015-03-14" / "March 14, 2015"). Returns a pd.Series of nullable Int64
+    years; unparseable or implausible values (outside 1500–2100) become <NA>
+    so filters can gracefully skip them. Never raises — safe on any column shape.
+    """
+    numeric = pd.to_numeric(series, errors='coerce')
+    valid = numeric.between(1500, 2100)
+    if len(series) and valid.sum() / len(series) >= 0.5:
+        result = numeric.where(valid)
+    else:
+        try:
+            dates = pd.to_datetime(series, errors='coerce')
+            result = dates.dt.year
+        except Exception:
+            result = pd.Series([pd.NA] * len(series), index=series.index)
+    result = pd.to_numeric(result, errors='coerce')
+    # Belt-and-suspenders: filter implausible year values out of the final result
+    result = result.where(result.between(1500, 2100))
+    return result.astype('Int64')
+
+
+def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
+                           selected_years=None, recent_year=None,
+                           baseline_years=None, key_prefix="prof"):
+    """Plot true usage volume per year with optional recent-vs-baseline comparison.
 
     Sums each year's usage column across the (already LC/year-filtered) titles,
     so each bar is that year's real total — not a single year a title's lifetime
     usage was pinned to.
+
+    Compare mode (recent_year + baseline_years) matches Workflow A: color-codes
+    the recent FY vs the historical baseline, overlays a baseline-average
+    reference line, shows a delta chart, and reports "recent vs baseline avg"
+    KPIs at the top.
+
+    Args:
+        selected_years: If given, restrict to these years (top-level filter).
+                        Otherwise plots all detected years.
+        recent_year, baseline_years: If both given, activates compare mode.
+        key_prefix: Prefix for widget keys, defaults to "prof".
     """
     import plotly.express as px
+    import plotly.graph_objects as go
+
     items = sorted(peryear_map.items(), key=lambda kv: kv[1])  # (col, year) ascending
     all_years = [y for _, y in items]
-    st.info("Each bar is that year's actual usage total, summed across titles "
-            "from the per-year columns in the file.")
-    sel = st.multiselect("Years to include", all_years, default=all_years,
-                         key="prof_peryear_filter")
-    items = [(c, y) for c, y in items if y in sel]
-    if not items:
-        st.warning("Select at least one year.")
+
+    compare_mode = recent_year is not None and baseline_years
+
+    if selected_years is None:
+        st.info("Each bar is that year's actual usage total, summed across titles "
+                "from the per-year columns in the file.")
+        sel = st.multiselect("Years to include", all_years, default=all_years,
+                             key=f"{key_prefix}_peryear_filter")
+    else:
+        sel = list(selected_years)
+        if compare_mode:
+            st.caption(
+                f"**Compare mode:** Recent FY = **{recent_year}** · "
+                f"Baseline = **{', '.join(str(y) for y in sorted(baseline_years))}**. "
+                f"Downstream views (Coverage-vs-Use, top titles, etc.) reflect the "
+                f"period you chose in the sidebar."
+            )
+        else:
+            st.caption(
+                f"Showing {len(sel)} year{'s' if len(sel)!=1 else ''} from the "
+                f"top-level year filter. All downstream views reflect this selection."
+            )
+
+    items_sel = [(c, y) for c, y in items if y in sel]
+    if not items_sel:
+        st.warning("Select at least one year in the sidebar year filter.")
         return
+
+    def _period_of(yr):
+        if recent_year and yr == recent_year:
+            return "Recent"
+        if baseline_years and yr in baseline_years:
+            return "Baseline"
+        return "Other"
+
     rows = []
-    for col, yr in items:
+    for col, yr in items_sel:
         series = pd.to_numeric(df_view[col], errors='coerce').fillna(0)
-        rows.append({'Year': yr,
-                     f'Total {weight_col}': float(series.sum()),
-                     'Titles used': int((series > 0).sum())})
-    ydf = pd.DataFrame(rows)
+        rows.append({
+            'Year': yr,
+            f'Total {weight_col}': float(series.sum()),
+            'Titles used': int((series > 0).sum()),
+            'Period': _period_of(yr),
+        })
+    ydf = pd.DataFrame(rows).sort_values('Year').reset_index(drop=True)
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Years", f"{len(ydf)}")
-    k2.metric(f"Total {weight_col}", f"{int(ydf[f'Total {weight_col}'].sum()):,}")
-    if len(ydf):
-        peak = ydf.loc[ydf[f'Total {weight_col}'].idxmax(), 'Year']
-        k3.metric("Peak year", str(int(peak)))
+    # ---- KPIs ----
+    total_col = f'Total {weight_col}'
+    if compare_mode and recent_year in sel:
+        recent_total = float(ydf.loc[ydf['Year'] == recent_year, total_col].sum())
+        baseline_present = [y for y in baseline_years if y in sel]
+        baseline_rows = ydf[ydf['Year'].isin(baseline_present)]
+        baseline_avg = float(baseline_rows[total_col].mean()) if len(baseline_rows) else 0.0
+        delta = recent_total - baseline_avg
+        delta_pct = (delta / baseline_avg * 100) if baseline_avg else 0.0
 
-    fig = px.bar(ydf, x='Year', y=f'Total {weight_col}',
-                 color=f'Total {weight_col}',
-                 color_continuous_scale=[[0, '#71C5E8'], [1, '#285C4D']],
-                 title=f"{weight_col} by year")
-    fig.update_layout(xaxis=dict(type='category'), showlegend=False,
-                      coloraxis_showscale=False)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(f"Recent FY ({recent_year})", f"{int(recent_total):,}")
+        k2.metric(f"Baseline avg ({len(baseline_rows)}y)",
+                  f"{int(baseline_avg):,}" if baseline_avg else "—")
+        k3.metric("Δ vs baseline", f"{int(delta):+,}")
+        k4.metric("% change", f"{delta_pct:+.1f}%" if baseline_avg else "—")
+    else:
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Years", f"{len(ydf)}")
+        k2.metric(f"Total {weight_col}", f"{int(ydf[total_col].sum()):,}")
+        if len(ydf):
+            peak = ydf.loc[ydf[total_col].idxmax(), 'Year']
+            k3.metric("Peak year", str(int(peak)))
+
+    # ---- Main chart: bars (color-coded by period) + trend line overlay ----
+    fig = go.Figure()
+    period_colors = {'Recent': '#285C4D', 'Baseline': '#71C5E8', 'Other': '#9CA3AF'}
+    if compare_mode:
+        for period in ['Baseline', 'Recent', 'Other']:
+            sub = ydf[ydf['Period'] == period]
+            if len(sub):
+                fig.add_bar(
+                    x=sub['Year'].astype(str),
+                    y=sub[total_col],
+                    name=period,
+                    marker_color=period_colors[period],
+                    text=sub[total_col].apply(lambda v: f"{int(v):,}"),
+                    textposition='outside',
+                    hovertemplate=(f"Year: %{{x}}<br>{weight_col}: %{{y:,.0f}}"
+                                   f"<br>Period: {period}<extra></extra>"),
+                )
+    else:
+        fig.add_bar(
+            x=ydf['Year'].astype(str), y=ydf[total_col],
+            marker_color='#285C4D',
+            text=ydf[total_col].apply(lambda v: f"{int(v):,}"),
+            textposition='outside',
+            hovertemplate=f"Year: %{{x}}<br>{weight_col}: %{{y:,.0f}}<extra></extra>",
+            name=weight_col,
+        )
+    # Trend line overlay (dotted, muted)
+    if len(ydf) > 1:
+        fig.add_scatter(
+            x=ydf['Year'].astype(str), y=ydf[total_col],
+            mode='lines+markers', name='Trend',
+            line=dict(color='#B45309', width=2, dash='dot'),
+            marker=dict(size=8, color='#B45309'),
+            hovertemplate="Trend %{y:,.0f}<extra></extra>",
+        )
+    # Baseline reference line in compare mode
+    if compare_mode and recent_year in sel:
+        baseline_present = [y for y in baseline_years if y in sel]
+        if baseline_present:
+            baseline_rows = ydf[ydf['Year'].isin(baseline_present)]
+            baseline_avg = float(baseline_rows[total_col].mean()) if len(baseline_rows) else 0.0
+            if baseline_avg > 0:
+                fig.add_hline(
+                    y=baseline_avg, line_dash='dash', line_color='#1B5478',
+                    annotation_text=f'Baseline avg: {int(baseline_avg):,}',
+                    annotation_position='top left',
+                    annotation_font_color='#1B5478',
+                )
+    fig.update_layout(
+        title=f"{weight_col} by year",
+        xaxis=dict(type='category', title='Year'),
+        yaxis=dict(title=f'Total {weight_col}'),
+        barmode='group',
+        legend=dict(orientation='h', y=-0.2),
+    )
     st.plotly_chart(fig, use_container_width=True)
-    st.dataframe(ydf, use_container_width=True, hide_index=True)
 
-    _yb = _annotate_csv(ydf, notes,
-                        extra_meta={'Tool': 'Use Analysis',
-                                    'View': 'Yearly trends (per-year usage)',
-                                    'Metric': weight_col})
+    # ---- Year-over-year delta chart ----
+    if len(ydf) > 1:
+        ydf_delta = ydf.copy()
+        ydf_delta['YoY Δ'] = ydf_delta[total_col].diff()
+        ydf_delta['YoY %'] = (ydf_delta['YoY Δ']
+                              / ydf_delta[total_col].shift(1) * 100)
+        ydf_delta = ydf_delta.dropna(subset=['YoY Δ'])
+        if len(ydf_delta):
+            st.markdown("**Year-over-year change**")
+            ydf_delta['Direction'] = ydf_delta['YoY Δ'].apply(
+                lambda v: 'Up' if v > 0 else 'Down' if v < 0 else 'Flat'
+            )
+            fig_delta = px.bar(
+                ydf_delta, x=ydf_delta['Year'].astype(str), y='YoY Δ',
+                color='Direction',
+                color_discrete_map={'Up': '#047857', 'Down': '#B45309', 'Flat': '#9CA3AF'},
+                title="Year-over-year change in usage",
+                hover_data={'YoY %': ':.1f', 'Year': False, 'Direction': False},
+            )
+            fig_delta.update_layout(
+                showlegend=False, xaxis=dict(type='category', title='Year'),
+                yaxis=dict(title=f'Δ {weight_col} vs prior year'),
+            )
+            st.plotly_chart(fig_delta, use_container_width=True)
+
+    # ---- Table + download ----
+    display_df = ydf.drop(columns=['Period']) if not compare_mode else ydf
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    _view_label = ('Yearly trends — recent vs baseline'
+                   if compare_mode else 'Yearly trends (per-year usage)')
+    _meta = {'Tool': 'Use Analysis', 'View': _view_label, 'Metric': weight_col}
+    if compare_mode:
+        _meta['Recent FY'] = str(recent_year)
+        _meta['Baseline years'] = ', '.join(str(y) for y in sorted(baseline_years))
+    _yb = _annotate_csv(display_df, notes, extra_meta=_meta)
     st.download_button("📥 Yearly totals (CSV)", _yb,
                        "yearly_usage_totals.csv", "text/csv",
-                       key="prof_peryear_dl")
+                       key=f"{key_prefix}_peryear_dl")
+
+    # ---- Recent vs Baseline LC-level shifts (compare mode only) ----
+    if (compare_mode and '_lc_range' in df_view.columns
+            and recent_year in sel and any(y in sel for y in baseline_years)):
+        st.markdown("---")
+        st.markdown("**🔍 LC-level shifts — which areas changed most**")
+        st.caption(
+            "For each LC range, this compares the recent FY's usage against the "
+            "average usage across baseline years. Ranges are sorted by absolute "
+            "change so the biggest movers surface first — either direction."
+        )
+        recent_col = next((c for c, y in peryear_map.items() if y == recent_year), None)
+        baseline_present = [y for y in baseline_years if y in sel]
+        baseline_cols = [c for c, y in peryear_map.items() if y in baseline_present]
+
+        if recent_col and baseline_cols:
+            work = df_view[['_lc_range'] + [recent_col] + baseline_cols].copy()
+            work = work[work['_lc_range'].notna() & (work['_lc_range'].astype(str).str.len() > 0)]
+            if len(work):
+                work[recent_col] = pd.to_numeric(work[recent_col], errors='coerce').fillna(0)
+                for bc in baseline_cols:
+                    work[bc] = pd.to_numeric(work[bc], errors='coerce').fillna(0)
+                # Sum recent per LC range; average of baseline totals per LC range
+                grouped = work.groupby('_lc_range').agg(
+                    **{f'Recent ({recent_year})': (recent_col, 'sum')},
+                    **{f'Baseline avg ({len(baseline_cols)}y)':
+                        (baseline_cols[0], lambda _s, _g=None: None)}  # placeholder
+                )
+                # Do the baseline avg properly: mean of yearly sums
+                bl_sums = {}
+                for bc in baseline_cols:
+                    bl_sums[bc] = work.groupby('_lc_range')[bc].sum()
+                bl_df = pd.DataFrame(bl_sums)
+                grouped[f'Baseline avg ({len(baseline_cols)}y)'] = bl_df.mean(axis=1)
+                grouped['Δ'] = (grouped[f'Recent ({recent_year})']
+                                - grouped[f'Baseline avg ({len(baseline_cols)}y)'])
+                # Guard against divide-by-zero
+                _denom = grouped[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, pd.NA)
+                grouped['Δ %'] = (grouped['Δ'] / _denom * 100).astype(float)
+                grouped['|Δ|'] = grouped['Δ'].abs()
+                grouped = grouped.sort_values('|Δ|', ascending=False).reset_index()
+
+                top_n = min(20, len(grouped))
+                movers = grouped.head(top_n).copy()
+                movers['Direction'] = movers['Δ'].apply(
+                    lambda v: 'Up' if v > 0 else 'Down' if v < 0 else 'Flat'
+                )
+                fig_shift = px.bar(
+                    movers, x='Δ', y='_lc_range', orientation='h',
+                    color='Direction',
+                    color_discrete_map={'Up': '#047857', 'Down': '#B45309', 'Flat': '#9CA3AF'},
+                    title=f"Top {top_n} LC ranges by |Δ| (recent vs baseline avg)",
+                    hover_data={'Δ %': ':.1f', '_lc_range': False, 'Direction': False},
+                )
+                fig_shift.update_layout(
+                    height=max(350, top_n * 22),
+                    yaxis={'categoryorder': 'total ascending', 'title': 'LC range'},
+                    xaxis={'title': f'Δ {weight_col} (recent − baseline avg)'},
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_shift, use_container_width=True)
+
+                shift_display = grouped[[
+                    '_lc_range', f'Recent ({recent_year})',
+                    f'Baseline avg ({len(baseline_cols)}y)', 'Δ', 'Δ %'
+                ]].rename(columns={'_lc_range': 'LC range'})
+                st.dataframe(
+                    shift_display.head(50), use_container_width=True, hide_index=True,
+                    column_config={
+                        'Δ %': st.column_config.NumberColumn(format="%.1f%%"),
+                    }
+                )
+                _sb = _annotate_csv(
+                    shift_display, notes,
+                    extra_meta={'Tool': 'Use Analysis',
+                                'View': 'LC-level shifts (recent vs baseline)',
+                                'Metric': weight_col,
+                                'Recent FY': str(recent_year),
+                                'Baseline years': ', '.join(str(y) for y in sorted(baseline_present))}
+                )
+                st.download_button(
+                    "📥 LC-level shifts (CSV)", _sb,
+                    "lc_shifts_recent_vs_baseline.csv", "text/csv",
+                    key=f"{key_prefix}_lc_shifts_dl"
+                )
 
 
 def _profiler_display_results(results, settings, df, idx,
@@ -4050,7 +4348,13 @@ def _profiler_display_results(results, settings, df, idx,
                 # ---- Yearly trends ----
                 if show_yearly and use_peryear:
                     with ts_objs[ts_idx["Yearly trends"]]:
-                        _render_peryear_trends(df_view, peryear_map, weight_col, notes)
+                        _render_peryear_trends(
+                            df_view, peryear_map, weight_col, notes,
+                            selected_years=year_selection_ui,
+                            recent_year=(compare_state or {}).get('recent'),
+                            baseline_years=(compare_state or {}).get('baseline'),
+                            key_prefix=f"{KP}prof",
+                        )
                 elif show_yearly:
                     with ts_objs[ts_idx["Yearly trends"]]:
                         st.info("How usage shifts year-over-year. Useful for "
@@ -4717,6 +5021,123 @@ def _profiler_ui(mode="structure", flavor="print"):
         else:
             sel_classes = None
             lc_filter_active = False
+
+        # --- Top-level publication-year filter (applies to the whole tool) ---
+        # Detected from any of PUBYEAR_ALIASES; verified to hold year-like values
+        # before the widget appears. Filters `df` in place so every downstream
+        # view (Coverage-vs-Use, top titles, weeding, yearly trends) reflects it.
+        # Useful for weeding (exclude recent acquisitions) or focusing on legacy
+        # holdings.
+        _pubyear_col = find_column(df, PUBYEAR_ALIASES)
+        if _pubyear_col:
+            _py_series = _extract_pubyear_series(df[_pubyear_col])
+            _py_valid = _py_series.dropna()
+            # Need at least a handful of valid years to make a filter meaningful,
+            # and a nontrivial range
+            if len(_py_valid) >= 5 and int(_py_valid.max()) > int(_py_valid.min()):
+                _py_min, _py_max = int(_py_valid.min()), int(_py_valid.max())
+                st.markdown("---")
+                st.subheader("📅 Publication year")
+                _py_range = st.slider(
+                    "Include titles published in:",
+                    min_value=_py_min, max_value=_py_max,
+                    value=(_py_min, _py_max),
+                    key=f"{KP}prof_pubyear_range",
+                    help=(f"Detected pub-year column: '{_pubyear_col}'. "
+                          "Narrows every view (Coverage-vs-Use, top titles, weeding, "
+                          "yearly trends) to titles published in the selected range. "
+                          "Useful for weeding reviews (exclude recent acquisitions "
+                          "that haven't had time to circulate) or focusing on legacy "
+                          "holdings. Titles with missing / unparseable pub-year are "
+                          "excluded when the filter is narrowed.")
+                )
+                if _py_range != (_py_min, _py_max):
+                    df = df.copy()
+                    df['_pubyear'] = _py_series.values
+                    _n_before = len(df)
+                    df = df[df['_pubyear'].between(_py_range[0], _py_range[1])].copy()
+                    st.caption(
+                        f"Filtered to **{len(df):,}** of {_n_before:,} titles "
+                        f"published {_py_range[0]}–{_py_range[1]}."
+                    )
+                else:
+                    st.caption(f"Full range: {_py_min}–{_py_max}. Narrow the slider "
+                               "to focus the analysis.")
+
+        # --- Top-level year filter (usage mode only, per-year columns detected) ---
+        # Matches Workflow A: analyze recent FY against a combined three-year
+        # historical baseline. When compare mode is off, this behaves as a plain
+        # year multi-select; when on, one period drives the downstream analysis
+        # and the yearly-trends view highlights the recent-vs-baseline picture.
+        year_selection_ui = None
+        compare_state = None
+        if mode == "usage":
+            _peryear_ui = _detect_per_year_usage_columns(df)
+            if _peryear_ui and len(_peryear_ui) > 1:
+                st.markdown("---")
+                st.subheader("📅 Year filter")
+                _all_years_ui = sorted(set(_peryear_ui.values()))
+
+                _use_compare = st.checkbox(
+                    "Compare recent FY vs baseline",
+                    value=False,
+                    key=f"{KP}prof_year_compare",
+                    help="Matches Workflow A in the analysis guide: contrast the "
+                         "most recent fiscal year against a combined three-year "
+                         "historical baseline. Downstream views (Coverage-vs-Use, "
+                         "top titles, LC profile) reflect the period you choose to "
+                         "drive analysis; the Yearly trends tab shows both."
+                )
+
+                if not _use_compare:
+                    _sel_years = st.multiselect(
+                        "Years to include:", _all_years_ui, default=_all_years_ui,
+                        key=f"{KP}prof_year_include",
+                        help="Usage in all views (Coverage-vs-Use, top titles, LC "
+                             "profile) is the sum of the selected year columns."
+                    )
+                    if _sel_years and set(_sel_years) != set(_all_years_ui):
+                        df = _recompute_weight_from_years(df, _peryear_ui,
+                                                          _sel_years, aggregate="sum")
+                        st.caption(f"Weighting by sum of {len(_sel_years)} year"
+                                   f"{'s' if len(_sel_years)!=1 else ''}.")
+                    year_selection_ui = _sel_years or _all_years_ui
+                else:
+                    _recent = st.selectbox(
+                        "Recent FY:", _all_years_ui,
+                        index=len(_all_years_ui) - 1,
+                        key=f"{KP}prof_year_recent",
+                        help="Most recent fiscal year to feature."
+                    )
+                    _baseline_opts = [y for y in _all_years_ui if y != _recent]
+                    _default_bl = _baseline_opts[-3:] if len(_baseline_opts) >= 3 else _baseline_opts
+                    _baseline = st.multiselect(
+                        "Baseline years:", _baseline_opts, default=_default_bl,
+                        key=f"{KP}prof_year_baseline",
+                        help="Workflow A: the three fiscal years before the recent FY."
+                    )
+                    _period = st.radio(
+                        "Downstream views reflect:",
+                        [f"Recent FY ({_recent})",
+                         f"Baseline (avg across {len(_baseline)}y)" if _baseline
+                         else "Baseline"],
+                        key=f"{KP}prof_year_drive",
+                        help="Which period drives Coverage-vs-Use, top titles, and "
+                             "LC profile. The Yearly trends tab shows both "
+                             "side-by-side regardless."
+                    )
+                    if _period.startswith("Recent"):
+                        df = _recompute_weight_from_years(
+                            df, _peryear_ui, [_recent], aggregate="sum")
+                        st.caption(f"Weighting by recent FY ({_recent}).")
+                    elif _baseline:
+                        df = _recompute_weight_from_years(
+                            df, _peryear_ui, _baseline, aggregate="mean")
+                        st.caption(f"Weighting by baseline average ({len(_baseline)} years).")
+                    # Union of both periods for the yearly-trends chart selection
+                    year_selection_ui = sorted(set([_recent] + list(_baseline)))
+                    compare_state = {'recent': _recent,
+                                     'baseline': list(_baseline)}
 
     # Main-body: visualization toggles in a collapsed "Customize view" expander
     with st.expander("🎨 Customize view (visualizations, word cloud, thresholds)", expanded=False):
