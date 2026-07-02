@@ -33,6 +33,25 @@ A unified Streamlit application bundling four collection decision-support tools:
      database as sole source, unique coverage, or redundant, using day-resolution
      interval math so date coverage (not just title name) drives the picture.
 
+v2.11 (slim) — Workflow-first navigation. New "Workflows" section in the sidebar
+       maps 1:1 to the analysis guide's Section 2 and 3: Workflow A (print
+       snapshot), Workflow C (ebook snapshot), Workflow E (renewal review).
+       Individual tools moved into a collapsible dropdown for ad-hoc use.
+       Workflow E is fully implemented as a one-page walkthrough: setup,
+       uniqueness classification (reuses overlap logic), usage triage (with
+       optional inline ProQuest extraction), and a decision matrix that applies
+       the guide's Section 3 rules to produce renew / negotiate / cancel-
+       candidate counts and a downloadable brief. Workflows A and C are
+       placeholders (page structure + guidance to the individual tools) —
+       coming next.
+v2.10 (slim) — Overlap & Uniqueness: optional usage-file upload for cancellation
+       triage (titles matched by normalized title; usage attaches to every
+       classification row, giving used/unused breakdowns per bucket). Added an
+       investigation-focus selector that centers the tool on one database at a
+       time (Workflow E starts from one renewal deadline, not a portfolio survey)
+       — banner summarizes sole-source/unique/redundant × used/unused for the
+       focus database. Uses column and used-only filter added throughout drill
+       and lookup views.
 v2.9 (slim) — Added ProQuest Report Extractor: a new tool page that reads
        ProQuest's multi-database "Database Titles Usage Report" .xls exports,
        lets the user pick database(s) and metric(s), maps each period file to
@@ -7621,6 +7640,25 @@ def page_overlap_analyzer():
                 "**interface**) column.")
         return
 
+    # ---- Optional: usage file for cancellation-triage ----
+    # Attached to the classification output so titles carry a "Uses" column.
+    # Sole-source-and-used vs sole-source-and-unused becomes visible directly in
+    # the drill view — the two strongest signals for retention vs cancellation
+    # in Workflow E Step 2.
+    with st.expander("\U0001F4C8 Optional: attach a usage file for cancellation triage",
+                     expanded=False):
+        st.caption(
+            "Titles are matched to the coverage export by normalized title. "
+            "Any title-level usage export works — COUNTER TR_J3, a Zero-Use "
+            "explicit-zero master, or the per-title CSV from the ProQuest "
+            "Extractor. Titles present in the coverage export but missing from "
+            "the usage file are treated as **0 uses**."
+        )
+        usage_file = st.file_uploader(
+            "Usage file (CSV or Excel)", type=['csv', 'xls', 'xlsx'],
+            key="ovl_usage_upload",
+        )
+
     try:
         cached = _cached_df_for_tool(TOOL, uploaded_file)
         if cached is not None:
@@ -7745,6 +7783,70 @@ def page_overlap_analyzer():
                        "title and coverage columns are mapped correctly.")
             return
 
+        # ---- Usage integration (if a usage file was uploaded) ----
+        # Build {normalized_title: sum_of_uses}. Matches to long_df["title"] by
+        # re-normalizing the display title (same rule that built _ovl_key), so
+        # a title present in both files aligns without the user having to
+        # touch anything.
+        usage_map = {}
+        usage_meta_note = None
+        if usage_file:
+            try:
+                if usage_file.name.lower().endswith(('.xls', '.xlsx')):
+                    engine = 'xlrd' if usage_file.name.lower().endswith('.xls') else 'openpyxl'
+                    usage_df_raw = pd.read_excel(BytesIO(usage_file.getvalue()),
+                                                  engine=engine)
+                else:
+                    usage_df_raw = _load_csv_chunked(usage_file.getvalue(),
+                                                     usage_file.name)
+                u_title_col = find_column(usage_df_raw, TITLE_ALIASES)
+                u_weight_col = find_column(usage_df_raw, WEIGHT_ALIASES)
+                # Per-year usage columns count too — sum them if no total-usage col
+                u_peryear = _detect_per_year_usage_columns(usage_df_raw)
+                if not u_weight_col and u_peryear:
+                    peryear_cols = list(u_peryear.keys())
+                    usage_df_raw['_total_uses'] = (
+                        usage_df_raw[peryear_cols].apply(pd.to_numeric, errors='coerce')
+                        .fillna(0).sum(axis=1))
+                    u_weight_col = '_total_uses'
+                if u_title_col and u_weight_col:
+                    for _, r in usage_df_raw.iterrows():
+                        raw_t = r[u_title_col]
+                        if pd.isna(raw_t):
+                            continue
+                        k = normalize_text(raw_t)
+                        if not k:
+                            continue
+                        v = pd.to_numeric(r[u_weight_col], errors='coerce')
+                        usage_map[k] = usage_map.get(k, 0) + (
+                            int(v) if pd.notna(v) else 0)
+                    usage_meta_note = (
+                        f"Usage from `{usage_file.name}` "
+                        f"(title=`{u_title_col}`, uses=`{u_weight_col}`); "
+                        f"{len(usage_map):,} distinct titles."
+                    )
+                else:
+                    st.warning(f"Couldn't detect title + usage columns in "
+                               f"**{usage_file.name}**. Title col: `{u_title_col}`, "
+                               f"usage col: `{u_weight_col}`.")
+            except Exception as e:
+                st.warning(f"Couldn't parse usage file **{usage_file.name}**: {e}")
+
+        if usage_map:
+            # Match by re-normalizing the display title. Missing titles → 0.
+            long_df = long_df.copy()
+            long_df["_key"] = long_df["title"].apply(
+                lambda t: normalize_text(t) if pd.notna(t) else None)
+            long_df["uses"] = long_df["_key"].map(usage_map).fillna(0).astype(int)
+            long_df = long_df.drop(columns=["_key"])
+            match_rate = (long_df["uses"] > 0).mean() * 100
+            st.success(
+                f"\u2705 Usage attached \u2014 {int((long_df['uses']>0).sum()):,} "
+                f"of {len(long_df):,} title-placements have any recorded use "
+                f"({match_rate:.0f}%). "
+                + (usage_meta_note or "")
+            )
+
         notes = _notes_widget(
             TOOL,
             placeholder="e.g., July cancellation review. America's Historical "
@@ -7757,6 +7859,63 @@ def page_overlap_analyzer():
         meta = {"Compared by": dim_choice, "Group column": group_col,
                 "Materiality threshold (yrs)": min_years,
                 "Databases": n_databases, "Distinct titles": n_titles}
+        if usage_map:
+            meta["Usage file"] = usage_file.name if usage_file else "\u2014"
+
+        # ---- Focus-of-investigation selector ----
+        # Workflow E starts from ONE specific renewal deadline. The focus
+        # picker lets the user center the tool's attention on that database:
+        # a banner summarizes its uniqueness+usage picture at a glance, and
+        # the drill tab preselects it. Leaving it unset preserves the survey
+        # behavior for portfolio-wide audits.
+        st.markdown("---")
+        st.subheader("\U0001F3AF Investigation focus")
+        db_list_all = sorted(long_df["database"].unique())
+        focus_pick = st.selectbox(
+            "Which database is the focus of this review? "
+            "(Leave unset for a portfolio-wide survey.)",
+            ["\u2014 Survey all databases \u2014"] + db_list_all,
+            key="ovl_focus_db",
+            help="When set, the Drill tab preselects this database and a "
+                 "summary banner shows its uniqueness picture. Uniqueness "
+                 "results for other databases remain available in the Survey "
+                 "tab."
+        )
+        focus_db = None if focus_pick.startswith("\u2014") else focus_pick
+
+        if focus_db:
+            _fdf = long_df[long_df["database"] == focus_db]
+            _n_sole = int((_fdf["status"] == "Sole source").sum())
+            _n_uniq = int((_fdf["status"] == "Unique coverage").sum())
+            _n_red = int((_fdf["status"] == "Redundant").sum())
+            _n_total = len(_fdf)
+            if usage_map:
+                _sole_used = int(((_fdf["status"] == "Sole source")
+                                  & (_fdf["uses"] > 0)).sum())
+                _uniq_used = int(((_fdf["status"] == "Unique coverage")
+                                  & (_fdf["uses"] > 0)).sum())
+                _red_used = int(((_fdf["status"] == "Redundant")
+                                 & (_fdf["uses"] > 0)).sum())
+                st.info(
+                    f"**Investigating: {focus_db}**\n\n"
+                    f"- **Sole source:** {_n_sole:,} titles \u2014 "
+                    f"{_sole_used:,} used, {_n_sole - _sole_used:,} unused "
+                    f"(lost outright if cancelled)\n"
+                    f"- **Unique coverage:** {_n_uniq:,} titles \u2014 "
+                    f"{_uniq_used:,} used, {_n_uniq - _uniq_used:,} unused "
+                    f"(kept, but with date gaps)\n"
+                    f"- **Redundant:** {_n_red:,} titles \u2014 "
+                    f"{_red_used:,} used, {_n_red - _red_used:,} unused "
+                    f"(fully covered elsewhere)"
+                )
+            else:
+                st.info(
+                    f"**Investigating: {focus_db}** \u2014 "
+                    f"{_n_sole:,} sole source, {_n_uniq:,} unique coverage, "
+                    f"{_n_red:,} redundant (of {_n_total:,} titles). "
+                    f"*Attach a usage file above to add used/unused breakdowns.*"
+                )
+
 
         st.markdown("---")
         tab_profile, tab_drill, tab_lookup = st.tabs([
@@ -7769,15 +7928,39 @@ def page_overlap_analyzer():
         # TAB 1 — Uniqueness profile across all databases
         # =============================================================
         with tab_profile:
-            prof = (long_df.groupby("database")
-                    .agg(Titles=("title", "count"),
-                         Sole_source=("status",
-                                      lambda s: int((s == "Sole source").sum())),
-                         Unique_coverage=("status",
-                                          lambda s: int((s == "Unique coverage").sum())),
-                         Redundant=("status",
-                                    lambda s: int((s == "Redundant").sum())))
-                    .reset_index())
+            has_usage = "uses" in long_df.columns
+            if has_usage:
+                # Build the profile with usage-aware breakdowns
+                def _cnt(mask):
+                    return int(mask.sum())
+                grp = long_df.groupby("database")
+                prof_rows = []
+                for db, g in grp:
+                    sole = g["status"] == "Sole source"
+                    uniq = g["status"] == "Unique coverage"
+                    red = g["status"] == "Redundant"
+                    used = g["uses"] > 0
+                    prof_rows.append({
+                        "database": db,
+                        "Titles": len(g),
+                        "Sole_source": _cnt(sole),
+                        "Sole (used)": _cnt(sole & used),
+                        "Unique_coverage": _cnt(uniq),
+                        "Unique cov. (used)": _cnt(uniq & used),
+                        "Redundant": _cnt(red),
+                        "Redundant (used)": _cnt(red & used),
+                    })
+                prof = pd.DataFrame(prof_rows)
+            else:
+                prof = (long_df.groupby("database")
+                        .agg(Titles=("title", "count"),
+                             Sole_source=("status",
+                                          lambda s: int((s == "Sole source").sum())),
+                             Unique_coverage=("status",
+                                              lambda s: int((s == "Unique coverage").sum())),
+                             Redundant=("status",
+                                        lambda s: int((s == "Redundant").sum())))
+                        .reset_index())
             prof["Irreplaceable"] = prof["Sole_source"] + prof["Unique_coverage"]
             prof["% redundant"] = (prof["Redundant"] / prof["Titles"] * 100).round(0)
             prof = prof.sort_values(["Irreplaceable", "Titles"],
@@ -7803,11 +7986,20 @@ def page_overlap_analyzer():
             display_prof = prof.rename(columns={
                 "database": "Database", "Sole_source": "Sole source",
                 "Unique_coverage": "Unique coverage"})
-            st.dataframe(
-                display_prof[["Database", "Titles", "Sole source",
-                              "Unique coverage", "Redundant", "Irreplaceable",
-                              "% redundant"]],
-                use_container_width=True, hide_index=True)
+            if has_usage:
+                st.dataframe(
+                    display_prof[["Database", "Titles",
+                                  "Sole source", "Sole (used)",
+                                  "Unique coverage", "Unique cov. (used)",
+                                  "Redundant", "Redundant (used)",
+                                  "Irreplaceable", "% redundant"]],
+                    use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(
+                    display_prof[["Database", "Titles", "Sole source",
+                                  "Unique coverage", "Redundant", "Irreplaceable",
+                                  "% redundant"]],
+                    use_container_width=True, hide_index=True)
 
             # Stacked bar — top N databases by title count.
             top_n = min(20, len(prof))
@@ -7850,21 +8042,43 @@ def page_overlap_analyzer():
         # =============================================================
         with tab_drill:
             db_list = sorted(long_df["database"].unique())
-            pick = st.selectbox("Database to examine", db_list, key="ovl_pick_db")
+            has_usage = "uses" in long_df.columns
+            # Preselect focus DB when set — that's the whole point of focus mode.
+            default_idx = db_list.index(focus_db) if focus_db in db_list else 0
+            pick = st.selectbox("Database to examine", db_list,
+                                index=default_idx, key="ovl_pick_db")
             sub = long_df[long_df["database"] == pick].copy()
 
             n_sole = int((sub["status"] == "Sole source").sum())
             n_uniq = int((sub["status"] == "Unique coverage").sum())
             n_red = int((sub["status"] == "Redundant").sum())
 
-            d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Titles", f"{len(sub):,}")
-            d2.metric("Sole source", f"{n_sole:,}",
-                      help="Lost entirely if cancelled.")
-            d3.metric("Unique coverage", f"{n_uniq:,}",
-                      help="Kept, but with a date gap if cancelled.")
-            d4.metric("Redundant", f"{n_red:,}",
-                      help="Fully duplicated elsewhere.")
+            if has_usage:
+                sole_used = int(((sub["status"] == "Sole source")
+                                 & (sub["uses"] > 0)).sum())
+                uniq_used = int(((sub["status"] == "Unique coverage")
+                                 & (sub["uses"] > 0)).sum())
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Titles", f"{len(sub):,}")
+                d2.metric("Sole source",
+                          f"{sole_used:,} used / {n_sole:,}",
+                          help="Used AND lost outright if cancelled \u2014 the "
+                               "strongest retention signal. Unused sole-source "
+                               "is a weaker keep argument.")
+                d3.metric("Unique coverage",
+                          f"{uniq_used:,} used / {n_uniq:,}",
+                          help="Used AND opens a date gap if cancelled.")
+                d4.metric("Redundant", f"{n_red:,}",
+                          help="Fully duplicated elsewhere.")
+            else:
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Titles", f"{len(sub):,}")
+                d2.metric("Sole source", f"{n_sole:,}",
+                          help="Lost entirely if cancelled.")
+                d3.metric("Unique coverage", f"{n_uniq:,}",
+                          help="Kept, but with a date gap if cancelled.")
+                d4.metric("Redundant", f"{n_red:,}",
+                          help="Fully duplicated elsewhere.")
 
             irreplaceable = n_sole + n_uniq
             if irreplaceable == 0:
@@ -7880,30 +8094,57 @@ def page_overlap_analyzer():
                     f"more. **{n_red}** of its {len(sub)} titles are safely "
                     f"duplicated elsewhere.")
 
-            status_filter = st.radio(
-                "Show", ["All", "Sole source", "Unique coverage", "Redundant"],
-                horizontal=True, key="ovl_status_filter")
+            fc1, fc2 = st.columns([2, 3])
+            with fc1:
+                status_filter = st.radio(
+                    "Show", ["All", "Sole source", "Unique coverage", "Redundant"],
+                    horizontal=True, key="ovl_status_filter")
+            with fc2:
+                if has_usage:
+                    usage_filter = st.radio(
+                        "Usage", ["All", "Used (uses > 0)", "Unused (uses = 0)"],
+                        horizontal=True, key="ovl_usage_filter",
+                        help="Filter by whether the title has any recorded use "
+                             "in the attached usage file.")
+                else:
+                    usage_filter = "All"
             view = sub if status_filter == "All" else sub[sub["status"] == status_filter]
+            if has_usage and usage_filter == "Used (uses > 0)":
+                view = view[view["uses"] > 0]
+            elif has_usage and usage_filter == "Unused (uses = 0)":
+                view = view[view["uses"] == 0]
 
-            # Order: sole source first, then unique coverage (by span desc), then redundant.
+            # Order: sole source first, then unique coverage. Within group, sort
+            # by usage desc (when available) then unique_years desc — the
+            # priority order Kay would want to eyeball in Workflow E.
             order_map = {"Sole source": 0, "Unique coverage": 1, "Redundant": 2}
-            view = view.assign(_o=view["status"].map(order_map)).sort_values(
-                ["_o", "unique_years"], ascending=[True, False]).drop(columns="_o")
+            if has_usage:
+                view = view.assign(_o=view["status"].map(order_map)).sort_values(
+                    ["_o", "uses", "unique_years"],
+                    ascending=[True, False, False]).drop(columns="_o")
+            else:
+                view = view.assign(_o=view["status"].map(order_map)).sort_values(
+                    ["_o", "unique_years"], ascending=[True, False]).drop(columns="_o")
 
-            display = view.rename(columns={
+            rename_map = {
                 "title": "Title", "status": "Status",
                 "unique_years": "Unique years",
                 "unique_ranges": "Unique coverage (years)",
-                "also_in": "Also available in"})
+                "also_in": "Also available in"}
+            if has_usage:
+                rename_map["uses"] = "Uses"
+            display = view.rename(columns=rename_map)
+            cols_order = ["Title", "Status"]
+            if has_usage:
+                cols_order.append("Uses")
+            cols_order += ["Unique years", "Unique coverage (years)", "Also available in"]
             st.dataframe(
-                display[["Title", "Status", "Unique years",
-                         "Unique coverage (years)", "Also available in"]],
+                display[cols_order],
                 use_container_width=True, hide_index=True)
 
             safe_name = re.sub(r'[^\w\-]+', '_', pick)[:60].strip('_') or "database"
             csv = _annotate_csv(
-                display[["Title", "Status", "Unique years",
-                         "Unique coverage (years)", "Also available in"]],
+                display[cols_order],
                 notes, extra_meta={**meta, "Database examined": pick})
             _dl(f"\U0001F4E5 {pick[:40]} \u2014 title classification (CSV)", csv,
                 f"uniqueness_{safe_name}.csv", "text/csv",
@@ -7936,15 +8177,26 @@ def page_overlap_analyzer():
                     rows = rows.assign(_o=rows["status"].map(order_map)).sort_values(
                         ["_o", "unique_years"], ascending=[True, False]).drop(columns="_o")
                     n_db = rows["database"].nunique()
+                    has_usage_lu = "uses" in rows.columns
+                    _uses_str = ""
+                    if has_usage_lu:
+                        _uses_total = int(rows["uses"].iloc[0]) if len(rows) else 0
+                        _uses_str = f" \u00b7 **{_uses_total:,}** uses"
                     st.markdown(f"**{chosen}** \u2014 held in **{n_db}** "
-                                f"database{'s' if n_db != 1 else ''}.")
-                    disp = rows.rename(columns={
+                                f"database{'s' if n_db != 1 else ''}{_uses_str}.")
+                    disp_rename = {
                         "database": "Database", "status": "Status in this database",
                         "unique_years": "Unique years",
-                        "unique_ranges": "Unique coverage (years)"})
+                        "unique_ranges": "Unique coverage (years)"}
+                    if has_usage_lu:
+                        disp_rename["uses"] = "Uses"
+                    disp = rows.rename(columns=disp_rename)
+                    lookup_cols = ["Database", "Status in this database"]
+                    if has_usage_lu:
+                        lookup_cols.append("Uses")
+                    lookup_cols += ["Unique years", "Unique coverage (years)"]
                     st.dataframe(
-                        disp[["Database", "Status in this database",
-                              "Unique years", "Unique coverage (years)"]],
+                        disp[lookup_cols],
                         use_container_width=True, hide_index=True)
                     if (rows["status"] == "Redundant").all():
                         st.caption("Every copy of this title is duplicated \u2014 "
@@ -7961,6 +8213,586 @@ def page_overlap_analyzer():
 
 
 # =====================================================================
+# WORKFLOW PAGES — one-page walkthroughs mapping to the guide's workflows.
+# These orchestrate the existing tool logic so a full review can be
+# completed on one page instead of hopping between tools. Files uploaded
+# in a workflow persist across its steps via session state.
+# =====================================================================
+
+
+def _wfe_classify_uniqueness(df, coverage_col, group_col, title_disp_col,
+                              title_norm_col, min_years, coverage_file):
+    """Build the _ovl_key column and run the cached overlap classification.
+
+    Wraps the same normalization + call used by page_overlap_analyzer so the
+    workflow page produces identical results to the standalone tool.
+    """
+    df = df.copy()
+    if title_norm_col and title_norm_col in df.columns:
+        df["_ovl_key"] = df[title_norm_col].apply(
+            lambda v: normalize_text(v) if pd.notna(v) and str(v).strip() else None)
+        blank = df["_ovl_key"].isna() | (df["_ovl_key"] == "")
+        df.loc[blank, "_ovl_key"] = df.loc[blank, title_disp_col].apply(
+            lambda v: normalize_text(v) if pd.notna(v) else None)
+    else:
+        df["_ovl_key"] = df[title_disp_col].apply(
+            lambda v: normalize_text(v) if pd.notna(v) else None)
+    return _ovl_cached_classification(
+        "wfe", coverage_file, group_col, "_ovl_key",
+        title_disp_col, coverage_col, min_years, df)
+
+
+def _wfe_build_usage_map(usage_df):
+    """Return {normalized_title: total_uses} from an arbitrary usage DataFrame.
+
+    Handles files with a single weight column and files with per-year usage
+    columns (from Zero-Use Identifier / ProQuest Extractor output) — sums the
+    per-year columns when no single-total column is present.
+    """
+    usage_map = {}
+    if usage_df is None or usage_df.empty:
+        return usage_map, None, None
+    u_title_col = find_column(usage_df, TITLE_ALIASES)
+    u_weight_col = find_column(usage_df, WEIGHT_ALIASES)
+    u_peryear = _detect_per_year_usage_columns(usage_df)
+    if not u_weight_col and u_peryear:
+        peryear_cols = list(u_peryear.keys())
+        usage_df = usage_df.copy()
+        usage_df['_total_uses'] = (
+            usage_df[peryear_cols].apply(pd.to_numeric, errors='coerce')
+            .fillna(0).sum(axis=1))
+        u_weight_col = '_total_uses'
+    if not (u_title_col and u_weight_col):
+        return usage_map, u_title_col, u_weight_col
+    for _, r in usage_df.iterrows():
+        raw_t = r[u_title_col]
+        if pd.isna(raw_t):
+            continue
+        k = normalize_text(raw_t)
+        if not k:
+            continue
+        v = pd.to_numeric(r[u_weight_col], errors='coerce')
+        usage_map[k] = usage_map.get(k, 0) + (int(v) if pd.notna(v) else 0)
+    return usage_map, u_title_col, u_weight_col
+
+
+def _wfe_apply_decision_matrix(long_df, focus_db, tlr_relevant, low_use_threshold):
+    """Apply the guide's Section 3 renew/negotiate/cancel matrix.
+
+    Guide rules (implemented per-title against the focus DB's placements):
+      - Sole source + used            → Renew
+      - Sole source + unused + T/L/R  → Renew (protected)
+      - Sole source + unused + !T/L/R → Cancel candidate (the exception)
+      - Unique coverage + used        → Renew (or negotiate for gap years)
+      - Unique coverage + unused + T/L/R → Renew (protected)
+      - Unique coverage + unused + !T/L/R → Cancel candidate
+      - Redundant + high use          → Negotiate / restructure
+      - Redundant + low use           → Cancel candidate
+    """
+    sub = long_df[long_df["database"] == focus_db].copy()
+    has_usage = "uses" in sub.columns
+    if not has_usage:
+        sub["uses"] = 0
+
+    def _row_decision(r):
+        status = r["status"]
+        used = r["uses"] > 0
+        heavy = r["uses"] >= low_use_threshold
+        if status == "Sole source":
+            if used:
+                return "Renew", "Sole source with recorded use — irreplaceable AND earning its keep."
+            if tlr_relevant:
+                return "Renew (protected)", "Sole source; unused but flagged as T/L/R relevant — protection outweighs low signal."
+            return "Cancel candidate", "Sole source but unused and not T/L/R relevant — Workflow E exception applies."
+        if status == "Unique coverage":
+            if used:
+                return "Renew / Negotiate", "Unique coverage with use — renew, or negotiate for the gap years."
+            if tlr_relevant:
+                return "Renew (protected)", "Unique coverage; unused but T/L/R relevant."
+            return "Cancel candidate", "Unique coverage but unused and not T/L/R relevant."
+        # Redundant
+        if heavy:
+            return "Negotiate / restructure", "Fully covered elsewhere but used — worth negotiating."
+        return "Cancel candidate", "Redundant coverage with low/no use — the cleanest cut."
+
+    decisions = sub.apply(_row_decision, axis=1)
+    sub["Decision"] = decisions.apply(lambda x: x[0])
+    sub["Reasoning"] = decisions.apply(lambda x: x[1])
+    return sub
+
+
+def page_workflow_e():
+    """Workflow E — Renewal-Driven Resource Review as a single-page walkthrough.
+
+    Steps: setup → uniqueness (Step 1) → usage (Step 2, branch-agnostic) →
+    decision matrix aligned with the guide's Section 3. Coverage and usage
+    files uploaded here are held in session; the underlying overlap
+    classification and usage matching reuse the same functions the standalone
+    Overlap & Uniqueness tool calls, so results are identical to running the
+    two tools separately.
+    """
+    st.header("🅔 Workflow E — Renewal-Driven Resource Review")
+    st.markdown(
+        "**Everything for one subscription's renewal on one page.** Setup, "
+        "uniqueness classification, usage triage, and the guide's decision "
+        "matrix — no tool-hopping."
+    )
+    with st.expander("ℹ️ How this workflow works", expanded=False):
+        st.markdown(
+            "This page walks through the four steps of Workflow E as described "
+            "in Section 3 of the Print & Electronic Resource Analysis Guide:\n\n"
+            "1. **Setup** — vendor, renewal deadline, and any T/L/R relevance "
+            "note the data can't see.\n"
+            "2. **Uniqueness (Step 1)** — upload the Alma coverage / A-to-Z "
+            "export; the tool classifies every title as sole source, unique "
+            "coverage, or redundant.\n"
+            "3. **Usage (Step 2)** — upload a title-level usage file (COUNTER, "
+            "non-COUNTER vendor report, Zero-Use master, or ProQuest extract). "
+            "Usage attaches to the uniqueness classification.\n"
+            "4. **Decision matrix** — the tool applies the guide's rules to "
+            "each title of the focus database and produces a renew / "
+            "negotiate / cancel-candidate breakdown, downloadable as a brief."
+        )
+
+    st.markdown("---")
+
+    # =============================================================
+    # 1. SETUP
+    # =============================================================
+    st.subheader("1️⃣ Setup")
+    c1, c2 = st.columns(2)
+    with c1:
+        vendor_name = st.text_input(
+            "Vendor / package name:", key="wfe_vendor",
+            placeholder="e.g., ABI/INFORM Global (ProQuest)"
+        )
+    with c2:
+        from datetime import date
+        deadline = st.date_input(
+            "Renewal deadline:", value=None, key="wfe_deadline",
+            help="Approximate is fine — this just anchors the review."
+        )
+    tlr_relevant = st.checkbox(
+        "This subscription is T/L/R (teaching / learning / research) relevant",
+        key="wfe_tlr_flag",
+        help="Flip on when the data can't see the curricular alignment — "
+             "e.g. required for a course, cited in faculty grant work, or "
+             "core to a program. When on, unused sole-source and "
+             "unique-coverage titles are recommended for **renew (protected)** "
+             "rather than cancel, matching the guide's exception rule."
+    )
+    tlr_note = st.text_area(
+        "T/L/R justification (optional, appears in the exported brief):",
+        key="wfe_tlr_note", placeholder="Faculty citations, course dependencies…",
+        height=68
+    )
+
+    st.markdown("---")
+
+    # =============================================================
+    # 2. UNIQUENESS (STEP 1)
+    # =============================================================
+    st.subheader("2️⃣ Uniqueness — Step 1")
+    st.caption(
+        "Upload the Alma electronic-journal coverage / A-to-Z export "
+        "(one row per title × database, with a coverage statement)."
+    )
+    coverage_file = st.file_uploader(
+        "Coverage / A-Z export (CSV, XLS, XLSX)",
+        type=['csv', 'xls', 'xlsx'], key="wfe_coverage_file"
+    )
+    if not coverage_file:
+        st.info("Upload the coverage export to run the uniqueness classification.")
+        return
+
+    try:
+        if coverage_file.name.lower().endswith(('.xls', '.xlsx')):
+            engine = 'xlrd' if coverage_file.name.lower().endswith('.xls') else 'openpyxl'
+            df = pd.read_excel(BytesIO(coverage_file.getvalue()), engine=engine)
+        else:
+            df = _load_csv_chunked(coverage_file.getvalue(), coverage_file.name)
+    except Exception as e:
+        st.error(f"❌ Couldn't read coverage export: {e}")
+        return
+
+    st.success(f"✅ Loaded {len(df):,} coverage rows.")
+
+    coverage_col = find_column(df, COVERAGE_ALIASES)
+    collection_col = find_column(df, COLLECTION_ALIASES)
+    interface_col = find_column(df, INTERFACE_ALIASES)
+    title_disp_col = find_column(df, TITLE_ALIASES)
+    title_norm_col = find_column(df, NORM_TITLE_ALIASES)
+
+    group_col = collection_col or interface_col
+
+    if not (title_disp_col and coverage_col and group_col):
+        st.error(
+            f"❌ Need title, coverage, and database columns. Detected: "
+            f"title=`{title_disp_col}`, coverage=`{coverage_col}`, "
+            f"database=`{collection_col}`, interface=`{interface_col}`. "
+            f"Use the Overlap & Uniqueness tool (under Individual tools) if "
+            f"the columns need manual overrides."
+        )
+        return
+
+    min_years = st.slider(
+        "Materiality threshold — minimum unique span to count as unique coverage (years):",
+        0.0, 5.0, 0.0, 0.25, key="wfe_min_years",
+        help="Raise to ignore small gaps that come from year-level metadata rounding."
+    )
+
+    with st.spinner("Classifying uniqueness…"):
+        long_df = _wfe_classify_uniqueness(
+            df, coverage_col, group_col, title_disp_col,
+            title_norm_col, min_years, coverage_file)
+
+    if long_df.empty:
+        st.warning("No title/database pairs could be built.")
+        return
+
+    # ---- Focus database picker ----
+    db_list = sorted(long_df["database"].unique())
+    # Prefill from vendor_name if it matches a database exactly (or nearly)
+    default_idx = 0
+    if vendor_name:
+        for i, db in enumerate(db_list):
+            if vendor_name.lower() in db.lower():
+                default_idx = i
+                break
+    focus_db = st.selectbox(
+        "Which database is under review?",
+        db_list, index=default_idx, key="wfe_focus_db"
+    )
+
+    focus_sub = long_df[long_df["database"] == focus_db]
+    n_sole = int((focus_sub["status"] == "Sole source").sum())
+    n_uniq = int((focus_sub["status"] == "Unique coverage").sum())
+    n_red = int((focus_sub["status"] == "Redundant").sum())
+    n_tot = len(focus_sub)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Titles in focus DB", f"{n_tot:,}")
+    k2.metric("Sole source", f"{n_sole:,}",
+              help="Lost entirely if cancelled.")
+    k3.metric("Unique coverage", f"{n_uniq:,}",
+              help="Kept, but with a date gap if cancelled.")
+    k4.metric("Redundant", f"{n_red:,}",
+              help="Fully duplicated elsewhere.")
+
+    st.markdown("---")
+
+    # =============================================================
+    # 3. USAGE (STEP 2)
+    # =============================================================
+    st.subheader("3️⃣ Usage — Step 2")
+    st.caption(
+        "Attach usage data so the decision matrix can weigh irreplaceability "
+        "against actual use. Skip if you're doing a uniqueness-only review "
+        "(the matrix will assume 0 uses for every title)."
+    )
+
+    usage_source = st.radio(
+        "Usage source:",
+        ["Skip (uniqueness-only)",
+         "Upload usage file directly",
+         "Extract from ProQuest DB Titles Usage Report"],
+        key="wfe_usage_source", horizontal=False
+    )
+
+    usage_map = {}
+    usage_source_desc = None
+
+    if usage_source == "Upload usage file directly":
+        usage_file = st.file_uploader(
+            "Usage file (CSV, XLS, XLSX)",
+            type=['csv', 'xls', 'xlsx'], key="wfe_usage_upload",
+            help="Any title-level usage file: COUNTER TR_J3, a Zero-Use master, "
+                 "a non-COUNTER vendor report, or the CSV from the ProQuest "
+                 "Extractor. Per-year usage columns are summed automatically."
+        )
+        if usage_file:
+            try:
+                if usage_file.name.lower().endswith(('.xls', '.xlsx')):
+                    engine = 'xlrd' if usage_file.name.lower().endswith('.xls') else 'openpyxl'
+                    usage_df_raw = pd.read_excel(BytesIO(usage_file.getvalue()), engine=engine)
+                else:
+                    usage_df_raw = _load_csv_chunked(usage_file.getvalue(), usage_file.name)
+                usage_map, u_title_col, u_weight_col = _wfe_build_usage_map(usage_df_raw)
+                if u_title_col and u_weight_col:
+                    usage_source_desc = (
+                        f"`{usage_file.name}` (title=`{u_title_col}`, "
+                        f"uses=`{u_weight_col}`; {len(usage_map):,} distinct titles)"
+                    )
+                else:
+                    st.warning(
+                        f"Couldn't detect title + usage columns in **{usage_file.name}**. "
+                        f"Title col: `{u_title_col}`, usage col: `{u_weight_col}`."
+                    )
+            except Exception as e:
+                st.warning(f"Couldn't parse usage file: {e}")
+
+    elif usage_source == "Extract from ProQuest DB Titles Usage Report":
+        if not XLS_AVAILABLE:
+            st.error("Reading ProQuest .xls files needs the `xlrd` package.")
+        else:
+            pq_files = st.file_uploader(
+                "ProQuest DB Titles Usage Report .xls file(s):",
+                type=['xls'], accept_multiple_files=True, key="wfe_pq_files",
+                help="Upload one or more period exports; the tool will extract "
+                     "usage for the focus database and combine periods."
+            )
+            if pq_files:
+                pq_metric_default = ['Total']
+                pq_metric_choice = st.multiselect(
+                    "Metrics to sum:", pq_metric_default + ['Full Text', 'Full Text  PDF', 'Page View'],
+                    default=pq_metric_default, key="wfe_pq_metrics",
+                    help="Defaults to ProQuest's precomputed 'Total'. Add "
+                         "Full Text / PDF for a stricter measure."
+                )
+                # Try to auto-detect a section that matches the focus_db
+                aggregated = {}  # title → total uses
+                matched_sections = 0
+                for pqf in pq_files:
+                    pqf.seek(0)
+                    parsed = _parse_proquest_usage_report(pqf.read(), pqf.name)
+                    if parsed.get('error'):
+                        st.warning(f"{pqf.name}: {parsed['error']}")
+                        continue
+                    for sec in parsed['sections']:
+                        # Fuzzy match: focus_db in section name or vice versa
+                        if (focus_db.lower() in sec['database'].lower()
+                                or sec['database'].lower() in focus_db.lower()):
+                            matched_sections += 1
+                            for tr in sec['titles']:
+                                title = str(tr.get('Title', '')).strip()
+                                if not title:
+                                    continue
+                                use_total = 0
+                                for m in pq_metric_choice:
+                                    v = tr.get(m, 0)
+                                    if isinstance(v, (int, float)) and not pd.isna(v):
+                                        use_total += int(v)
+                                aggregated[title] = aggregated.get(title, 0) + use_total
+                if matched_sections:
+                    for title, use_total in aggregated.items():
+                        k = normalize_text(title)
+                        if k:
+                            usage_map[k] = usage_map.get(k, 0) + use_total
+                    usage_source_desc = (
+                        f"ProQuest Extract — {len(pq_files)} file(s), "
+                        f"{matched_sections} matching section(s) for '{focus_db}', "
+                        f"{len(usage_map):,} distinct titles."
+                    )
+                    st.success(
+                        f"✅ Extracted usage for '{focus_db}' from {matched_sections} "
+                        f"section(s) across {len(pq_files)} file(s)."
+                    )
+                else:
+                    st.warning(
+                        f"No sections matching '{focus_db}' in the uploaded files. "
+                        f"Check that the focus database name aligns with a "
+                        f"ProQuest section name."
+                    )
+
+    # Attach usage to long_df
+    has_usage = bool(usage_map)
+    if has_usage:
+        long_df = long_df.copy()
+        long_df["_k"] = long_df["title"].apply(
+            lambda t: normalize_text(t) if pd.notna(t) else None)
+        long_df["uses"] = long_df["_k"].map(usage_map).fillna(0).astype(int)
+        long_df = long_df.drop(columns=["_k"])
+        focus_sub = long_df[long_df["database"] == focus_db]
+        sole_used = int(((focus_sub["status"] == "Sole source") & (focus_sub["uses"] > 0)).sum())
+        uniq_used = int(((focus_sub["status"] == "Unique coverage") & (focus_sub["uses"] > 0)).sum())
+        red_used = int(((focus_sub["status"] == "Redundant") & (focus_sub["uses"] > 0)).sum())
+        st.info(
+            f"**Usage attached.** In '{focus_db}': "
+            f"**{sole_used:,}** of {n_sole:,} sole-source titles are used · "
+            f"**{uniq_used:,}** of {n_uniq:,} unique-coverage titles are used · "
+            f"**{red_used:,}** of {n_red:,} redundant titles are used."
+        )
+
+    st.markdown("---")
+
+    # =============================================================
+    # 4. DECISION MATRIX
+    # =============================================================
+    st.subheader("4️⃣ Decision matrix")
+
+    low_use_threshold = st.number_input(
+        "Low-use threshold (uses per title to treat as 'used' for redundant titles):",
+        min_value=1, max_value=1000, value=5, step=1, key="wfe_low_use_thresh",
+        help="Redundant titles above this threshold get 'Negotiate / restructure' "
+             "(worth keeping the good stuff, dropping the tail). Below → cancel "
+             "candidate."
+    ) if has_usage else 5
+
+    decision_df = _wfe_apply_decision_matrix(long_df, focus_db, tlr_relevant, low_use_threshold)
+
+    # Summary counts
+    dcounts = decision_df["Decision"].value_counts()
+    _renew_total = int(dcounts.get("Renew", 0) + dcounts.get("Renew (protected)", 0)
+                       + dcounts.get("Renew / Negotiate", 0))
+    _negot_total = int(dcounts.get("Negotiate / restructure", 0))
+    _cancel_total = int(dcounts.get("Cancel candidate", 0))
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Titles reviewed", f"{len(decision_df):,}")
+    d2.metric("Recommend RENEW", f"{_renew_total:,}",
+              help="Renew, Renew (protected), or Renew/Negotiate combined.")
+    d3.metric("Recommend NEGOTIATE", f"{_negot_total:,}",
+              help="Redundant-but-used titles worth restructuring.")
+    d4.metric("Recommend CANCEL", f"{_cancel_total:,}",
+              help="Candidates for dropping — check each against T/L/R notes.")
+
+    # Recommendation callout
+    if _cancel_total > 0.5 * len(decision_df) and _renew_total < 0.2 * len(decision_df):
+        st.warning(
+            f"⚠️ **Cancellation trend**: {_cancel_total:,} of {len(decision_df):,} "
+            f"titles ({_cancel_total/len(decision_df)*100:.0f}%) meet the "
+            f"cancel-candidate criteria. Consider a full cancellation review — "
+            f"is this subscription still earning its cost?"
+        )
+    elif _renew_total > 0.5 * len(decision_df):
+        st.success(
+            f"✅ **Retention signal**: {_renew_total:,} of {len(decision_df):,} "
+            f"titles ({_renew_total/len(decision_df)*100:.0f}%) are recommended "
+            f"for renewal. The subscription is earning its keep."
+        )
+    else:
+        st.info(
+            f"**Mixed signal**: {_renew_total:,} renew, {_negot_total:,} "
+            f"negotiate, {_cancel_total:,} cancel-candidate. A restructure "
+            f"negotiation likely gets the best outcome."
+        )
+
+    # Decision breakdown table
+    with st.expander("📊 Decision breakdown by category", expanded=True):
+        # Cross-tab: status × decision
+        crosstab = pd.crosstab(decision_df["status"], decision_df["Decision"], margins=True, margins_name="Total")
+        st.dataframe(crosstab, use_container_width=True)
+
+    # Per-title recommendations
+    with st.expander("📋 Per-title recommendations", expanded=False):
+        show_only = st.multiselect(
+            "Show decisions:",
+            sorted(decision_df["Decision"].unique()),
+            default=sorted(decision_df["Decision"].unique()),
+            key="wfe_decision_filter"
+        )
+        display = decision_df[decision_df["Decision"].isin(show_only)].copy()
+        display = display.rename(columns={
+            "title": "Title", "status": "Uniqueness", "uses": "Uses",
+            "unique_years": "Unique years",
+            "unique_ranges": "Unique coverage (years)",
+            "also_in": "Also available in"
+        })
+        cols = ["Title", "Uniqueness", "Uses", "Decision", "Reasoning",
+                "Unique years", "Unique coverage (years)", "Also available in"]
+        st.dataframe(
+            display[cols].sort_values(["Decision", "Uses"], ascending=[True, False]),
+            use_container_width=True, hide_index=True
+        )
+
+    # =============================================================
+    # 5. EXPORT BRIEF
+    # =============================================================
+    st.markdown("---")
+    st.subheader("📥 Export renewal review brief")
+
+    # Build a small brief header + the decision table
+    brief_header = pd.DataFrame([
+        {'Field': 'Vendor / package', 'Value': vendor_name or focus_db},
+        {'Field': 'Focus database (from coverage)', 'Value': focus_db},
+        {'Field': 'Renewal deadline', 'Value': str(deadline) if deadline else '—'},
+        {'Field': 'T/L/R relevant?', 'Value': 'Yes' if tlr_relevant else 'No'},
+        {'Field': 'T/L/R justification', 'Value': tlr_note or '—'},
+        {'Field': 'Coverage file', 'Value': coverage_file.name},
+        {'Field': 'Usage source', 'Value': usage_source_desc or '(none — uniqueness only)'},
+        {'Field': 'Materiality threshold (yrs)', 'Value': str(min_years)},
+        {'Field': 'Low-use threshold', 'Value': str(low_use_threshold) if has_usage else '—'},
+        {'Field': 'Titles reviewed', 'Value': f"{len(decision_df):,}"},
+        {'Field': 'Recommend RENEW (all types)', 'Value': f"{_renew_total:,}"},
+        {'Field': 'Recommend NEGOTIATE', 'Value': f"{_negot_total:,}"},
+        {'Field': 'Recommend CANCEL', 'Value': f"{_cancel_total:,}"},
+    ])
+
+    csv_buf = BytesIO()
+    csv_buf.write(b"# Workflow E Renewal Review Brief\n")
+    csv_buf.write(f"# Generated: {pd.Timestamp.now()}\n\n".encode('utf-8'))
+    csv_buf.write(b"# ---- Setup ----\n")
+    brief_header.to_csv(csv_buf, index=False)
+    csv_buf.write(b"\n# ---- Per-title decisions ----\n")
+    dcsv = decision_df.rename(columns={
+        "title": "Title", "status": "Uniqueness", "uses": "Uses",
+        "unique_years": "Unique years", "unique_ranges": "Unique coverage (years)",
+        "also_in": "Also available in"
+    })[["Title", "Uniqueness", "Uses", "Decision", "Reasoning",
+        "Unique years", "Unique coverage (years)", "Also available in"]]
+    dcsv.to_csv(csv_buf, index=False)
+
+    safe_name = re.sub(r'[^\w\-]+', '_', focus_db)[:60].strip('_') or "renewal"
+    st.download_button(
+        "📥 Renewal review brief (CSV)",
+        csv_buf.getvalue(),
+        f"renewal_brief_{safe_name}.csv",
+        "text/csv",
+        key="wfe_dl_brief"
+    )
+
+    # XLSX version with separate sheets
+    if XLSX_AVAILABLE:
+        xbuf = BytesIO()
+        with pd.ExcelWriter(xbuf, engine='openpyxl') as writer:
+            brief_header.to_excel(writer, sheet_name='Setup', index=False)
+            dcsv.to_excel(writer, sheet_name='Decisions', index=False)
+            crosstab.to_excel(writer, sheet_name='Summary')
+        st.download_button(
+            "📥 Renewal review brief (XLSX, multi-sheet)",
+            xbuf.getvalue(),
+            f"renewal_brief_{safe_name}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="wfe_dl_brief_xlsx"
+        )
+
+
+def page_workflow_a():
+    """Workflow A — Annual Print Snapshot (placeholder, not yet built)."""
+    st.header("🅐 Workflow A — Annual Print Collection Snapshot")
+    st.info(
+        "**Coming next.** This page will orchestrate the July print-snapshot "
+        "workflow described in Section 2 of the Print & Electronic Resource "
+        "Analysis Guide:\n\n"
+        "1. Upload the multi-year Alma export (recent FY + 3 prior FYs)\n"
+        "2. Run Zero-Use reconciliation inline\n"
+        "3. Run Coverage-vs-Use with the compare-mode toggle (recent vs baseline)\n"
+        "4. Export the liaison meeting brief\n\n"
+        "For now, do these steps individually via the tools under **Individual "
+        "tools** in the sidebar — Zero-Use Identifier, then Use Analysis with "
+        "compare mode on."
+    )
+
+
+def page_workflow_c():
+    """Workflow C — Annual Ebook Snapshot (placeholder, not yet built)."""
+    st.header("🅒 Workflow C — Annual Ebook Collection Snapshot")
+    st.info(
+        "**Coming next.** This page will orchestrate the July ebook-snapshot "
+        "workflow described in Section 2 of the Print & Electronic Resource "
+        "Analysis Guide:\n\n"
+        "1. Per major ebook vendor, upload the ERM-acquired usage data\n"
+        "2. Classify by data type (COUNTER, non-COUNTER, non-COUNTER + subjects)\n"
+        "3. Run Zero-Use reconciliation against the vendor's full title list\n"
+        "4. Run Use Analysis on the appropriate branch (A/B/C)\n"
+        "5. Export vendor-level ebook usage profiles for the July meeting\n\n"
+        "For now, do these steps individually via the tools under **Individual "
+        "tools** in the sidebar — ProQuest Extractor (if applicable), "
+        "Zero-Use Identifier, then Use Analysis."
+    )
+
+
+# =====================================================================
 # HOME PAGE & MAIN NAVIGATION
 # =====================================================================
 
@@ -7971,10 +8803,65 @@ def page_home():
         "and acquisition prioritization at Howard-Tilton Memorial Library."
     )
     st.markdown(
-        "Each tool answers one question. Pick based on what you need to decide."
+        "**Start with a workflow** — a one-page walkthrough that matches the "
+        "analysis guide and orchestrates the tools you need. Reach for the "
+        "individual tools (in the sidebar dropdown) for ad-hoc analysis outside "
+        "a workflow, or for teaching/demos."
     )
     st.markdown("---")
 
+    st.markdown("### 🎯 Workflows")
+    st.caption("One page each, mapping to the analysis guide's Section 2 and Section 3 workflows.")
+
+    wc1, wc2, wc3 = st.columns(3)
+    with wc1:
+        st.markdown("""
+        <div class="tool-card">
+            <h3>🅐 Workflow A</h3>
+            <p><em>Annual Print Snapshot</em></p>
+            <p>The July print review: one multi-year Alma export, recent FY vs
+            three-year baseline compared in-tool. Drives weeding, approval-plan
+            edits, and print/electronic migration decisions through the year.</p>
+            <hr>
+            <p><strong>Status:</strong> Placeholder — use Zero-Use → Use Analysis
+            (compare mode) directly for now.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with wc2:
+        st.markdown("""
+        <div class="tool-card">
+            <h3>🅒 Workflow C</h3>
+            <p><em>Annual Ebook Snapshot</em></p>
+            <p>The July ebook review, per major vendor. Data acquired with ERM;
+            classified by the same COUNTER / non-COUNTER / non-COUNTER + subjects
+            taxonomy as renewals. Informs firm purchases, package restructuring,
+            and migration decisions.</p>
+            <hr>
+            <p><strong>Status:</strong> Placeholder — use ProQuest Extractor →
+            Zero-Use → Use Analysis directly for now.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with wc3:
+        st.markdown("""
+        <div class="tool-card">
+            <h3>🅔 Workflow E</h3>
+            <p><em>Renewal-Driven Resource Review</em></p>
+            <p>Everything for one subscription's renewal on one page. Uniqueness
+            (Step 1), usage triage (Step 2), and the guide's decision matrix
+            (renew / negotiate / cancel) — no tool-hopping. Optional inline
+            ProQuest extraction.</p>
+            <hr>
+            <p><strong>Status:</strong> Ready. Coverage upload + optional usage
+            + focus DB → renewal brief.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### 🛠️ Individual tools")
+    st.caption(
+        "Direct access via the sidebar dropdown. The workflows above orchestrate "
+        "these under the hood."
+    )
     c1, c2 = st.columns(2)
 
     with c1:
@@ -8105,35 +8992,79 @@ def page_home():
 
 
 def main():
+    # Track which nav section is active — workflows vs individual tools.
+    # Whichever radio the user most recently interacted with drives the view.
+    if 'active_view' not in st.session_state:
+        st.session_state['active_view'] = ('workflow', "🏠 Home")
+
+    def _pick_workflow():
+        st.session_state['active_view'] = ('workflow', st.session_state['nav_workflow'])
+
+    def _pick_tool():
+        v = st.session_state.get('nav_tool')
+        if v and v != "— none selected —":
+            st.session_state['active_view'] = ('tool', v)
+
     with st.sidebar:
         st.title("📚 Collection Dashboard")
         st.markdown("*Howard-Tilton Memorial Library*")
         st.markdown("---")
-        page = st.radio(
-            "Select a tool:",
+
+        st.radio(
+            "Workflows",
             ["🏠 Home",
-             "🗺️ Collection Profiler",
-             "📈 Use Analysis",
-             "🧾 ProQuest Extractor",
-             "🔍 Zero-Use Identifier",
-             "🧩 Overlap & Uniqueness"],
-            index=0,
-            key="nav"
+             "🅐 Workflow A — Print Snapshot",
+             "🅒 Workflow C — Ebook Snapshot",
+             "🅔 Workflow E — Renewal Review"],
+            key="nav_workflow",
+            on_change=_pick_workflow,
+            help="One-page walkthroughs that match the analysis guide. Each "
+                 "workflow orchestrates the underlying tools so you don't have "
+                 "to hop between them."
         )
+
+        st.markdown("---")
+        with st.expander("🛠️ Individual tools", expanded=False):
+            st.caption(
+                "Direct access to the underlying tools — for ad-hoc analysis "
+                "outside the guide's workflows, or for teaching/demos."
+            )
+            st.radio(
+                "Tool",
+                ["— none selected —",
+                 "🗺️ Collection Profiler",
+                 "📈 Use Analysis",
+                 "🧾 ProQuest Extractor",
+                 "🔍 Zero-Use Identifier",
+                 "🧩 Overlap & Uniqueness"],
+                key="nav_tool",
+                on_change=_pick_tool,
+                label_visibility="collapsed",
+            )
         st.markdown("---")
 
-    if page == "🏠 Home":
-        page_home()
-    elif page == "🗺️ Collection Profiler":
-        page_collection_profiler()
-    elif page == "📈 Use Analysis":
-        page_use_analysis()
-    elif page == "🧾 ProQuest Extractor":
-        page_proquest_extractor()
-    elif page == "🔍 Zero-Use Identifier":
-        page_zero_use_identifier()
-    elif page == "🧩 Overlap & Uniqueness":
-        page_overlap_analyzer()
+    # Route based on whichever radio was last touched
+    kind, page_name = st.session_state['active_view']
+    if kind == 'workflow':
+        if page_name == "🏠 Home":
+            page_home()
+        elif "Workflow A" in page_name:
+            page_workflow_a()
+        elif "Workflow C" in page_name:
+            page_workflow_c()
+        elif "Workflow E" in page_name:
+            page_workflow_e()
+    else:  # tool
+        if "Collection Profiler" in page_name:
+            page_collection_profiler()
+        elif "Use Analysis" in page_name:
+            page_use_analysis()
+        elif "ProQuest Extractor" in page_name:
+            page_proquest_extractor()
+        elif "Zero-Use Identifier" in page_name:
+            page_zero_use_identifier()
+        elif "Overlap & Uniqueness" in page_name:
+            page_overlap_analyzer()
 
     _footer()
 
