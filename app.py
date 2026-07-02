@@ -33,6 +33,14 @@ A unified Streamlit application bundling four collection decision-support tools:
      database as sole source, unique coverage, or redundant, using day-resolution
      interval math so date coverage (not just title name) drives the picture.
 
+v2.9 (slim) — Added ProQuest Report Extractor: a new tool page that reads
+       ProQuest's multi-database "Database Titles Usage Report" .xls exports,
+       lets the user pick database(s) and metric(s), maps each period file to
+       an output column (so calendar-halves can be summed into fiscal years),
+       and downloads a clean per-title CSV/XLSX ready to feed the Zero-Use
+       Identifier or Use Analysis non-COUNTER branch. Supports combining
+       sister databases (e.g., ABI/INFORM Global + Dateline + Trade & Industry)
+       into one file for subscription-level renewal reviews.
 v2.8 (slim) — Top-level year filter in Use Analysis + recent-vs-baseline compare
        mode that maps to Workflow A (recent FY vs three-year historical baseline).
        Year filter recomputes `_weight` from per-year usage columns, so downstream
@@ -1866,6 +1874,20 @@ INTERFACE_ALIASES = ['Interface Name', 'Interface', 'Provider Name', 'Provider',
 NORM_TITLE_ALIASES = ['Title (Normalized)', 'Normalized Title', 'Title Normalized',
                       'Title (normalized)']
 
+# Metric labels observed in ProQuest "Database Titles Usage Report" section headers.
+# Used to auto-detect the header rows that separate database sections in the
+# multi-DB .xls exports. Any column-1 value matching one of these signals a
+# section header row (which carries the metric column labels for that section).
+PROQUEST_METRIC_KEYWORDS = frozenset([
+    'BriefCitation', 'Citation', 'Citation/Abstract', 'Full Text', 'Full Text Scanned',
+    'Full Text  PDF', 'Full Text PDF', 'PDFLink', 'PDFPage', 'Page View',
+    'Preview - PDF', 'Figures and Tables', 'Video', 'Audio', 'Supplemental File',
+    'Presentation', 'Spreadsheet', 'Webpage', 'Zip File', 'BriefCitationAbstract',
+    'PatentFamily', 'Kwic', 'Dataset', 'FullSizeImage', 'Images', 'Total',
+    'Requests', 'Searches', 'Sessions', 'Turnaways', 'Result Clicks',
+    'Regular Searches', 'Federated Searches', 'Investigations', 'Unique Items',
+])
+
 
 def find_column(df_or_cols, aliases, partial=True):
     """Find a column matching any alias. Accepts a DataFrame or list of column names."""
@@ -3305,6 +3327,93 @@ def _extract_pubyear_series(series):
     # Belt-and-suspenders: filter implausible year values out of the final result
     result = result.where(result.between(1500, 2100))
     return result.astype('Int64')
+
+
+def _parse_proquest_usage_report(file_bytes, filename=""):
+    """Parse a ProQuest 'Database Titles Usage Report' .xls into per-DB sections.
+
+    ProQuest exports these reports as a single .xls with many database sections
+    stacked vertically: row 0 = time frame, row 1 = account info, then repeating
+    (section header row = DB name in col 0 + metric labels in cols 1..N, followed
+    by N title rows with numeric usage per metric). Metrics vary by DB but usually
+    include Total, Full Text, and platform-specific counters.
+
+    Returns:
+        dict with:
+          time_frame: str from the top row (e.g. "JAN-2026 to JUN-2026") or None
+          sections: list of {database, metrics: [str], titles: [{Title, <metric>...}]}
+          filename: passed-through for tracking
+
+    Never raises — returns an empty result on unparseable files.
+    """
+    result = {'time_frame': None, 'sections': [], 'filename': filename,
+              'error': None}
+    try:
+        df = pd.read_excel(BytesIO(file_bytes), engine='xlrd', header=None)
+    except Exception as e:
+        result['error'] = f"Could not read as .xls: {e}"
+        return result
+
+    # Time frame from first cell (best-effort)
+    if len(df) and isinstance(df.iloc[0, 0], str) and 'Time Frame' in df.iloc[0, 0]:
+        result['time_frame'] = df.iloc[0, 0].replace('Time Frame:', '').strip()
+
+    # Section header rows: col 1 holds a recognized metric-label keyword AND
+    # col 0 holds a non-empty string. Title rows have numeric col 1.
+    header_rows = []
+    for i in range(len(df)):
+        v1 = df.iloc[i, 1]
+        v0 = df.iloc[i, 0]
+        if (isinstance(v0, str) and v0.strip()
+                and isinstance(v1, str) and v1.strip() in PROQUEST_METRIC_KEYWORDS):
+            header_rows.append(i)
+
+    n_cols = len(df.columns)
+    for idx, h_row in enumerate(header_rows):
+        db_name = str(df.iloc[h_row, 0]).strip()
+
+        # Metric labels: cols 1 → first NaN
+        metric_labels = []
+        for col in range(1, n_cols):
+            v = df.iloc[h_row, col]
+            if pd.notna(v) and isinstance(v, str) and v.strip():
+                metric_labels.append((col, v.strip()))
+            else:
+                break
+
+        # Title rows: from h_row+1 up to next header row
+        next_h = header_rows[idx + 1] if idx + 1 < len(header_rows) else len(df)
+        titles = []
+        for r in range(h_row + 1, next_h):
+            title = df.iloc[r, 0]
+            if pd.isna(title):
+                continue
+            title = str(title).strip()
+            if not title:
+                continue
+            row_data = {'Title': title}
+            for col, metric in metric_labels:
+                v = df.iloc[r, col]
+                if pd.isna(v):
+                    row_data[metric] = 0
+                else:
+                    # Prefer int; fall back to float; strings stay strings
+                    try:
+                        row_data[metric] = int(v)
+                    except (TypeError, ValueError):
+                        try:
+                            row_data[metric] = float(v)
+                        except (TypeError, ValueError):
+                            row_data[metric] = v
+            titles.append(row_data)
+
+        result['sections'].append({
+            'database': db_name,
+            'metrics': [m for _, m in metric_labels],
+            'titles': titles,
+        })
+
+    return result
 
 
 def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
@@ -6248,7 +6357,291 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
     return holdings_df, carry_out, year_meta
 
 
-def page_zero_use_identifier():
+def page_proquest_extractor():
+    """ProQuest Report Extractor — convert multi-DB usage reports into per-DB files.
+
+    ProQuest's "Database Titles Usage Report" packs 200+ databases into one .xls
+    with a section per database. This tool lets a user upload one or more period
+    exports (e.g., calendar-half or fiscal-year files), pick the database(s) of
+    interest, and download a clean per-title file with one column per period —
+    ready to feed into the Zero-Use Identifier or Use Analysis (non-COUNTER
+    branch). Multiple files mapped to the same output column are summed so
+    calendar-half exports can be combined into fiscal-year totals.
+    """
+    st.header("🧾 ProQuest Report Extractor")
+    st.markdown(
+        "**Convert multi-database ProQuest usage reports into per-title files ready "
+        "for the rest of the pipeline.** Upload one or more period exports, pick a "
+        "database, and download a clean file — one row per title, one column per "
+        "period (or per fiscal year, if you group calendar-halves)."
+    )
+    with st.expander("ℹ️ When to use this tool"):
+        st.markdown(
+            "- You have ProQuest's **Database Titles Usage Report** (multi-DB `.xls`) "
+            "and need a per-database usage extract — one row per title, no section "
+            "headers, no other databases in the way.\n"
+            "- You want to **combine calendar-half exports into fiscal years** "
+            "(e.g., JUN-2024→DEC-2024 + JAN-2025→JUN-2025 → `Use FY2025`) so the "
+            "output plugs directly into Use Analysis compare mode (Workflow A) or "
+            "the Zero-Use Identifier's per-year synthesis.\n"
+            "- You want to **combine sister databases** (e.g., ABI/INFORM Global + "
+            "Dateline + Trade & Industry) into one usage file for a subscription-"
+            "level renewal review (Workflow E)."
+        )
+
+    if not XLS_AVAILABLE:
+        st.error(
+            "This tool needs the `xlrd` package to read legacy `.xls` files. "
+            "Install it (`pip install 'xlrd>=2.0.1'`) and restart the app. "
+            "Once installed, this tool becomes available with no other changes."
+        )
+        return
+
+    files = st.file_uploader(
+        "Upload one or more ProQuest DB Titles Usage Report .xls files:",
+        type=['xls'], accept_multiple_files=True, key='pq_upload',
+        help="Each file typically covers one period (e.g., calendar half or "
+             "fiscal year). Multiple files let you build multi-period comparisons."
+    )
+    if not files:
+        st.info("Upload files above to begin.")
+        return
+
+    # Parse each file — cache by filename so re-uploads don't re-parse
+    if 'pq_parsed' not in st.session_state:
+        st.session_state['pq_parsed'] = {}
+    parsed = st.session_state['pq_parsed']
+
+    with st.spinner(f"Parsing {len(files)} file(s)…"):
+        for f in files:
+            if f.name not in parsed:
+                f.seek(0)
+                parsed[f.name] = _parse_proquest_usage_report(f.read(), f.name)
+
+    # Drop any that were removed
+    active_names = {f.name for f in files}
+    for stale in [k for k in parsed if k not in active_names]:
+        del parsed[stale]
+
+    # Any parse failures?
+    failed = {n: p for n, p in parsed.items() if p.get('error')}
+    if failed:
+        for n, p in failed.items():
+            st.error(f"**{n}**: {p['error']}")
+
+    ok = {n: p for n, p in parsed.items() if not p.get('error') and p.get('sections')}
+    if not ok:
+        st.warning("No parseable files. Check that these are ProQuest DB Titles Usage Reports.")
+        return
+
+    # ---- Loaded periods summary ----
+    st.subheader("📋 Loaded periods")
+    period_summary = pd.DataFrame([
+        {'File': fn,
+         'Time frame': p['time_frame'] or '—',
+         'Databases': len(p['sections']),
+         'Total title-rows': sum(len(s['titles']) for s in p['sections'])}
+        for fn, p in ok.items()
+    ])
+    st.dataframe(period_summary, use_container_width=True, hide_index=True)
+
+    # ---- Collect all databases across all files ----
+    all_dbs_info = defaultdict(list)  # db → [(filename, section), ...]
+    for fn, p in ok.items():
+        for s in p['sections']:
+            all_dbs_info[s['database']].append((fn, s))
+
+    # ---- Database picker (multi-select for sister-DB combining) ----
+    st.subheader("🎯 Select database(s)")
+    st.caption(
+        "Pick one database, or multiple to combine (e.g., ABI/INFORM Global + "
+        "Dateline + Trade & Industry). When multiple are selected, their titles "
+        "are unioned; same title in more than one DB has its usage summed."
+    )
+
+    db_options = sorted(all_dbs_info.keys())
+    db_summary_map = {
+        db: sum(len(s['titles']) for _, s in secs)
+        for db, secs in all_dbs_info.items()
+    }
+    db_labels = {
+        db: f"{db}  —  {len(all_dbs_info[db])} period(s), "
+            f"{db_summary_map[db]:,} title-row(s)"
+        for db in db_options
+    }
+    chosen_dbs = st.multiselect(
+        "Database(s):", db_options,
+        format_func=lambda db: db_labels[db],
+        key='pq_chosen_dbs',
+    )
+    if not chosen_dbs:
+        st.info("Pick at least one database to continue.")
+        return
+
+    # ---- Metric selection ----
+    all_metrics = []
+    seen_m = set()
+    for db in chosen_dbs:
+        for _, sec in all_dbs_info[db]:
+            for m in sec['metrics']:
+                if m not in seen_m:
+                    seen_m.add(m)
+                    all_metrics.append(m)
+
+    st.subheader("📊 Metric selection")
+    st.caption(
+        "Metrics selected here are **summed together per title**. `Total` is the "
+        "aggregate ProQuest pre-computes; for a stricter measure of real use, "
+        "pick `Full Text` + `Full Text  PDF` (or the platform-specific request "
+        "counters)."
+    )
+    default_metric = ['Total'] if 'Total' in all_metrics else all_metrics[:1]
+    chosen_metrics = st.multiselect(
+        "Metrics to sum:", all_metrics, default=default_metric,
+        key='pq_metrics',
+    )
+    if not chosen_metrics:
+        st.warning("Select at least one metric.")
+        return
+
+    # ---- Period → output column mapping ----
+    st.subheader("📆 Period assignment")
+    st.caption(
+        "Assign each file to an output column. Multiple files mapped to the "
+        "**same column** are summed — this is how you build fiscal-year totals "
+        "from calendar-half exports. Use the Zero-Use convention (`Use FYyyyy`) "
+        "if you want the output to plug straight into Use Analysis compare mode."
+    )
+    period_to_col = {}
+    for fn, p in ok.items():
+        default_label = p['time_frame'] or fn
+        col_name = st.text_input(
+            f"**{fn}**  ({p['time_frame'] or 'unknown period'}):",
+            value=default_label, key=f"pq_col_{fn}"
+        ).strip() or default_label
+        period_to_col[fn] = col_name
+
+    # Column order = user's order, deduped
+    output_cols = list(dict.fromkeys(period_to_col.values()))
+
+    # ---- Extract & pivot ----
+    # Build long-format frame; sum chosen metrics per (title, target column).
+    # This is what handles both same-file dupes (rare) and multi-file → same col.
+    long_rows = []
+    for db in chosen_dbs:
+        for fn, sec in all_dbs_info[db]:
+            target_col = period_to_col[fn]
+            for tr in sec['titles']:
+                title = str(tr.get('Title', '')).strip()
+                if not title:
+                    continue
+                usage = 0
+                for m in chosen_metrics:
+                    v = tr.get(m, 0)
+                    if isinstance(v, (int, float)) and not pd.isna(v):
+                        usage += int(v)
+                long_rows.append({'Title': title, 'Column': target_col, 'Usage': usage})
+
+    if not long_rows:
+        st.warning("No title rows to extract — try selecting different databases or metrics.")
+        return
+
+    long_df = pd.DataFrame(long_rows)
+    long_df = long_df.groupby(['Title', 'Column'], as_index=False)['Usage'].sum()
+    wide = long_df.pivot(index='Title', columns='Column', values='Usage').fillna(0)
+    # Preserve user-specified column order; put any unexpected extras at the end
+    ordered = [c for c in output_cols if c in wide.columns] + \
+              [c for c in wide.columns if c not in output_cols]
+    wide = wide[ordered].astype(int).reset_index()
+
+    # Add a per-title total across periods
+    period_cols = [c for c in wide.columns if c != 'Title']
+    if len(period_cols) > 1:
+        wide['Total (all periods)'] = wide[period_cols].sum(axis=1)
+
+    # ---- Preview ----
+    st.subheader(f"👀 Preview")
+    db_label = chosen_dbs[0] if len(chosen_dbs) == 1 else f"{len(chosen_dbs)} databases combined"
+    st.markdown(f"**Database:** {db_label}  ·  "
+                f"**Titles:** {len(wide):,}  ·  "
+                f"**Periods (output columns):** {len(period_cols)}")
+
+    # KPIs across all periods
+    if period_cols:
+        total_all = int(wide[period_cols].sum().sum())
+        active = int((wide[period_cols].sum(axis=1) > 0).sum())
+        zero_use = len(wide) - active
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Titles", f"{len(wide):,}")
+        k2.metric("With any use", f"{active:,}")
+        k3.metric("Zero-use titles", f"{zero_use:,}")
+        k4.metric("Total usage", f"{total_all:,}")
+
+    # Sort by total (or first period if only one)
+    sort_col = 'Total (all periods)' if 'Total (all periods)' in wide.columns else period_cols[0]
+    wide_display = wide.sort_values(sort_col, ascending=False)
+    st.dataframe(wide_display.head(200), use_container_width=True, hide_index=True)
+    if len(wide) > 200:
+        st.caption(f"Preview shows top 200 of {len(wide):,} titles by {sort_col}. "
+                   "Download to get the full file.")
+
+    # ---- Download ----
+    st.subheader("📥 Download")
+    safe_name = re.sub(r'[^A-Za-z0-9_-]+', '_', chosen_dbs[0] if len(chosen_dbs) == 1
+                       else f"{len(chosen_dbs)}_databases")[:60].strip('_') or 'proquest_export'
+
+    csv_bytes = wide.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        "📥 Per-title CSV (long → wide, one column per period)",
+        csv_bytes,
+        f"proquest_{safe_name}.csv",
+        "text/csv",
+        key='pq_dl_csv',
+    )
+
+    # XLSX with metadata sheet
+    if XLSX_AVAILABLE:
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            wide.to_excel(writer, sheet_name='Usage', index=False)
+            meta = pd.DataFrame([
+                {'Setting': 'Databases selected', 'Value': ' + '.join(chosen_dbs)},
+                {'Setting': 'Metrics summed', 'Value': ' + '.join(chosen_metrics)},
+                {'Setting': 'Source files', 'Value': ' · '.join(ok.keys())},
+                {'Setting': 'Period → Column mapping',
+                 'Value': ' · '.join(f"{fn} → {col}" for fn, col in period_to_col.items())},
+                {'Setting': 'Titles', 'Value': f"{len(wide):,}"},
+                {'Setting': 'Total usage', 'Value': f"{total_all:,}"
+                    if period_cols else '—'},
+            ])
+            meta.to_excel(writer, sheet_name='Extraction settings', index=False)
+        st.download_button(
+            "📥 Per-title XLSX (with extraction-settings sheet)",
+            buf.getvalue(),
+            f"proquest_{safe_name}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key='pq_dl_xlsx',
+        )
+
+    # ---- Next-step guidance ----
+    st.markdown("---")
+    st.markdown("**Next steps**")
+    st.markdown(
+        "- **Feed into Use Analysis (non-COUNTER branch):** load the CSV in "
+        "Use Analysis → *Non-COUNTER usage* — the per-period columns auto-detect "
+        "as per-year usage if named `Use FYyyyy` / `Use yyyy`. Compare mode and "
+        "the top-level year filter then work as in Workflow A.\n"
+        "- **Reconcile with a full title list (Zero-Use):** if the vendor also "
+        "gives you a full title list, run holdings + this file through the "
+        "Zero-Use Identifier so unused titles land with an explicit 0 — see the "
+        "guide's Step-2-branch-A / vendor-report prerequisite.\n"
+        "- **Overlap check (Workflow E, Step 1):** for a renewal review, run "
+        "the Alma coverage export through Overlap & Uniqueness *first*; then "
+        "come back here for usage."
+    )
+
+
+
     """Tool 4: Zero-Use Identifier — compare a holdings list to a usage list."""
     st.header("🔍 Zero-Use Identifier")
     st.markdown(
@@ -7721,6 +8114,7 @@ def main():
             ["🏠 Home",
              "🗺️ Collection Profiler",
              "📈 Use Analysis",
+             "🧾 ProQuest Extractor",
              "🔍 Zero-Use Identifier",
              "🧩 Overlap & Uniqueness"],
             index=0,
@@ -7734,6 +8128,8 @@ def main():
         page_collection_profiler()
     elif page == "📈 Use Analysis":
         page_use_analysis()
+    elif page == "🧾 ProQuest Extractor":
+        page_proquest_extractor()
     elif page == "🔍 Zero-Use Identifier":
         page_zero_use_identifier()
     elif page == "🧩 Overlap & Uniqueness":
