@@ -33,6 +33,27 @@ A unified Streamlit application bundling four collection decision-support tools:
      database as sole source, unique coverage, or redundant, using day-resolution
      interval math so date coverage (not just title name) drives the picture.
 
+v2.13 (slim) — Workflow E T/L/R protection is now per-title instead of an
+       all-or-nothing subscription flag. Three modes in Setup: "not applicable"
+       (no protection), "whole subscription" (universal — for wall-to-wall
+       course-relevant discipline databases), or "specific titles" (the common
+       case). Specific-titles mode supports two paths: upload a T/L/R title
+       list (matched by normalized title, with unmatched titles reported), and
+       an interactive editable table in Step 4 showing only the protectable
+       candidates (unused sole-source and unique-coverage titles) with
+       tick-to-protect checkboxes pre-filled from the upload. Decision matrix
+       now checks each title's own T/L/R flag; brief exports (CSV + XLSX) list
+       the protected titles.
+v2.12 (slim) — Workflows A and C fully implemented (previously placeholders).
+       Workflow A: multi-year Alma upload + optional inline Zero-Use
+       reconciliation + year mapping (recent vs baseline) + snapshot KPIs +
+       yearly trends with LC-level shifts + weeding candidates + optional
+       ILL summary (Workflow B piece) + multi-sheet meeting brief export.
+       Workflow C: per-vendor ebook analysis with the guide's A/B/C data-type
+       branching, direct usage upload OR inline ProQuest extraction, optional
+       Zero-Use reconciliation against the vendor's title list, branch-
+       appropriate analysis (Coverage-vs-Use for A, usage triage for B/C),
+       and vendor-level ebook profile export.
 v2.11 (slim) — Workflow-first navigation. New "Workflows" section in the sidebar
        maps 1:1 to the analysis guide's Section 2 and 3: Workflow A (print
        snapshot), Workflow C (ebook snapshot), Workflow E (renewal review).
@@ -8276,38 +8297,48 @@ def _wfe_build_usage_map(usage_df):
     return usage_map, u_title_col, u_weight_col
 
 
-def _wfe_apply_decision_matrix(long_df, focus_db, tlr_relevant, low_use_threshold):
+def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
     """Apply the guide's Section 3 renew/negotiate/cancel matrix.
 
-    Guide rules (implemented per-title against the focus DB's placements):
-      - Sole source + used            → Renew
-      - Sole source + unused + T/L/R  → Renew (protected)
-      - Sole source + unused + !T/L/R → Cancel candidate (the exception)
-      - Unique coverage + used        → Renew (or negotiate for gap years)
-      - Unique coverage + unused + T/L/R → Renew (protected)
+    T/L/R relevance is per-title: `tlr_keys` is a set of normalized title keys
+    that the librarian has flagged as teaching/learning/research relevant. A
+    row is protected only if its own key is in the set — not because the
+    whole subscription is flagged. Pass an empty set for "no titles protected"
+    or the full title-key set for "everything protected."
+
+    Guide rules (applied per-title against the focus DB's placements):
+      - Sole source + used                → Renew
+      - Sole source + unused + T/L/R      → Renew (protected)
+      - Sole source + unused + !T/L/R     → Cancel candidate (the exception)
+      - Unique coverage + used            → Renew (or negotiate for gap years)
+      - Unique coverage + unused + T/L/R  → Renew (protected)
       - Unique coverage + unused + !T/L/R → Cancel candidate
-      - Redundant + high use          → Negotiate / restructure
-      - Redundant + low use           → Cancel candidate
+      - Redundant + high use              → Negotiate / restructure
+      - Redundant + low use               → Cancel candidate
     """
     sub = long_df[long_df["database"] == focus_db].copy()
     has_usage = "uses" in sub.columns
     if not has_usage:
         sub["uses"] = 0
+    # Compute each row's T/L/R flag from its own title
+    sub["_tlr_row"] = sub["title"].apply(
+        lambda t: normalize_text(t) in tlr_keys if pd.notna(t) else False)
 
     def _row_decision(r):
         status = r["status"]
         used = r["uses"] > 0
         heavy = r["uses"] >= low_use_threshold
+        tlr = bool(r["_tlr_row"])
         if status == "Sole source":
             if used:
                 return "Renew", "Sole source with recorded use — irreplaceable AND earning its keep."
-            if tlr_relevant:
+            if tlr:
                 return "Renew (protected)", "Sole source; unused but flagged as T/L/R relevant — protection outweighs low signal."
             return "Cancel candidate", "Sole source but unused and not T/L/R relevant — Workflow E exception applies."
         if status == "Unique coverage":
             if used:
                 return "Renew / Negotiate", "Unique coverage with use — renew, or negotiate for the gap years."
-            if tlr_relevant:
+            if tlr:
                 return "Renew (protected)", "Unique coverage; unused but T/L/R relevant."
             return "Cancel candidate", "Unique coverage but unused and not T/L/R relevant."
         # Redundant
@@ -8318,7 +8349,7 @@ def _wfe_apply_decision_matrix(long_df, focus_db, tlr_relevant, low_use_threshol
     decisions = sub.apply(_row_decision, axis=1)
     sub["Decision"] = decisions.apply(lambda x: x[0])
     sub["Reasoning"] = decisions.apply(lambda x: x[1])
-    return sub
+    return sub.drop(columns=["_tlr_row"])
 
 
 def page_workflow_e():
@@ -8372,20 +8403,40 @@ def page_workflow_e():
             "Renewal deadline:", value=None, key="wfe_deadline",
             help="Approximate is fine — this just anchors the review."
         )
-    tlr_relevant = st.checkbox(
-        "This subscription is T/L/R (teaching / learning / research) relevant",
-        key="wfe_tlr_flag",
-        help="Flip on when the data can't see the curricular alignment — "
-             "e.g. required for a course, cited in faculty grant work, or "
-             "core to a program. When on, unused sole-source and "
-             "unique-coverage titles are recommended for **renew (protected)** "
-             "rather than cancel, matching the guide's exception rule."
+    tlr_mode = st.radio(
+        "Teaching / Learning / Research (T/L/R) protection:",
+        ["Not applicable to this review",
+         "Whole subscription is T/L/R relevant",
+         "Specific titles are T/L/R relevant (pick in Step 4)"],
+        key="wfe_tlr_mode",
+        help="**Not applicable** — no titles are protected from cancellation "
+             "on T/L/R grounds; the decision matrix runs on uniqueness × "
+             "usage alone.  \n"
+             "**Whole subscription** — every unused sole-source or "
+             "unique-coverage title is protected. Use for specialized "
+             "discipline databases that are wall-to-wall course-relevant.  \n"
+             "**Specific titles** — the common case. Optionally upload a "
+             "T/L/R title list below (course readings, faculty citations); "
+             "you can also tick additional titles interactively in Step 4."
     )
     tlr_note = st.text_area(
         "T/L/R justification (optional, appears in the exported brief):",
-        key="wfe_tlr_note", placeholder="Faculty citations, course dependencies…",
+        key="wfe_tlr_note",
+        placeholder="Course dependencies, faculty citations, grant work…",
         height=68
     )
+    tlr_list_file = None
+    if tlr_mode.startswith("Specific"):
+        tlr_list_file = st.file_uploader(
+            "Optional: T/L/R title list (CSV, XLS, XLSX) — "
+            "titles matched by normalized title",
+            type=['csv', 'xls', 'xlsx'], key="wfe_tlr_list",
+            help="A one-column file of titles known to be T/L/R relevant "
+                 "(course reserves, syllabi, faculty citation lists). "
+                 "Titles that match the coverage export get pre-checked in "
+                 "Step 4; unmatched titles are reported so you can verify "
+                 "spelling or add them separately."
+        )
 
     st.markdown("---")
 
@@ -8628,7 +8679,118 @@ def page_workflow_e():
              "candidate."
     ) if has_usage else 5
 
-    decision_df = _wfe_apply_decision_matrix(long_df, focus_db, tlr_relevant, low_use_threshold)
+    # ---- Build the T/L/R key set based on setup mode ----
+    # Modes:
+    #   "Not applicable"       → empty set (no titles protected)
+    #   "Whole subscription"   → all title keys in the focus DB (universal protect)
+    #   "Specific titles"      → keys from upload ∪ keys ticked interactively
+    focus_placements = long_df[long_df["database"] == focus_db].copy()
+    focus_placements["_key"] = focus_placements["title"].apply(
+        lambda t: normalize_text(t) if pd.notna(t) else None)
+
+    tlr_keys = set()
+    tlr_upload_keys = set()
+    tlr_upload_summary = None
+    if tlr_list_file is not None and tlr_mode.startswith("Specific"):
+        try:
+            if tlr_list_file.name.lower().endswith(('.xls', '.xlsx')):
+                engine = 'xlrd' if tlr_list_file.name.lower().endswith('.xls') else 'openpyxl'
+                tlr_df_raw = pd.read_excel(BytesIO(tlr_list_file.getvalue()), engine=engine)
+            else:
+                tlr_df_raw = _load_csv_chunked(tlr_list_file.getvalue(), tlr_list_file.name)
+            t_col = find_column(tlr_df_raw, TITLE_ALIASES) or tlr_df_raw.columns[0]
+            for raw_t in tlr_df_raw[t_col].dropna():
+                k = normalize_text(raw_t)
+                if k:
+                    tlr_upload_keys.add(k)
+            matched = tlr_upload_keys & set(focus_placements["_key"].dropna())
+            unmatched = tlr_upload_keys - matched
+            tlr_upload_summary = (
+                f"Uploaded T/L/R list `{tlr_list_file.name}` "
+                f"(title column: `{t_col}`) — "
+                f"**{len(matched):,}** of {len(tlr_upload_keys):,} titles matched "
+                f"the focus database."
+            )
+            if unmatched:
+                with st.expander(
+                    f"⚠️ {len(unmatched):,} T/L/R titles not found in '{focus_db}'"
+                ):
+                    st.caption(
+                        "These titles didn't match anything in the coverage export. "
+                        "Check spelling, or add them separately via the interactive "
+                        "editor below."
+                    )
+                    st.dataframe(
+                        pd.DataFrame({'Unmatched T/L/R title': sorted(unmatched)}),
+                        use_container_width=True, hide_index=True
+                    )
+        except Exception as e:
+            st.warning(f"Couldn't parse T/L/R list: {e}")
+
+    if tlr_mode == "Whole subscription is T/L/R relevant":
+        tlr_keys = set(focus_placements["_key"].dropna())
+        st.info(f"**T/L/R protection: whole subscription** — all "
+                f"**{len(tlr_keys):,}** titles in '{focus_db}' are treated as "
+                f"T/L/R relevant.")
+    elif tlr_mode.startswith("Specific"):
+        # Show interactive editor over the titles that would benefit from
+        # T/L/R protection (unused sole-source + unique-coverage). Pre-check
+        # from the upload; librarian can add or remove.
+        protectable = focus_placements[
+            focus_placements["status"].isin(["Sole source", "Unique coverage"])
+        ].copy()
+        if has_usage:
+            protectable = protectable[protectable["uses"] == 0]
+        protectable = protectable.sort_values(["status", "title"]).reset_index(drop=True)
+
+        st.markdown("**Mark titles as T/L/R relevant**")
+        if tlr_upload_summary:
+            st.caption(tlr_upload_summary)
+        st.caption(
+            "Only unused sole-source and unique-coverage titles are shown — "
+            "those are the ones that would be cancel candidates without T/L/R "
+            "protection. Used titles are already renew-recommended and don't "
+            "need the flag. Tick a title to protect it from cancellation."
+        )
+        if len(protectable) == 0:
+            st.info("No unused sole-source or unique-coverage titles in the "
+                    "focus database. T/L/R protection has nothing to attach to.")
+        else:
+            editor_df = pd.DataFrame({
+                'T/L/R': protectable["_key"].apply(lambda k: k in tlr_upload_keys),
+                'Title': protectable["title"],
+                'Status': protectable["status"],
+                'Uses': protectable["uses"] if has_usage else 0,
+                'Unique coverage (years)': protectable["unique_ranges"],
+            })
+            edited = st.data_editor(
+                editor_df,
+                key="wfe_tlr_editor",
+                disabled=["Title", "Status", "Uses", "Unique coverage (years)"],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    'T/L/R': st.column_config.CheckboxColumn(
+                        "T/L/R relevant?", help="Tick to protect from cancellation."),
+                    'Uses': st.column_config.NumberColumn(format="%d"),
+                },
+                height=min(600, 40 + 35 * len(protectable)),
+            )
+            # Extract ticked keys
+            ticked_titles = edited[edited['T/L/R']]['Title'].tolist()
+            tlr_keys = set(normalize_text(t) for t in ticked_titles if pd.notna(t))
+            n_ticked = len(tlr_keys)
+            n_from_upload = len(tlr_keys & tlr_upload_keys)
+            n_added = n_ticked - n_from_upload
+            st.caption(
+                f"**T/L/R protection:** {n_ticked:,} title(s) selected "
+                f"({n_from_upload:,} from upload, {n_added:,} added interactively)."
+            )
+    else:
+        st.info("**T/L/R protection: none** — the decision matrix runs on "
+                "uniqueness × usage alone.")
+
+    decision_df = _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold)
 
     # Summary counts
     dcounts = decision_df["Decision"].value_counts()
@@ -8702,11 +8864,19 @@ def page_workflow_e():
     st.subheader("📥 Export renewal review brief")
 
     # Build a small brief header + the decision table
+    # Human-readable T/L/R summary for the brief
+    if tlr_mode == "Not applicable to this review":
+        tlr_summary = "Not applicable"
+    elif tlr_mode == "Whole subscription is T/L/R relevant":
+        tlr_summary = f"Whole subscription — {len(tlr_keys):,} titles protected"
+    else:
+        tlr_summary = f"Per-title — {len(tlr_keys):,} title(s) flagged"
+
     brief_header = pd.DataFrame([
         {'Field': 'Vendor / package', 'Value': vendor_name or focus_db},
         {'Field': 'Focus database (from coverage)', 'Value': focus_db},
         {'Field': 'Renewal deadline', 'Value': str(deadline) if deadline else '—'},
-        {'Field': 'T/L/R relevant?', 'Value': 'Yes' if tlr_relevant else 'No'},
+        {'Field': 'T/L/R protection mode', 'Value': tlr_summary},
         {'Field': 'T/L/R justification', 'Value': tlr_note or '—'},
         {'Field': 'Coverage file', 'Value': coverage_file.name},
         {'Field': 'Usage source', 'Value': usage_source_desc or '(none — uniqueness only)'},
@@ -8718,11 +8888,21 @@ def page_workflow_e():
         {'Field': 'Recommend CANCEL', 'Value': f"{_cancel_total:,}"},
     ])
 
+    # Build the T/L/R-protected titles list for the brief
+    tlr_titles_list = []
+    if tlr_keys:
+        tlr_titles_list = sorted(
+            focus_placements[focus_placements["_key"].isin(tlr_keys)]["title"].unique()
+        )
+
     csv_buf = BytesIO()
     csv_buf.write(b"# Workflow E Renewal Review Brief\n")
     csv_buf.write(f"# Generated: {pd.Timestamp.now()}\n\n".encode('utf-8'))
     csv_buf.write(b"# ---- Setup ----\n")
     brief_header.to_csv(csv_buf, index=False)
+    if tlr_titles_list:
+        csv_buf.write(b"\n# ---- T/L/R protected titles ----\n")
+        pd.DataFrame({'T/L/R protected title': tlr_titles_list}).to_csv(csv_buf, index=False)
     csv_buf.write(b"\n# ---- Per-title decisions ----\n")
     dcsv = decision_df.rename(columns={
         "title": "Title", "status": "Uniqueness", "uses": "Uses",
@@ -8748,6 +8928,9 @@ def page_workflow_e():
             brief_header.to_excel(writer, sheet_name='Setup', index=False)
             dcsv.to_excel(writer, sheet_name='Decisions', index=False)
             crosstab.to_excel(writer, sheet_name='Summary')
+            if tlr_titles_list:
+                pd.DataFrame({'T/L/R protected title': tlr_titles_list}).to_excel(
+                    writer, sheet_name='T_L_R titles', index=False)
         st.download_button(
             "📥 Renewal review brief (XLSX, multi-sheet)",
             xbuf.getvalue(),
@@ -8757,38 +8940,905 @@ def page_workflow_e():
         )
 
 
+def _wfa_infer_recent_and_baseline(all_years):
+    """Given detected years, pick sensible defaults for recent FY + baseline.
+
+    Recent FY = most recent year present. Baseline = up to three years
+    preceding it. Handles both fiscal and calendar year naming — the caller
+    just gets integers back.
+    """
+    if not all_years:
+        return None, []
+    sorted_years = sorted(all_years)
+    recent = sorted_years[-1]
+    baseline = [y for y in sorted_years if y != recent][-3:]
+    return recent, baseline
+
+
+def _wfa_lc_shift_table(df, peryear_map, recent_year, baseline_years,
+                        weight_col_label):
+    """Compute per-LC-range recent-vs-baseline delta table.
+
+    Extracted from the inline block in `_render_peryear_trends` so Workflow A
+    can render the same shifts table without pulling in the full trends view.
+    Returns a DataFrame sorted by |Δ| descending (biggest movers first).
+    """
+    if '_lc_range' not in df.columns:
+        return pd.DataFrame()
+    recent_col = next((c for c, y in peryear_map.items() if y == recent_year), None)
+    baseline_cols = [c for c, y in peryear_map.items() if y in baseline_years]
+    if not (recent_col and baseline_cols):
+        return pd.DataFrame()
+    work = df[['_lc_range'] + [recent_col] + baseline_cols].copy()
+    work = work[work['_lc_range'].notna()
+                & (work['_lc_range'].astype(str).str.len() > 0)]
+    if work.empty:
+        return pd.DataFrame()
+    work[recent_col] = pd.to_numeric(work[recent_col], errors='coerce').fillna(0)
+    for bc in baseline_cols:
+        work[bc] = pd.to_numeric(work[bc], errors='coerce').fillna(0)
+    bl_sums = {bc: work.groupby('_lc_range')[bc].sum() for bc in baseline_cols}
+    bl_df = pd.DataFrame(bl_sums)
+    grouped = pd.DataFrame({
+        f'Recent ({recent_year})': work.groupby('_lc_range')[recent_col].sum(),
+        f'Baseline avg ({len(baseline_cols)}y)': bl_df.mean(axis=1),
+    })
+    grouped['Δ'] = (grouped[f'Recent ({recent_year})']
+                    - grouped[f'Baseline avg ({len(baseline_cols)}y)'])
+    _denom = grouped[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, pd.NA)
+    grouped['Δ %'] = (grouped['Δ'] / _denom * 100).astype(float)
+    grouped['|Δ|'] = grouped['Δ'].abs()
+    return (grouped.sort_values('|Δ|', ascending=False)
+            .reset_index()
+            .rename(columns={'_lc_range': 'LC range'}))
+
+
 def page_workflow_a():
-    """Workflow A — Annual Print Snapshot (placeholder, not yet built)."""
+    """Workflow A — Annual Print Collection Snapshot as a single-page walkthrough.
+
+    Steps: setup → multi-year Alma upload → year mapping → snapshot summary →
+    yearly trends (recent vs baseline) → LC-level shifts → weeding candidates →
+    optional ILL upload (Workflow B) → meeting brief export.
+
+    Reuses per-year detection, weight recomputation, and the trends renderer
+    from Use Analysis so results match what the standalone tool produces.
+    """
     st.header("🅐 Workflow A — Annual Print Collection Snapshot")
-    st.info(
-        "**Coming next.** This page will orchestrate the July print-snapshot "
-        "workflow described in Section 2 of the Print & Electronic Resource "
-        "Analysis Guide:\n\n"
-        "1. Upload the multi-year Alma export (recent FY + 3 prior FYs)\n"
-        "2. Run Zero-Use reconciliation inline\n"
-        "3. Run Coverage-vs-Use with the compare-mode toggle (recent vs baseline)\n"
-        "4. Export the liaison meeting brief\n\n"
-        "For now, do these steps individually via the tools under **Individual "
-        "tools** in the sidebar — Zero-Use Identifier, then Use Analysis with "
-        "compare mode on."
+    st.markdown(
+        "**Everything for the July liaison meeting on one page.** Multi-year "
+        "print snapshot with recent FY vs three-year baseline comparison, "
+        "LC-level shifts, weeding candidates, and — if you upload it — the "
+        "ILL list from Workflow B."
     )
+    with st.expander("ℹ️ How this workflow works", expanded=False):
+        st.markdown(
+            "This page walks through Workflow A as described in Section 2 of "
+            "the Print & Electronic Resource Analysis Guide:\n\n"
+            "1. **Setup** — fiscal year context and meeting info.\n"
+            "2. **Prepare** — upload one multi-year Alma export with per-year "
+            "circulation. Zero-Use reconciliation runs inline if you supply "
+            "the holdings file.\n"
+            "3. **Profile & Compare** — snapshot KPIs, year-over-year trends "
+            "(color-coded recent vs baseline), and LC-level shifts.\n"
+            "4. **Weeding candidates** — titles with no use across all four years.\n"
+            "5. **ILL context (Workflow B)** — optional 12-month ILL upload to "
+            "share at the same meeting.\n"
+            "6. **Brief export** — meeting-ready package."
+        )
+
+    st.markdown("---")
+
+    # =============================================================
+    # 1. SETUP
+    # =============================================================
+    st.subheader("1️⃣ Setup")
+    from datetime import date, timedelta
+    today = date.today()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        # Recent FY defaults to the FY that just ended (assuming July fiscal year)
+        default_fy = today.year if today.month >= 7 else today.year
+        recent_fy_input = st.number_input(
+            "Recent FY (previous fiscal year):",
+            min_value=2000, max_value=today.year + 1,
+            value=default_fy, step=1, key="wfa_recent_fy"
+        )
+    with c2:
+        meeting_date = st.date_input(
+            "July meeting date:",
+            value=date(today.year, 7, 15) if today.month <= 7 else today + timedelta(days=14),
+            key="wfa_meeting_date"
+        )
+    with c3:
+        liaison_group = st.text_input(
+            "Liaison / subject group:", key="wfa_liaison",
+            placeholder="e.g., Humanities, STEM, Social Sciences…"
+        )
+
+    st.markdown("---")
+
+    # =============================================================
+    # 2. UPLOAD
+    # =============================================================
+    st.subheader("2️⃣ Multi-year Alma export")
+    st.caption(
+        "Upload one Alma title export covering the recent FY plus the three "
+        "prior FYs, with per-year usage columns (`Use FY2023`, `Use FY2024`, "
+        "etc.). If the file hasn't been through the Zero-Use Identifier yet, "
+        "attach the holdings file below and reconciliation runs inline."
+    )
+
+    up_col1, up_col2 = st.columns(2)
+    with up_col1:
+        usage_file = st.file_uploader(
+            "Alma title export (with per-year usage) — required",
+            type=['csv', 'xls', 'xlsx'], key="wfa_usage_file"
+        )
+    with up_col2:
+        holdings_file = st.file_uploader(
+            "Holdings file (optional — for inline Zero-Use)",
+            type=['csv', 'xls', 'xlsx'], key="wfa_holdings_file",
+            help="If your usage file already includes 0-use rows (post-"
+                 "reconciliation), leave this blank. Otherwise, uploading "
+                 "holdings enables inline Zero-Use reconciliation."
+        )
+
+    if not usage_file:
+        st.info("Upload the multi-year Alma export to continue.")
+        return
+
+    try:
+        if usage_file.name.lower().endswith(('.xls', '.xlsx')):
+            engine = 'xlrd' if usage_file.name.lower().endswith('.xls') else 'openpyxl'
+            df = pd.read_excel(BytesIO(usage_file.getvalue()), engine=engine)
+        else:
+            df = _load_csv_chunked(usage_file.getvalue(), usage_file.name)
+    except Exception as e:
+        st.error(f"❌ Couldn't read the file: {e}")
+        return
+
+    st.success(f"✅ Loaded {len(df):,} title rows.")
+
+    # Detect per-year usage columns
+    peryear_map = _detect_per_year_usage_columns(df)
+    if not peryear_map:
+        st.error(
+            "❌ No per-year usage columns detected. Workflow A requires columns "
+            "like `Use FY2023`, `Use FY2024`, etc. — produced by the Zero-Use "
+            "Identifier. If you have a single 'Total Uses' column, use "
+            "Use Analysis under Individual tools instead."
+        )
+        return
+
+    # Optional inline Zero-Use reconciliation
+    if holdings_file:
+        try:
+            if holdings_file.name.lower().endswith(('.xls', '.xlsx')):
+                engine = ('xlrd' if holdings_file.name.lower().endswith('.xls')
+                          else 'openpyxl')
+                holdings_df = pd.read_excel(BytesIO(holdings_file.getvalue()),
+                                            engine=engine)
+            else:
+                holdings_df = _load_csv_chunked(holdings_file.getvalue(),
+                                                holdings_file.name)
+            # Simple reconciliation: any holding-only title gets 0 in every year
+            h_title = find_column(holdings_df, TITLE_ALIASES)
+            u_title = find_column(df, TITLE_ALIASES)
+            if h_title and u_title:
+                usage_keys = set(df[u_title].apply(
+                    lambda t: normalize_text(t) if pd.notna(t) else None
+                ).dropna())
+                holdings_df['_key'] = holdings_df[h_title].apply(
+                    lambda t: normalize_text(t) if pd.notna(t) else None)
+                missing = holdings_df[~holdings_df['_key'].isin(usage_keys)
+                                       & holdings_df['_key'].notna()]
+                if len(missing):
+                    zero_rows = missing[[h_title]].rename(
+                        columns={h_title: u_title}).copy()
+                    for col in peryear_map:
+                        zero_rows[col] = 0
+                    # Carry any subject/LC columns
+                    for extra in ['_lc_main', '_lc_range']:
+                        if extra in df.columns:
+                            zero_rows[extra] = None
+                    df = pd.concat([df, zero_rows], ignore_index=True)
+                    st.success(
+                        f"✅ Zero-Use reconciliation added **{len(missing):,}** "
+                        f"holding-only titles with 0 use across all years. "
+                        f"Total titles now: {len(df):,}."
+                    )
+                else:
+                    st.info("Every holding in the holdings file is present in "
+                            "the usage file — no reconciliation needed.")
+        except Exception as e:
+            st.warning(f"Couldn't reconcile with holdings: {e}")
+
+    # =============================================================
+    # 3. YEAR MAPPING
+    # =============================================================
+    st.markdown("---")
+    st.subheader("3️⃣ Year mapping")
+    st.caption(
+        "Detected per-year usage columns are listed below. Confirm which "
+        "represents the recent FY and which form the baseline. Defaults are "
+        "recent = most-recent detected year, baseline = three preceding years."
+    )
+
+    all_years = sorted(set(peryear_map.values()))
+    st.caption(f"**Detected years:** {', '.join(str(y) for y in all_years)}")
+
+    default_recent, default_baseline = _wfa_infer_recent_and_baseline(all_years)
+    yc1, yc2 = st.columns(2)
+    with yc1:
+        recent_year = st.selectbox(
+            "Recent FY:",
+            all_years,
+            index=all_years.index(default_recent) if default_recent in all_years else len(all_years) - 1,
+            key="wfa_year_recent"
+        )
+    with yc2:
+        baseline_years = st.multiselect(
+            "Baseline years:",
+            [y for y in all_years if y != recent_year],
+            default=[y for y in default_baseline if y != recent_year],
+            key="wfa_year_baseline",
+            help="Workflow A: the three fiscal years before the recent FY."
+        )
+
+    if not baseline_years:
+        st.warning("Pick at least one baseline year.")
+        return
+
+    # Recompute _weight from recent FY (drives the KPIs and any downstream views)
+    df_recent = _recompute_weight_from_years(df, peryear_map, [recent_year], aggregate="sum")
+    df_baseline = _recompute_weight_from_years(df, peryear_map, baseline_years, aggregate="mean")
+
+    # Ensure _lc_range exists for LC-shift table
+    lc_col = find_column(df, LC_ALIASES)
+    if lc_col and '_lc_range' not in df.columns:
+        df['_lc_range'] = df[lc_col].astype(str).apply(
+            lambda x: x.split('.')[0] if pd.notna(x) and x != 'nan' else None)
+
+    # =============================================================
+    # 4. SNAPSHOT SUMMARY
+    # =============================================================
+    st.markdown("---")
+    st.subheader("4️⃣ Snapshot summary")
+
+    recent_col = next((c for c, y in peryear_map.items() if y == recent_year), None)
+    baseline_cols = [c for c, y in peryear_map.items() if y in baseline_years]
+
+    n_titles = len(df)
+    recent_total = int(pd.to_numeric(df[recent_col], errors='coerce').fillna(0).sum())
+    baseline_totals = [int(pd.to_numeric(df[bc], errors='coerce').fillna(0).sum())
+                       for bc in baseline_cols]
+    baseline_avg = int(sum(baseline_totals) / len(baseline_totals)) if baseline_totals else 0
+    delta = recent_total - baseline_avg
+    delta_pct = (delta / baseline_avg * 100) if baseline_avg else 0
+
+    active_recent = int((pd.to_numeric(df[recent_col], errors='coerce').fillna(0) > 0).sum())
+    active_any_baseline = int((df[baseline_cols].apply(pd.to_numeric, errors='coerce')
+                               .fillna(0).sum(axis=1) > 0).sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Titles in file", f"{n_titles:,}")
+    k2.metric(f"Recent FY ({recent_year}) uses", f"{recent_total:,}")
+    k3.metric(f"Baseline avg ({len(baseline_cols)}y)",
+              f"{baseline_avg:,}" if baseline_avg else "—")
+    k4.metric("Δ vs baseline", f"{delta_pct:+.1f}%" if baseline_avg else "—",
+              delta=f"{delta:+,}")
+
+    a1, a2 = st.columns(2)
+    a1.metric(f"Active titles in {recent_year}",
+              f"{active_recent:,}",
+              help=f"Titles with ≥1 checkout in FY{recent_year}.")
+    a2.metric(f"Active titles across baseline",
+              f"{active_any_baseline:,}",
+              help=f"Titles with ≥1 checkout in any of the {len(baseline_cols)} baseline years.")
+
+    if baseline_avg > 0:
+        if delta_pct < -15:
+            st.warning(
+                f"📉 **Downward trend**: recent FY usage is {abs(delta_pct):.0f}% "
+                f"below the baseline average. Look for structural shifts — "
+                f"discipline decline, format migration, or curriculum changes."
+            )
+        elif delta_pct > 15:
+            st.success(
+                f"📈 **Upward trend**: recent FY usage is {delta_pct:.0f}% above "
+                f"the baseline average. Consider whether recent acquisitions "
+                f"or curriculum changes are driving demand."
+            )
+        else:
+            st.info(
+                f"➖ **Stable**: recent FY usage is within ±15% of baseline. "
+                f"The comparison chart below and LC-level shifts will show "
+                f"internal reshuffles even when the top line is flat."
+            )
+
+    # =============================================================
+    # 5. YEARLY TRENDS + LC SHIFTS
+    # =============================================================
+    st.markdown("---")
+    st.subheader("5️⃣ Yearly trends & LC-level shifts")
+    st.caption(
+        "Color-coded bars show recent vs baseline; the trend line traces the "
+        "full arc; delta bars call out the year-over-year direction."
+    )
+
+    _render_peryear_trends(
+        df, peryear_map, "Uses", "",
+        selected_years=all_years,
+        recent_year=recent_year,
+        baseline_years=baseline_years,
+        key_prefix="wfa"
+    )
+
+    # =============================================================
+    # 6. WEEDING CANDIDATES
+    # =============================================================
+    st.markdown("---")
+    st.subheader("6️⃣ Weeding candidates")
+    st.caption(
+        "Titles with **zero use across all four years** are the strongest "
+        "weeding signal. The list below sorts them so you can filter by LC "
+        "class and export for liaison follow-up."
+    )
+
+    all_year_cols = [c for c, y in peryear_map.items()
+                     if y == recent_year or y in baseline_years]
+    total_per_row = df[all_year_cols].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+    weeding = df[total_per_row == 0].copy()
+    weeding['Total uses (all periods)'] = 0
+    n_weeding = len(weeding)
+
+    st.metric(
+        f"Zero-use titles (all {len(all_year_cols)} periods)",
+        f"{n_weeding:,}",
+        delta=f"{n_weeding/n_titles*100:.1f}% of holdings" if n_titles else None,
+        delta_color='off'
+    )
+
+    if n_weeding > 0:
+        title_col_w = find_column(weeding, TITLE_ALIASES) or weeding.columns[0]
+        display_cols = [c for c in [title_col_w, lc_col, '_lc_range'] if c and c in weeding.columns]
+        weeding_display = weeding[display_cols].rename(columns={title_col_w: 'Title'})
+        st.dataframe(weeding_display.head(200), use_container_width=True, hide_index=True)
+        if n_weeding > 200:
+            st.caption(f"Preview shows first 200 of {n_weeding:,} titles. "
+                       "Full list is in the meeting brief download.")
+
+    # =============================================================
+    # 7. OPTIONAL: ILL CONTEXT (Workflow B)
+    # =============================================================
+    st.markdown("---")
+    st.subheader("7️⃣ ILL context (Workflow B, optional)")
+    st.caption(
+        "Upload the 12-month ILL summary to share at the same meeting. "
+        "This is Workflow B — the analyst shares this alongside the print "
+        "snapshot; liaisons identify purchase candidates."
+    )
+    ill_file = st.file_uploader(
+        "12-month ILL summary (CSV/XLS/XLSX, optional)",
+        type=['csv', 'xls', 'xlsx'], key="wfa_ill_file"
+    )
+    ill_df = None
+    if ill_file:
+        try:
+            if ill_file.name.lower().endswith(('.xls', '.xlsx')):
+                engine = 'xlrd' if ill_file.name.lower().endswith('.xls') else 'openpyxl'
+                ill_df = pd.read_excel(BytesIO(ill_file.getvalue()), engine=engine)
+            else:
+                ill_df = _load_csv_chunked(ill_file.getvalue(), ill_file.name)
+            st.success(f"✅ Loaded {len(ill_df):,} ILL rows.")
+            st.dataframe(ill_df.head(50), use_container_width=True, hide_index=True)
+            if len(ill_df) > 50:
+                st.caption(f"Preview shows first 50 of {len(ill_df):,} rows.")
+        except Exception as e:
+            st.warning(f"Couldn't read ILL file: {e}")
+
+    # =============================================================
+    # 8. EXPORT MEETING BRIEF
+    # =============================================================
+    st.markdown("---")
+    st.subheader("📥 Export meeting brief")
+
+    setup_meta = pd.DataFrame([
+        {'Field': 'Fiscal year (recent)', 'Value': f"FY{recent_year}"},
+        {'Field': 'Baseline years', 'Value': ', '.join(f"FY{y}" for y in baseline_years)},
+        {'Field': 'Meeting date', 'Value': str(meeting_date)},
+        {'Field': 'Liaison / subject group', 'Value': liaison_group or '—'},
+        {'Field': 'Snapshot file', 'Value': usage_file.name},
+        {'Field': 'Holdings file', 'Value': holdings_file.name if holdings_file else '(not used)'},
+        {'Field': 'ILL file', 'Value': ill_file.name if ill_file else '(not attached)'},
+        {'Field': 'Titles in analysis', 'Value': f"{n_titles:,}"},
+        {'Field': f'Recent FY ({recent_year}) total uses', 'Value': f"{recent_total:,}"},
+        {'Field': f'Baseline average uses', 'Value': f"{baseline_avg:,}"},
+        {'Field': 'Δ vs baseline', 'Value': f"{delta:+,} ({delta_pct:+.1f}%)" if baseline_avg else "—"},
+        {'Field': f'Active in recent FY', 'Value': f"{active_recent:,}"},
+        {'Field': f'Active across baseline', 'Value': f"{active_any_baseline:,}"},
+        {'Field': f'Zero-use titles (all periods)', 'Value': f"{n_weeding:,}"},
+    ])
+
+    # LC shift table for the brief
+    lc_shifts = _wfa_lc_shift_table(df, peryear_map, recent_year, baseline_years, "Uses")
+
+    if XLSX_AVAILABLE:
+        xbuf = BytesIO()
+        with pd.ExcelWriter(xbuf, engine='openpyxl') as writer:
+            setup_meta.to_excel(writer, sheet_name='Setup', index=False)
+            # Yearly totals
+            year_totals = pd.DataFrame([
+                {'Year': recent_year, 'Total uses': recent_total, 'Period': 'Recent'},
+            ] + [
+                {'Year': y, 'Total uses': int(pd.to_numeric(df[c], errors='coerce').fillna(0).sum()),
+                 'Period': 'Baseline'}
+                for y, c in [(y, next(k for k, yy in peryear_map.items() if yy == y))
+                             for y in baseline_years]
+            ])
+            year_totals.to_excel(writer, sheet_name='Yearly totals', index=False)
+            if not lc_shifts.empty:
+                lc_shifts[['LC range', f'Recent ({recent_year})',
+                           f'Baseline avg ({len(baseline_cols)}y)', 'Δ', 'Δ %'
+                           ]].to_excel(writer, sheet_name='LC shifts', index=False)
+            if n_weeding > 0:
+                weeding_display.to_excel(writer, sheet_name='Weeding candidates', index=False)
+            if ill_df is not None:
+                ill_df.to_excel(writer, sheet_name='ILL summary', index=False)
+        st.download_button(
+            "📥 July meeting brief (XLSX, multi-sheet)",
+            xbuf.getvalue(),
+            f"july_meeting_brief_FY{recent_year}_"
+            f"{re.sub(r'[^\\w-]+', '_', liaison_group or 'all')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="wfa_dl_brief"
+        )
+    else:
+        st.info("XLSX export needs `openpyxl`. Falling back to CSV.")
+        csv_buf = BytesIO()
+        csv_buf.write("# Workflow A — July meeting brief\n".encode('utf-8'))
+        csv_buf.write(f"# Generated: {pd.Timestamp.now()}\n\n".encode('utf-8'))
+        setup_meta.to_csv(csv_buf, index=False)
+        st.download_button(
+            "📥 July meeting brief (CSV)",
+            csv_buf.getvalue(),
+            f"july_meeting_brief_FY{recent_year}.csv",
+            "text/csv",
+            key="wfa_dl_brief_csv"
+        )
 
 
 def page_workflow_c():
-    """Workflow C — Annual Ebook Snapshot (placeholder, not yet built)."""
+    """Workflow C — Annual Ebook Collection Snapshot (per major vendor).
+
+    One vendor at a time. Steps: setup → data-type classification (A/B/C
+    branch from the guide) → usage upload (with optional inline ProQuest
+    extraction) → optional Zero-Use reconciliation → branch-appropriate
+    analysis → vendor-level ebook usage profile export for the July meeting.
+
+    Because ebook data varies more by vendor than print data does, the
+    workflow is scoped to one vendor per run and produces a portable
+    vendor-level profile; batch multiple runs to build the full ebook
+    picture for the July meeting.
+    """
     st.header("🅒 Workflow C — Annual Ebook Collection Snapshot")
-    st.info(
-        "**Coming next.** This page will orchestrate the July ebook-snapshot "
-        "workflow described in Section 2 of the Print & Electronic Resource "
-        "Analysis Guide:\n\n"
-        "1. Per major ebook vendor, upload the ERM-acquired usage data\n"
-        "2. Classify by data type (COUNTER, non-COUNTER, non-COUNTER + subjects)\n"
-        "3. Run Zero-Use reconciliation against the vendor's full title list\n"
-        "4. Run Use Analysis on the appropriate branch (A/B/C)\n"
-        "5. Export vendor-level ebook usage profiles for the July meeting\n\n"
-        "For now, do these steps individually via the tools under **Individual "
-        "tools** in the sidebar — ProQuest Extractor (if applicable), "
-        "Zero-Use Identifier, then Use Analysis."
+    st.markdown(
+        "**Per-vendor ebook analysis for the July meeting.** Set up the "
+        "vendor, classify by data type (branch A / B / C — same taxonomy as "
+        "Workflow E), attach usage (with optional inline ProQuest extraction), "
+        "and export a vendor-level ebook usage profile."
+    )
+    with st.expander("ℹ️ How this workflow works", expanded=False):
+        st.markdown(
+            "This page walks through Workflow C as described in Section 2 of "
+            "the Print & Electronic Resource Analysis Guide:\n\n"
+            "1. **Setup** — vendor name and fiscal year context.\n"
+            "2. **Classify by data type** — the same A/B/C taxonomy as "
+            "Workflow E: (A) non-COUNTER with subject metadata → full "
+            "Coverage-vs-Use, (B) non-COUNTER without subjects → usage triage, "
+            "(C) COUNTER only → COUNTER triage. Pick the branch based on "
+            "what the vendor provides.\n"
+            "3. **Prepare & profile** — upload the vendor's usage file "
+            "(optional: extract inline from a ProQuest DB Titles Usage "
+            "Report). Optional Zero-Use reconciliation against the full "
+            "title list. Then run branch-appropriate analysis.\n"
+            "4. **Act** — the exported profile feeds firm ebook purchases "
+            "(Wishlist F), package restructuring (Workflow E), or migration "
+            "decisions.\n\n"
+            "Run this workflow once per major ebook vendor for the July "
+            "meeting."
+        )
+
+    st.markdown("---")
+
+    # =============================================================
+    # 1. SETUP
+    # =============================================================
+    st.subheader("1️⃣ Setup")
+    from datetime import date, timedelta
+    today = date.today()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        vendor_name = st.text_input(
+            "Vendor / package name:", key="wfc_vendor",
+            placeholder="e.g., ProQuest Ebook Central, EBSCO eBook Academic…"
+        )
+    with c2:
+        default_fy = today.year if today.month >= 7 else today.year
+        fy_input = st.number_input(
+            "Fiscal year covered:",
+            min_value=2000, max_value=today.year + 1,
+            value=default_fy, step=1, key="wfc_fy"
+        )
+
+    st.markdown("---")
+
+    # =============================================================
+    # 2. CLASSIFY BY DATA TYPE
+    # =============================================================
+    st.subheader("2️⃣ Data-type classification")
+    st.caption(
+        "Pick the branch matching what the vendor provides. This drives which "
+        "analytical views the workflow runs — same taxonomy as Workflow E "
+        "Step 2."
+    )
+
+    branch = st.radio(
+        "Vendor data type:",
+        [
+            "A — non-COUNTER with subject metadata → full Coverage-vs-Use",
+            "B — non-COUNTER without subject metadata → usage triage",
+            "C — COUNTER only → COUNTER-style triage",
+        ],
+        key="wfc_branch",
+        help="If unsure, check the vendor's admin portal or ask ERM. Most "
+             "major ebook platforms offer at least COUNTER TR_B1; some also "
+             "provide subject metadata in their admin exports."
+    )
+    branch_letter = branch[0]
+
+    st.markdown("---")
+
+    # =============================================================
+    # 3. UPLOAD USAGE
+    # =============================================================
+    st.subheader("3️⃣ Usage data")
+
+    usage_source = st.radio(
+        "Usage source:",
+        ["Upload usage file directly",
+         "Extract from ProQuest DB Titles Usage Report"],
+        key="wfc_usage_source", horizontal=False
+    )
+
+    usage_df = None
+    usage_source_desc = None
+
+    if usage_source == "Upload usage file directly":
+        st.caption(
+            "Any title-level usage file. For branch A, include subject "
+            "metadata; for branch C, upload the COUNTER TR_B1 (title report "
+            "for books) or IR (item report)."
+        )
+        usage_file = st.file_uploader(
+            "Vendor usage file (CSV, XLS, XLSX)",
+            type=['csv', 'xls', 'xlsx'], key="wfc_usage_upload"
+        )
+        if usage_file:
+            try:
+                if usage_file.name.lower().endswith(('.xls', '.xlsx')):
+                    engine = 'xlrd' if usage_file.name.lower().endswith('.xls') else 'openpyxl'
+                    usage_df = pd.read_excel(BytesIO(usage_file.getvalue()), engine=engine)
+                else:
+                    usage_df = _load_csv_chunked(usage_file.getvalue(), usage_file.name)
+                usage_source_desc = usage_file.name
+                st.success(f"✅ Loaded {len(usage_df):,} rows.")
+            except Exception as e:
+                st.error(f"❌ Couldn't read the file: {e}")
+
+    else:  # ProQuest extraction path
+        if not XLS_AVAILABLE:
+            st.error("Reading ProQuest .xls needs the `xlrd` package.")
+        else:
+            st.caption(
+                "Upload one or more ProQuest DB Titles Usage Reports. The "
+                "tool extracts titles from sections matching your vendor "
+                "name and combines periods."
+            )
+            pq_files = st.file_uploader(
+                "ProQuest DB Titles Usage Report .xls file(s):",
+                type=['xls'], accept_multiple_files=True, key="wfc_pq_files"
+            )
+            if pq_files:
+                extracted_rows = []
+                matched_sections = 0
+                per_file_periods = {}
+                for pqf in pq_files:
+                    pqf.seek(0)
+                    parsed = _parse_proquest_usage_report(pqf.read(), pqf.name)
+                    if parsed.get('error'):
+                        st.warning(f"{pqf.name}: {parsed['error']}")
+                        continue
+                    per_file_periods[pqf.name] = parsed.get('time_frame') or 'unknown'
+                    for sec in parsed['sections']:
+                        if not vendor_name:
+                            continue
+                        if (vendor_name.lower() in sec['database'].lower()
+                                or sec['database'].lower() in vendor_name.lower()):
+                            matched_sections += 1
+                            for tr in sec['titles']:
+                                title = str(tr.get('Title', '')).strip()
+                                if not title:
+                                    continue
+                                extracted_rows.append({
+                                    'Title': title,
+                                    'Total': int(tr.get('Total', 0) or 0),
+                                    'Full Text': int(tr.get('Full Text', 0) or 0),
+                                    'Full Text PDF': int(tr.get('Full Text  PDF', 0) or 0),
+                                    'Period': parsed.get('time_frame') or pqf.name,
+                                })
+                if extracted_rows:
+                    raw = pd.DataFrame(extracted_rows)
+                    # Aggregate: sum usage per title across periods
+                    usage_df = raw.groupby('Title', as_index=False).agg(
+                        Uses=('Total', 'sum'),
+                        FullText=('Full Text', 'sum'),
+                        FullTextPDF=('Full Text PDF', 'sum'),
+                    )
+                    usage_source_desc = (
+                        f"ProQuest Extract — {len(pq_files)} file(s), "
+                        f"{matched_sections} section(s) matching '{vendor_name}'"
+                    )
+                    st.success(
+                        f"✅ Extracted {len(usage_df):,} unique titles from "
+                        f"{matched_sections} matching section(s)."
+                    )
+                elif vendor_name:
+                    st.warning(
+                        f"No sections matching '{vendor_name}' in the files. "
+                        f"Check the vendor name against the ProQuest section labels."
+                    )
+                else:
+                    st.info("Enter a vendor name above to enable ProQuest matching.")
+
+    if usage_df is None or usage_df.empty:
+        st.info("Attach usage data above to continue.")
+        return
+
+    # =============================================================
+    # 4. OPTIONAL ZERO-USE RECONCILIATION
+    # =============================================================
+    st.markdown("---")
+    st.subheader("4️⃣ Zero-use reconciliation (optional)")
+    st.caption(
+        "Vendor usage reports typically list only used titles. Attach the "
+        "vendor's full title list so unused titles land with an explicit 0 "
+        "in the profile (matches the guide's usage-step prerequisite)."
+    )
+    titlelist_file = st.file_uploader(
+        "Full title list from vendor (CSV, XLS, XLSX)",
+        type=['csv', 'xls', 'xlsx'], key="wfc_titlelist"
+    )
+
+    n_reconciled = 0
+    if titlelist_file:
+        try:
+            if titlelist_file.name.lower().endswith(('.xls', '.xlsx')):
+                engine = ('xlrd' if titlelist_file.name.lower().endswith('.xls')
+                          else 'openpyxl')
+                titlelist_df = pd.read_excel(BytesIO(titlelist_file.getvalue()), engine=engine)
+            else:
+                titlelist_df = _load_csv_chunked(titlelist_file.getvalue(),
+                                                 titlelist_file.name)
+            tl_title = find_column(titlelist_df, TITLE_ALIASES)
+            u_title = find_column(usage_df, TITLE_ALIASES) or usage_df.columns[0]
+            if tl_title:
+                usage_keys = set(usage_df[u_title].apply(
+                    lambda t: normalize_text(t) if pd.notna(t) else None
+                ).dropna())
+                titlelist_df['_k'] = titlelist_df[tl_title].apply(
+                    lambda t: normalize_text(t) if pd.notna(t) else None)
+                missing = titlelist_df[~titlelist_df['_k'].isin(usage_keys)
+                                        & titlelist_df['_k'].notna()]
+                n_reconciled = len(missing)
+                if n_reconciled:
+                    zero_rows = pd.DataFrame({u_title: missing[tl_title].values})
+                    # Zero out every numeric column in usage_df
+                    for col in usage_df.select_dtypes(include='number').columns:
+                        zero_rows[col] = 0
+                    usage_df = pd.concat([usage_df, zero_rows], ignore_index=True)
+                    st.success(
+                        f"✅ Added **{n_reconciled:,}** unused titles from the "
+                        f"vendor title list. Total titles now: {len(usage_df):,}."
+                    )
+                else:
+                    st.info("Every title in the vendor list is present in the "
+                            "usage file — no reconciliation needed.")
+            else:
+                st.warning("Couldn't detect a title column in the vendor title list.")
+        except Exception as e:
+            st.warning(f"Couldn't reconcile title list: {e}")
+
+    # =============================================================
+    # 5. BRANCH-APPROPRIATE ANALYSIS
+    # =============================================================
+    st.markdown("---")
+    st.subheader(f"5️⃣ Analysis — Branch {branch_letter}")
+
+    u_title_col = find_column(usage_df, TITLE_ALIASES) or usage_df.columns[0]
+    u_weight_col = find_column(usage_df, WEIGHT_ALIASES)
+    if not u_weight_col:
+        # Look for any numeric column that likely represents uses
+        for c in usage_df.columns:
+            if pd.api.types.is_numeric_dtype(usage_df[c]) and c != u_title_col:
+                u_weight_col = c
+                break
+
+    if not u_weight_col:
+        st.error(
+            "❌ Couldn't detect a usage column. Use the Use Analysis tool "
+            "(Individual tools dropdown) if the columns need manual overrides."
+        )
+        return
+
+    usage_df[u_weight_col] = pd.to_numeric(usage_df[u_weight_col], errors='coerce').fillna(0)
+    n_titles = len(usage_df)
+    total_uses = int(usage_df[u_weight_col].sum())
+    used_titles = int((usage_df[u_weight_col] > 0).sum())
+    unused_titles = n_titles - used_titles
+    avg_use = total_uses / used_titles if used_titles else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Titles", f"{n_titles:,}")
+    k2.metric("Used titles", f"{used_titles:,}",
+              delta=f"{used_titles/n_titles*100:.1f}%" if n_titles else None,
+              delta_color='off')
+    k3.metric("Unused titles", f"{unused_titles:,}",
+              delta=f"{unused_titles/n_titles*100:.1f}%" if n_titles else None,
+              delta_color='off')
+    k4.metric("Total uses", f"{total_uses:,}",
+              help=f"Average per used title: {avg_use:.1f}")
+
+    subj_col = find_column(usage_df, SUBJECT_ALIASES)
+    lc_col_c = find_column(usage_df, LC_ALIASES)
+
+    # ---- Branch A: full Coverage-vs-Use ----
+    if branch_letter == 'A':
+        if not subj_col and not lc_col_c:
+            st.warning(
+                "⚠️ Branch A needs subject metadata (LC or LCSH) but none was "
+                "detected in the usage file. Fall back to Branch B (usage "
+                "triage) or use the Use Analysis tool for column overrides."
+            )
+        else:
+            st.info(
+                f"**Branch A — subject-rich analysis** using "
+                f"{'LC' if lc_col_c else 'Subject Terms'} for Coverage-vs-Use."
+            )
+            # Simple subject/LC distribution
+            display_col = lc_col_c or subj_col
+            if display_col:
+                grouped = usage_df.groupby(display_col).agg(
+                    Titles=(u_title_col, 'count'),
+                    Uses=(u_weight_col, 'sum'),
+                ).reset_index()
+                grouped['Coverage %'] = (grouped['Titles'] / n_titles * 100).round(1)
+                grouped['Use %'] = (grouped['Uses'] / max(1, total_uses) * 100).round(1)
+                grouped['Cov-Use Δ'] = (grouped['Coverage %'] - grouped['Use %']).round(1)
+                grouped = grouped.sort_values('Uses', ascending=False)
+                st.markdown(f"**Coverage vs Use by `{display_col}`**")
+                st.dataframe(grouped.head(30), use_container_width=True, hide_index=True)
+                st.caption(
+                    "Coverage % = share of titles in this group. Use % = share "
+                    "of usage from this group. Positive Δ means we own more "
+                    "than we use (potential over-investment); negative Δ means "
+                    "usage exceeds coverage (potential under-investment)."
+                )
+
+    # ---- Branch B & C: usage triage ----
+    else:
+        st.info(
+            f"**Branch {branch_letter} — usage triage.** No subject data to "
+            f"organize by, so the analysis focuses on top titles and the "
+            f"long tail."
+        )
+
+    # Top-used titles (all branches)
+    st.markdown("**Top titles by use**")
+    top = usage_df.sort_values(u_weight_col, ascending=False).head(30)
+    show_cols = [u_title_col, u_weight_col]
+    if subj_col and subj_col in top.columns:
+        show_cols.append(subj_col)
+    if lc_col_c and lc_col_c in top.columns:
+        show_cols.append(lc_col_c)
+    st.dataframe(top[show_cols], use_container_width=True, hide_index=True)
+
+    # Usage distribution histogram
+    st.markdown("**Usage distribution**")
+    used_slice = usage_df[usage_df[u_weight_col] > 0][u_weight_col]
+    if len(used_slice) > 0:
+        import plotly.express as px
+        fig = px.histogram(used_slice, nbins=30,
+                           title=f"Distribution of uses per title (used titles only, n={len(used_slice):,})")
+        fig.update_layout(showlegend=False, xaxis_title="Uses", yaxis_title="Titles")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # =============================================================
+    # 6. EXPORT VENDOR PROFILE
+    # =============================================================
+    st.markdown("---")
+    st.subheader("📥 Export vendor profile")
+
+    setup_meta = pd.DataFrame([
+        {'Field': 'Vendor', 'Value': vendor_name or '—'},
+        {'Field': 'Fiscal year', 'Value': f"FY{fy_input}"},
+        {'Field': 'Data type (branch)', 'Value': branch},
+        {'Field': 'Usage source', 'Value': usage_source_desc or '(none)'},
+        {'Field': 'Zero-use reconciliation',
+         'Value': f"+{n_reconciled:,} unused titles" if n_reconciled else '(not run)'},
+        {'Field': 'Titles', 'Value': f"{n_titles:,}"},
+        {'Field': 'Used titles', 'Value': f"{used_titles:,}"},
+        {'Field': 'Unused titles', 'Value': f"{unused_titles:,}"},
+        {'Field': 'Total uses', 'Value': f"{total_uses:,}"},
+        {'Field': 'Avg use per used title', 'Value': f"{avg_use:.1f}"},
+    ])
+
+    safe_vendor = re.sub(r'[^\w-]+', '_', vendor_name or 'vendor')[:60].strip('_') or 'vendor'
+
+    if XLSX_AVAILABLE:
+        xbuf = BytesIO()
+        with pd.ExcelWriter(xbuf, engine='openpyxl') as writer:
+            setup_meta.to_excel(writer, sheet_name='Setup', index=False)
+            top.to_excel(writer, sheet_name='Top titles', index=False)
+            usage_df.sort_values(u_weight_col, ascending=False).to_excel(
+                writer, sheet_name='All titles', index=False)
+            if branch_letter == 'A' and (lc_col_c or subj_col):
+                display_col = lc_col_c or subj_col
+                grouped = usage_df.groupby(display_col).agg(
+                    Titles=(u_title_col, 'count'),
+                    Uses=(u_weight_col, 'sum'),
+                ).reset_index().sort_values('Uses', ascending=False)
+                grouped.to_excel(writer, sheet_name='Coverage vs Use', index=False)
+            # Weeding candidates (zero use)
+            weeding = usage_df[usage_df[u_weight_col] == 0]
+            if len(weeding):
+                weeding.to_excel(writer, sheet_name='Weeding candidates', index=False)
+        st.download_button(
+            "📥 Vendor ebook profile (XLSX, multi-sheet)",
+            xbuf.getvalue(),
+            f"ebook_profile_{safe_vendor}_FY{fy_input}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="wfc_dl_brief"
+        )
+    else:
+        csv_buf = BytesIO()
+        csv_buf.write("# Workflow C — Vendor ebook profile\n".encode('utf-8'))
+        csv_buf.write(f"# Generated: {pd.Timestamp.now()}\n\n".encode('utf-8'))
+        setup_meta.to_csv(csv_buf, index=False)
+        csv_buf.write(b"\n# ---- All titles ----\n")
+        usage_df.sort_values(u_weight_col, ascending=False).to_csv(csv_buf, index=False)
+        st.download_button(
+            "📥 Vendor ebook profile (CSV)",
+            csv_buf.getvalue(),
+            f"ebook_profile_{safe_vendor}_FY{fy_input}.csv",
+            "text/csv",
+            key="wfc_dl_brief_csv"
+        )
+
+    # Next-step guidance
+    st.markdown("---")
+    st.markdown("**Next steps**")
+    st.markdown(
+        f"- **Firm ebook purchases** — top-used titles that could support "
+        f"new firm-order requests. Route to the Wishlist (Workflow F).\n"
+        f"- **Package restructuring** — for large weeding candidate lists, "
+        f"take the vendor to the Renewal Review (Workflow E) with an "
+        f"exchange-list ask (drop the tail, keep the top).\n"
+        f"- **Migration signal** — heavy ebook use in a subject where you "
+        f"also hold print (see Workflow A's LC shifts) is a print-to-electronic "
+        f"conversion prompt."
     )
 
 
@@ -8823,8 +9873,8 @@ def page_home():
             three-year baseline compared in-tool. Drives weeding, approval-plan
             edits, and print/electronic migration decisions through the year.</p>
             <hr>
-            <p><strong>Status:</strong> Placeholder — use Zero-Use → Use Analysis
-            (compare mode) directly for now.</p>
+            <p><strong>Status:</strong> Ready. Includes optional Workflow B
+            (ILL) attachment.</p>
         </div>
         """, unsafe_allow_html=True)
     with wc2:
@@ -8837,8 +9887,8 @@ def page_home():
             taxonomy as renewals. Informs firm purchases, package restructuring,
             and migration decisions.</p>
             <hr>
-            <p><strong>Status:</strong> Placeholder — use ProQuest Extractor →
-            Zero-Use → Use Analysis directly for now.</p>
+            <p><strong>Status:</strong> Ready. Run once per vendor for the
+            July meeting.</p>
         </div>
         """, unsafe_allow_html=True)
     with wc3:
