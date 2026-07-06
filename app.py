@@ -9847,7 +9847,7 @@ def page_workflow_c():
 # =====================================================================
 
 def page_home():
-    st.title("📚 Library Collection Dashboard")
+    st.title("📚 Collection Analysis Dashboard")
     st.markdown(
         "A decision-support suite for collection assessment, subscription management, "
         "and acquisition prioritization at Howard-Tilton Memorial Library."
@@ -10056,8 +10056,8 @@ def main():
             st.session_state['active_view'] = ('tool', v)
 
     with st.sidebar:
-        st.title("📚 Collection Dashboard")
-        st.markdown("*Howard-Tilton Memorial Library*")
+        st.title("📚 Collection Analysis Dashboard")
+        st.markdown("*Howard-Tilton Memorial Library | General Collection*")
         st.markdown("---")
 
         st.radio(
