@@ -1,5 +1,5 @@
 """
-Library Collection Dashboard (slim edition)
+Collection Analysis Dashboard
 ===========================================
 A unified Streamlit application bundling four collection decision-support tools:
 
