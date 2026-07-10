@@ -33,6 +33,21 @@ A unified Streamlit application bundling four collection decision-support tools:
      database as sole source, unique coverage, or redundant, using day-resolution
      interval math so date coverage (not just title name) drives the picture.
 
+v2.18 (slim) — Workflow E decision-matrix updates:
+       (1) "Renew" is now "Renew or find equivalent subscription" — reminder to
+           check whether the same content is available cheaper elsewhere before
+           auto-renewing.
+       (2) "Renew / Negotiate" is now "Renew/Negotiate or get quote for unique
+           coverage from vendor we already use" — a specific next-step option
+           for unique-coverage titles worth exploring before committing to
+           renewal.
+       (3) New threshold rule: sole-source or unique-coverage titles with fewer
+           than 2.5 years of unique loss become Cancel candidates. Rationale:
+           thin unique coverage doesn't justify the subscription cost, even
+           when used. T/L/R protection still overrides — a flagged title stays
+           protected regardless of thin coverage.
+       Reasoning fields now include the exact unique-year count so the
+           threshold decision is auditable in the exported brief.
 v2.17 (slim) — Coverage-range formatting is now consistent within each
        interval: both endpoints use the finer of the two precisions needed.
        Whole years compress to "2013–2020"; month-boundary intervals show as
@@ -8472,15 +8487,24 @@ def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
     whole subscription is flagged. Pass an empty set for "no titles protected"
     or the full title-key set for "everything protected."
 
-    Guide rules (applied per-title against the focus DB's placements):
-      - Sole source + used                → Renew
-      - Sole source + unused + T/L/R      → Renew (protected)
-      - Sole source + unused + !T/L/R     → Cancel candidate (the exception)
-      - Unique coverage + used            → Renew (or negotiate for gap years)
-      - Unique coverage + unused + T/L/R  → Renew (protected)
-      - Unique coverage + unused + !T/L/R → Cancel candidate
-      - Redundant + high use              → Negotiate / restructure
-      - Redundant + low use               → Cancel candidate
+    Rule order (per-title against the focus DB's placements):
+      1. T/L/R flag protects sole-source and unique-coverage titles — always
+         wins (whether used or unused, whether coverage is thin or thick).
+         The librarian's explicit institutional signal beats the automated
+         rules.
+      2. Below-threshold rule: if unique-loss coverage is < 2.5 years, the
+         title falls to Cancel candidate even when sole-source or used.
+         Rationale: a fraction of a subscription's worth of unique material
+         doesn't justify the subscription cost.
+      3. Otherwise, follow the standard matrix:
+         - Sole source + used            → Renew or find equivalent subscription
+         - Sole source + unused          → Cancel candidate
+         - Unique coverage + used        → Renew/Negotiate or get quote
+                                            for unique coverage from vendor
+                                            we already use
+         - Unique coverage + unused      → Cancel candidate
+         - Redundant + high use          → Negotiate / restructure
+         - Redundant + low use           → Cancel candidate
     """
     sub = long_df[long_df["database"] == focus_db].copy()
     has_usage = "uses" in sub.columns
@@ -8490,27 +8514,60 @@ def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
     sub["_tlr_row"] = sub["title"].apply(
         lambda t: normalize_text(t) in tlr_keys if pd.notna(t) else False)
 
+    MIN_UNIQUE_YEARS = 2.5
+
     def _row_decision(r):
         status = r["status"]
         used = r["uses"] > 0
         heavy = r["uses"] >= low_use_threshold
         tlr = bool(r["_tlr_row"])
+        unique_yrs = r["unique_years"]
+
         if status == "Sole source":
-            if used:
-                return "Renew", "Sole source with recorded use — irreplaceable AND earning its keep."
             if tlr:
-                return "Renew (protected)", "Sole source; unused but flagged as T/L/R relevant — protection outweighs low signal."
-            return "Cancel candidate", "Sole source but unused and not T/L/R relevant — Workflow E exception applies."
+                use_note = "with use, " if used else "unused, "
+                return ("Renew (protected)",
+                        f"Sole source ({use_note}{unique_yrs} yrs) — "
+                        "flagged as T/L/R relevant; protection outweighs other signals.")
+            if unique_yrs < MIN_UNIQUE_YEARS:
+                return ("Cancel candidate",
+                        f"Sole source but only {unique_yrs} yrs of unique coverage "
+                        f"(threshold {MIN_UNIQUE_YEARS} yrs) — not enough material "
+                        "to justify the subscription for this title.")
+            if used:
+                return ("Renew or find equivalent subscription",
+                        f"Sole source with recorded use ({unique_yrs} yrs unique) — "
+                        "irreplaceable AND earning its keep, but check whether an "
+                        "equivalent subscription exists at a lower cost.")
+            return ("Cancel candidate",
+                    "Sole source but unused and not T/L/R relevant — "
+                    "Workflow E exception applies.")
+
         if status == "Unique coverage":
-            if used:
-                return "Renew / Negotiate", "Unique coverage with use — renew, or negotiate for the gap years."
             if tlr:
-                return "Renew (protected)", "Unique coverage; unused but T/L/R relevant."
-            return "Cancel candidate", "Unique coverage but unused and not T/L/R relevant."
+                use_note = "with use, " if used else "unused, "
+                return ("Renew (protected)",
+                        f"Unique coverage ({use_note}{unique_yrs} yrs) — "
+                        "flagged as T/L/R relevant; protection outweighs other signals.")
+            if unique_yrs < MIN_UNIQUE_YEARS:
+                return ("Cancel candidate",
+                        f"Unique coverage but only {unique_yrs} yrs "
+                        f"(threshold {MIN_UNIQUE_YEARS} yrs) — not enough to "
+                        "justify the subscription for this title.")
+            if used:
+                return ("Renew/Negotiate or get quote for unique coverage from vendor we already use",
+                        f"Unique coverage with use ({unique_yrs} yrs unique) — "
+                        "renew, negotiate for the gap years, or ask an existing "
+                        "vendor for a quote to cover the unique span.")
+            return ("Cancel candidate",
+                    "Unique coverage but unused and not T/L/R relevant.")
+
         # Redundant
         if heavy:
-            return "Negotiate / restructure", "Fully covered elsewhere but used — worth negotiating."
-        return "Cancel candidate", "Redundant coverage with low/no use — the cleanest cut."
+            return ("Negotiate / restructure",
+                    "Fully covered elsewhere but used — worth negotiating.")
+        return ("Cancel candidate",
+                "Redundant coverage with low/no use — the cleanest cut.")
 
     decisions = sub.apply(_row_decision, axis=1)
     sub["Decision"] = decisions.apply(lambda x: x[0])
@@ -9036,8 +9093,9 @@ def page_workflow_e():
 
     # Summary counts
     dcounts = decision_df["Decision"].value_counts()
-    _renew_total = int(dcounts.get("Renew", 0) + dcounts.get("Renew (protected)", 0)
-                       + dcounts.get("Renew / Negotiate", 0))
+    _renew_total = int(dcounts.get("Renew or find equivalent subscription", 0)
+                       + dcounts.get("Renew (protected)", 0)
+                       + dcounts.get("Renew/Negotiate or get quote for unique coverage from vendor we already use", 0))
     _negot_total = int(dcounts.get("Negotiate / restructure", 0))
     _cancel_total = int(dcounts.get("Cancel candidate", 0))
 
