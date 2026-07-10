@@ -33,6 +33,52 @@ A unified Streamlit application bundling four collection decision-support tools:
      database as sole source, unique coverage, or redundant, using day-resolution
      interval math so date coverage (not just title name) drives the picture.
 
+v2.17 (slim) — Coverage-range formatting is now consistent within each
+       interval: both endpoints use the finer of the two precisions needed.
+       Whole years compress to "2013–2020"; month-boundary intervals show as
+       "Aug 2013–Oct 2020"; anything with day precision uses ISO
+       "YYYY-MM-DD–YYYY-MM-DD" so the values are unambiguous and math-friendly
+       (sortable, easy to copy into a date-difference calc). Fixes the
+       display quirk where "Jan 2, 1997 – Jan 1997" looked self-
+       contradicting (it was internally correct but rendered at mixed
+       precisions).
+v2.16 (slim) — Fixed a coverage-parser bug that was overreporting loss for
+       any bounded subscription with volume/issue metadata between the from-
+       date and the until-date. Alma writes coverage as
+         "Available from 2013-08-01 volume: 1 issue: 1 until 2020-10-31 volume: 8"
+       The old regex required "until" to sit right after the from-date and so
+       missed the "until" clause, treating the coverage as ongoing and extending
+       loss to today. Now the parser tolerates arbitrary text (except semicolons,
+       which separate clauses) between the from-date and the until-date.
+       Verified on the electronic-journal-coverage export — every previously
+       broken Category A / C case now reports its true bounded loss.
+v2.15 (slim) — Workflow E: added a "Cap ongoing coverage at" date input.
+       Alma coverage often stays flagged as ongoing after a vendor has actually
+       stopped providing a title — so extending ongoing coverage all the way
+       to today overstates the loss. The new date input lets the analyst cap
+       ongoing claims at a date they can vouch for (typically end of last
+       verified subscription period). Default is today. Also added a per-title
+       safety cap in _ovl_classify: unique loss for any subscription is
+       capped at the max end date observed across all subscriptions for that
+       title, so the tool never claims to lose coverage for dates no
+       subscription in the file ever held. Both settings are recorded in the
+       exported renewal brief for audit.
+v2.14 (slim) — Four fixes based on renewal-brief feedback:
+       (1) Coverage-loss display now shows month/day resolution instead of
+       rounding to whole years — an ongoing subscription ending today reads as
+       "2013–Jul 8, 2026" rather than "2013–2026", so partial-year loss doesn't
+       overstate the picture. Added an explicit "loss as of [today]" caption in
+       Workflow E.
+       (2) Workflow E gained a "Databases already cancelled" multiselect that
+       excludes phantom-active subscriptions from the redundancy math — titles
+       previously masked as "redundant" (because a cancelled DB also held them
+       in Alma's records) get correctly reclassified as sole source / unique
+       coverage.
+       (3) Coverage math already worked at day resolution internally; the format
+       function now surfaces that precision.
+       (4) Renamed "ProQuest Extractor" → "Multi-Database Usage Extractor" and
+       generalized language throughout so the same tool covers ProQuest, EBSCO,
+       Gale, and other vendors that ship stacked multi-database `.xls` reports.
 v2.13 (slim) — Workflow E T/L/R protection is now per-title instead of an
        all-or-nothing subscription flag. Three modes in Setup: "not applicable"
        (no protection), "whole subscription" (universal — for wall-to-wall
@@ -60,7 +106,7 @@ v2.11 (slim) — Workflow-first navigation. New "Workflows" section in the sideb
        Individual tools moved into a collapsible dropdown for ad-hoc use.
        Workflow E is fully implemented as a one-page walkthrough: setup,
        uniqueness classification (reuses overlap logic), usage triage (with
-       optional inline ProQuest extraction), and a decision matrix that applies
+       optional inline multi-database extraction), and a decision matrix that applies
        the guide's Section 3 rules to produce renew / negotiate / cancel-
        candidate counts and a downloadable brief. Workflows A and C are
        placeholders (page structure + guidance to the individual tools) —
@@ -6398,28 +6444,33 @@ def _match_holdings_to_usage(holdings_df, usage_df, holdings_keys, usage_keys,
 
 
 def page_proquest_extractor():
-    """ProQuest Report Extractor — convert multi-DB usage reports into per-DB files.
+    """Multi-Database Usage Extractor — convert stacked per-DB reports to per-DB files.
 
-    ProQuest's "Database Titles Usage Report" packs 200+ databases into one .xls
-    with a section per database. This tool lets a user upload one or more period
-    exports (e.g., calendar-half or fiscal-year files), pick the database(s) of
-    interest, and download a clean per-title file with one column per period —
-    ready to feed into the Zero-Use Identifier or Use Analysis (non-COUNTER
-    branch). Multiple files mapped to the same output column are summed so
-    calendar-half exports can be combined into fiscal-year totals.
+    Vendors like ProQuest, EBSCO, Gale, and others export "database titles usage"
+    reports as a single stacked file with a section per database (header row +
+    title rows). This tool detects those sections, lets a user upload one or more
+    period exports, pick the database(s) of interest, and download a clean per-
+    title file with one column per period — ready to feed into Zero-Use, Use
+    Analysis, or the Workflow E page.
+
+    Multiple files mapped to the same output column are summed so calendar-half
+    exports can be combined into fiscal-year totals. Header detection uses a
+    library of common vendor metric labels; extending PROQUEST_METRIC_KEYWORDS
+    covers new vendors as they come up.
     """
-    st.header("🧾 ProQuest Report Extractor")
+    st.header("🧾 Multi-Database Usage Extractor")
     st.markdown(
-        "**Convert multi-database ProQuest usage reports into per-title files ready "
-        "for the rest of the pipeline.** Upload one or more period exports, pick a "
-        "database, and download a clean file — one row per title, one column per "
-        "period (or per fiscal year, if you group calendar-halves)."
+        "**Convert stacked multi-database usage reports into per-title files ready "
+        "for the rest of the pipeline.** Works with ProQuest, EBSCO, and other "
+        "vendors that pack many databases into one file with a section per database. "
+        "Upload one or more period exports, pick a database, and download a clean "
+        "file — one row per title, one column per period."
     )
     with st.expander("ℹ️ When to use this tool"):
         st.markdown(
-            "- You have ProQuest's **Database Titles Usage Report** (multi-DB `.xls`) "
-            "and need a per-database usage extract — one row per title, no section "
-            "headers, no other databases in the way.\n"
+            "- You have a **multi-database titles usage report** (typically `.xls`) "
+            "from a platform vendor and need a per-database extract — one row per "
+            "title, no section headers, no other databases in the way.\n"
             "- You want to **combine calendar-half exports into fiscal years** "
             "(e.g., JUN-2024→DEC-2024 + JAN-2025→JUN-2025 → `Use FY2025`) so the "
             "output plugs directly into Use Analysis compare mode (Workflow A) or "
@@ -6427,6 +6478,13 @@ def page_proquest_extractor():
             "- You want to **combine sister databases** (e.g., ABI/INFORM Global + "
             "Dateline + Trade & Industry) into one usage file for a subscription-"
             "level renewal review (Workflow E)."
+        )
+        st.info(
+            "**Compatible file structure.** Each file should be one sheet with "
+            "the vendor's usage metric labels on a header row (e.g. "
+            "'BriefCitation, Citation, Full Text, Total') and title rows below. "
+            "Section detection is keyword-based; if your vendor uses metric labels "
+            "not currently recognized, tell your analyst — they're one edit to add."
         )
 
     if not XLS_AVAILABLE:
@@ -6438,7 +6496,7 @@ def page_proquest_extractor():
         return
 
     files = st.file_uploader(
-        "Upload one or more ProQuest DB Titles Usage Report .xls files:",
+        "Upload one or more multi-database titles usage report `.xls` files:",
         type=['xls'], accept_multiple_files=True, key='pq_upload',
         help="Each file typically covers one period (e.g., calendar half or "
              "fiscal year). Multiple files let you build multi-period comparisons."
@@ -6471,7 +6529,8 @@ def page_proquest_extractor():
 
     ok = {n: p for n, p in parsed.items() if not p.get('error') and p.get('sections')}
     if not ok:
-        st.warning("No parseable files. Check that these are ProQuest DB Titles Usage Reports.")
+        st.warning("No parseable files. Check that these are multi-database "
+                   "titles usage reports (ProQuest, EBSCO, or similar format).")
         return
 
     # ---- Loaded periods summary ----
@@ -7441,7 +7500,12 @@ def _ovl_parse_coverage(text, present):
     if not s.strip() or s.lower() == 'nan':
         return []
     intervals = []
-    for mm in re.finditer(r'from\s+([\d\-]+)(?:\s+until\s+([\d\-]+))?', s, re.I):
+    # The pattern allows "volume: N issue: M" style metadata between the from-date
+    # and the optional "until" clause — Alma coverage often reads like
+    #   "Available from 2013-08-01 volume: 1 issue: 1 until 2020-10-31 volume: 8;"
+    # so we can't require "until" to sit right after the from-date. The gap
+    # matcher [^;]*? stops at the semicolon that separates coverage clauses.
+    for mm in re.finditer(r'from\s+([\d\-]+)(?:[^;]*?\s+until\s+([\d\-]+))?', s, re.I):
         start = _ovl_parse_one_date(mm.group(1), is_end=False)
         if start is None:
             continue
@@ -7498,28 +7562,97 @@ def _ovl_span_years(ivs):
     return sum((e - s).days + 1 for s, e in ivs) / 365.25
 
 
+def _ovl_endpoint_precision(d, is_end):
+    """Determine what precision this endpoint needs:
+      0 = year (start = Jan 1 / end = Dec 31 — no info lost)
+      1 = month (start = day 1 / end = last day of month — day info not needed)
+      2 = day (specific date within a month)
+    """
+    if not is_end:
+        if d.month == 1 and d.day == 1:
+            return 0
+        if d.day == 1:
+            return 1
+        return 2
+    from datetime import timedelta
+    next_day = d + timedelta(days=1)
+    if next_day.month == 1 and next_day.day == 1:
+        return 0
+    if next_day.day == 1:
+        return 1
+    return 2
+
+
+def _ovl_fmt_at_precision(d, precision):
+    """Format a date at a fixed precision level (0=year, 1=month, 2=day-ISO)."""
+    if precision == 0:
+        return f"{d.year}"
+    if precision == 1:
+        return d.strftime("%b %Y")
+    return d.strftime("%Y-%m-%d")
+
+
 def _ovl_fmt_ranges(ivs):
-    """Render intervals as a compact human-readable string like '1925–1985; 2014–2015'."""
+    """Render intervals with consistent precision inside each interval — both
+    endpoints use the same granularity (the finer of what either endpoint
+    needs). Whole-year intervals compress to "YYYY"; month-boundary intervals
+    read as "Mon YYYY"; anything with day precision uses ISO "YYYY-MM-DD" so
+    the values are unambiguous and math-friendly (sortable, easy to copy into
+    Excel or a date-difference calc).
+
+    Examples:
+      Jan 1, 2013 – Dec 31, 2020       → "2013–2020"
+      Aug 1, 2013 – Oct 31, 2020       → "Aug 2013–Oct 2020"
+      Jan 2, 1997 – Jan 31, 1997       → "1997-01-02–1997-01-31"
+      Jan 1, 2021 – Jul 10, 2026       → "2021-01-01–2026-07-10"
+    """
     out = []
     for s, e in ivs:
-        if s.year == e.year:
-            out.append(f"{s.year}")
+        precision = max(_ovl_endpoint_precision(s, is_end=False),
+                        _ovl_endpoint_precision(e, is_end=True))
+        start_str = _ovl_fmt_at_precision(s, precision)
+        end_str = _ovl_fmt_at_precision(e, precision)
+        if start_str == end_str:
+            out.append(start_str)
         else:
-            out.append(f"{s.year}\u2013{e.year}")
+            out.append(f"{start_str}\u2013{end_str}")
     return "; ".join(out)
 
 
 def _ovl_classify(df, group_col, title_key_col, title_disp_col, coverage_col,
-                  min_years):
+                  min_years, excluded_databases=None, coverage_as_of_date=None):
     """Classify every (database, title) pair. Returns a long DataFrame with one
     row per database-title combination.
+
+    excluded_databases: optional iterable of database names that have already
+    been cancelled but still appear in the coverage export. These are silently
+    dropped before classification runs, so titles previously marked "redundant"
+    because a phantom-cancelled DB also held them get correctly reclassified as
+    "sole source" or "unique coverage" against the databases we actually still
+    have.
+
+    coverage_as_of_date: date at which ongoing coverage claims are considered
+    trustworthy. Defaults to today. Set earlier to conservatively cap "loss"
+    computations — Alma coverage often stays flagged as ongoing after a vendor
+    has actually stopped providing a title, so extending ongoing to today can
+    overstate what we'd actually lose by cancelling.
+
+    Per-title safety cap: after computing unique loss for a database, the
+    interval is capped at the max end date observed across all subscriptions
+    for that title. This ensures we never claim to lose coverage for dates
+    when no subscription in the file ever claimed to hold the title.
 
     Columns: database, title, status, unique_years, unique_ranges,
              other_count, also_in.
     """
     from datetime import date
 
-    present = date.today()
+    present = coverage_as_of_date or date.today()
+    excluded = set(excluded_databases or ())
+
+    # Drop rows for already-cancelled databases before parsing
+    if excluded:
+        df = df[~df[group_col].astype(str).str.strip().isin(excluded)]
 
     # Parse coverage once per row.
     parsed = df[coverage_col].apply(lambda t: _ovl_parse_coverage(t, present))
@@ -7543,6 +7676,15 @@ def _ovl_classify(df, group_col, title_key_col, title_disp_col, coverage_col,
     for tkey, recs in title_recs.items():
         groups_here = {g for g, _ in recs}
         disp = title_disp.get(tkey, tkey)
+
+        # Safety cap: max end date across all subscriptions for this title.
+        # Loss for any single database can't extend past what any subscription
+        # claimed to provide — this handles cases where the focus's own
+        # ongoing extension would otherwise inflate loss beyond the observable
+        # coverage window.
+        all_ends = [e for _, ivs in recs for _, e, _ in ivs]
+        title_max_end = max(all_ends) if all_ends else None
+
         for g in groups_here:
             target = [(s, e) for rg, ivs in recs if rg == g for (s, e, _) in ivs]
             other_groups = sorted({rg for rg, _ in recs if rg != g})
@@ -7554,6 +7696,14 @@ def _ovl_classify(df, group_col, title_key_col, title_disp_col, coverage_col,
                 unique = _ovl_subtract(target, other)
                 yrs = _ovl_span_years(unique)
                 status = "Unique coverage" if yrs > min_years else "Redundant"
+            # Apply per-title max-end safety cap (no-op if focus's own end IS
+            # the max, which is the normal case). It kicks in when the focus's
+            # coverage extends past all OTHER subscriptions AND was truncated
+            # by a coverage-as-of date being applied to others differently.
+            if title_max_end is not None:
+                unique = [(s, min(e, title_max_end)) for s, e in unique
+                          if s <= title_max_end]
+                unique = [(s, e) for s, e in unique if e >= s]
             rows.append({
                 "database": g,
                 "title": disp,
@@ -7577,16 +7727,24 @@ _OVL_STATUS_COLORS = {
 
 def _ovl_cached_classification(tool_key, uploaded_file, group_col,
                                title_key_col, title_disp_col, coverage_col,
-                               min_years, df):
+                               min_years, df, excluded_databases=None,
+                               coverage_as_of_date=None):
     """Memoize the (somewhat expensive) classification in session_state, keyed
-    on file + the settings that affect the result. Returns the long DataFrame."""
+    on file + the settings that affect the result. Returns the long DataFrame.
+    Cache key includes the excluded-databases set and coverage-as-of date so
+    toggling either reruns the classification correctly."""
     file_key = _make_file_key(uploaded_file)
-    sig = (file_key, group_col, title_key_col, coverage_col, min_years)
+    ex_key = tuple(sorted(excluded_databases)) if excluded_databases else ()
+    as_of_key = coverage_as_of_date.isoformat() if coverage_as_of_date else None
+    sig = (file_key, group_col, title_key_col, coverage_col, min_years,
+           ex_key, as_of_key)
     slot = st.session_state.get(f"_ovl_cache_{tool_key}")
     if slot and slot.get("sig") == sig:
         return slot["result"]
     result = _ovl_classify(df, group_col, title_key_col, title_disp_col,
-                           coverage_col, min_years)
+                           coverage_col, min_years,
+                           excluded_databases=excluded_databases,
+                           coverage_as_of_date=coverage_as_of_date)
     st.session_state[f"_ovl_cache_{tool_key}"] = {"sig": sig, "result": result}
     return result
 
@@ -7671,8 +7829,8 @@ def page_overlap_analyzer():
         st.caption(
             "Titles are matched to the coverage export by normalized title. "
             "Any title-level usage export works — COUNTER TR_J3, a Zero-Use "
-            "explicit-zero master, or the per-title CSV from the ProQuest "
-            "Extractor. Titles present in the coverage export but missing from "
+            "explicit-zero master, or the per-title CSV from the Multi-Database "
+            "Usage Extractor. Titles present in the coverage export but missing from "
             "the usage file are treated as **0 uses**."
         )
         usage_file = st.file_uploader(
@@ -8242,11 +8400,17 @@ def page_overlap_analyzer():
 
 
 def _wfe_classify_uniqueness(df, coverage_col, group_col, title_disp_col,
-                              title_norm_col, min_years, coverage_file):
+                              title_norm_col, min_years, coverage_file,
+                              excluded_databases=None,
+                              coverage_as_of_date=None):
     """Build the _ovl_key column and run the cached overlap classification.
 
     Wraps the same normalization + call used by page_overlap_analyzer so the
     workflow page produces identical results to the standalone tool.
+    excluded_databases lets Workflow E treat "phantom-active" subscriptions
+    (already cancelled but still in the Alma coverage export) as gone before
+    the redundancy math runs. coverage_as_of_date caps ongoing coverage
+    claims so loss doesn't extend past a date the analyst can vouch for.
     """
     df = df.copy()
     if title_norm_col and title_norm_col in df.columns:
@@ -8260,14 +8424,16 @@ def _wfe_classify_uniqueness(df, coverage_col, group_col, title_disp_col,
             lambda v: normalize_text(v) if pd.notna(v) else None)
     return _ovl_cached_classification(
         "wfe", coverage_file, group_col, "_ovl_key",
-        title_disp_col, coverage_col, min_years, df)
+        title_disp_col, coverage_col, min_years, df,
+        excluded_databases=excluded_databases,
+        coverage_as_of_date=coverage_as_of_date)
 
 
 def _wfe_build_usage_map(usage_df):
     """Return {normalized_title: total_uses} from an arbitrary usage DataFrame.
 
     Handles files with a single weight column and files with per-year usage
-    columns (from Zero-Use Identifier / ProQuest Extractor output) — sums the
+    columns (from Zero-Use Identifier / Multi-Database Usage Extractor output) — sums the
     per-year columns when no single-total column is present.
     """
     usage_map = {}
@@ -8378,7 +8544,7 @@ def page_workflow_e():
             "export; the tool classifies every title as sole source, unique "
             "coverage, or redundant.\n"
             "3. **Usage (Step 2)** — upload a title-level usage file (COUNTER, "
-            "non-COUNTER vendor report, Zero-Use master, or ProQuest extract). "
+            "non-COUNTER vendor report, Zero-Use master, or multi-database extract). "
             "Usage attaches to the uniqueness classification.\n"
             "4. **Decision matrix** — the tool applies the guide's rules to "
             "each title of the focus database and produces a renew / "
@@ -8492,10 +8658,66 @@ def page_workflow_e():
         help="Raise to ignore small gaps that come from year-level metadata rounding."
     )
 
+    # ---- Already-cancelled databases (phantom-active in Alma) ----
+    # Some databases stay in the Alma coverage export even after they've been
+    # cancelled. If we don't tell the tool to ignore them, titles show up as
+    # "redundant" because the phantom DB "still" holds them — masking a real
+    # loss. This multiselect lets the analyst nominate any such subscriptions
+    # to exclude from the redundancy math before classification runs.
+    all_dbs_in_file = sorted(df[group_col].dropna().astype(str).str.strip().unique())
+    all_dbs_in_file = [d for d in all_dbs_in_file if d]
+    excluded_dbs = st.multiselect(
+        "Databases already cancelled but still in the coverage export "
+        "(exclude from redundancy math):",
+        all_dbs_in_file,
+        key="wfe_excluded_dbs",
+        help="Any database selected here is treated as if it doesn't hold "
+             "any of its listed titles. Use this when Alma still shows a "
+             "cancelled subscription as active — otherwise the tool thinks "
+             "titles held by that phantom database are 'redundant' and won't "
+             "flag the true loss you'd take by cancelling the focus database."
+    )
+    if excluded_dbs:
+        st.caption(f"⚠️ Excluding **{len(excluded_dbs)}** database(s) from "
+                   f"redundancy math: {', '.join(excluded_dbs)}")
+
+    # ---- Coverage-as-of date ----
+    # Alma's coverage claims often extend as "ongoing" past the point where
+    # a vendor actually stopped providing a title (nobody updates the record).
+    # If ongoing coverage is extended all the way to today, the tool overstates
+    # loss for the cancellation review — showing years of "loss" for coverage
+    # we never actually had. This date input lets the analyst cap ongoing
+    # claims at a date they can vouch for. Default is today; set earlier to
+    # be conservative.
+    from datetime import date as _date_cls, timedelta
+    _today = _date_cls.today()
+    coverage_as_of = st.date_input(
+        "Cap ongoing coverage claims at (\"coverage as-of\" date):",
+        value=_today,
+        min_value=_date_cls(2000, 1, 1),
+        max_value=_today,
+        key="wfe_coverage_as_of",
+        help="Any subscription with 'Available from X' (no end date) is treated "
+             "as extending only up to this date. If you know a subscription's "
+             "vendor actually stopped providing titles before today, set this "
+             "to a date you can verify — otherwise the tool will claim loss "
+             "for years the vendor wasn't actually delivering. Default is today. "
+             "A common conservative choice is the end of the most recent fiscal "
+             "year where you can verify all subscriptions were current."
+    )
+    if coverage_as_of < _today:
+        _days_back = (_today - coverage_as_of).days
+        st.caption(f"📅 Ongoing coverage capped at "
+                   f"**{coverage_as_of.strftime('%b %-d, %Y')}** "
+                   f"({_days_back:,} days before today). Loss beyond this date "
+                   f"won't be attributed to any subscription.")
+
     with st.spinner("Classifying uniqueness…"):
         long_df = _wfe_classify_uniqueness(
             df, coverage_col, group_col, title_disp_col,
-            title_norm_col, min_years, coverage_file)
+            title_norm_col, min_years, coverage_file,
+            excluded_databases=excluded_dbs or None,
+            coverage_as_of_date=coverage_as_of)
 
     if long_df.empty:
         st.warning("No title/database pairs could be built.")
@@ -8530,6 +8752,20 @@ def page_workflow_e():
     k4.metric("Redundant", f"{n_red:,}",
               help="Fully duplicated elsewhere.")
 
+    from datetime import date as _wfe_date
+    _cap_label = (coverage_as_of.strftime('%b %-d, %Y')
+                  if coverage_as_of < _wfe_date.today()
+                  else "today")
+    st.caption(
+        f"📅 **Loss shown as of {_cap_label}**. Coverage extending into the "
+        "future is clipped to that date; ongoing subscriptions display "
+        "specific end dates (e.g. \"Jul 2026\") rather than year rollups so "
+        "partial-year loss reads accurately. Loss for any title is also "
+        "capped at the max end date across all subscriptions for that title, "
+        "so we never claim to lose coverage for dates when no subscription "
+        "actually held the title."
+    )
+
     st.markdown("---")
 
     # =============================================================
@@ -8546,8 +8782,12 @@ def page_workflow_e():
         "Usage source:",
         ["Skip (uniqueness-only)",
          "Upload usage file directly",
-         "Extract from ProQuest DB Titles Usage Report"],
-        key="wfe_usage_source", horizontal=False
+         "Extract from multi-database titles usage report"],
+        key="wfe_usage_source", horizontal=False,
+        help="The 'Extract' option works with ProQuest, EBSCO, and other "
+             "vendors that pack many databases into one stacked `.xls`. See "
+             "the Multi-Database Usage Extractor (Individual tools) for "
+             "standalone use."
     )
 
     usage_map = {}
@@ -8558,8 +8798,9 @@ def page_workflow_e():
             "Usage file (CSV, XLS, XLSX)",
             type=['csv', 'xls', 'xlsx'], key="wfe_usage_upload",
             help="Any title-level usage file: COUNTER TR_J3, a Zero-Use master, "
-                 "a non-COUNTER vendor report, or the CSV from the ProQuest "
-                 "Extractor. Per-year usage columns are summed automatically."
+                 "a non-COUNTER vendor report, or the CSV from the "
+                 "Multi-Database Usage Extractor. Per-year usage columns are "
+                 "summed automatically."
         )
         if usage_file:
             try:
@@ -8582,22 +8823,23 @@ def page_workflow_e():
             except Exception as e:
                 st.warning(f"Couldn't parse usage file: {e}")
 
-    elif usage_source == "Extract from ProQuest DB Titles Usage Report":
+    elif usage_source == "Extract from multi-database titles usage report":
         if not XLS_AVAILABLE:
-            st.error("Reading ProQuest .xls files needs the `xlrd` package.")
+            st.error("Reading legacy `.xls` files needs the `xlrd` package.")
         else:
             pq_files = st.file_uploader(
-                "ProQuest DB Titles Usage Report .xls file(s):",
+                "Multi-database titles usage report `.xls` file(s):",
                 type=['xls'], accept_multiple_files=True, key="wfe_pq_files",
-                help="Upload one or more period exports; the tool will extract "
-                     "usage for the focus database and combine periods."
+                help="ProQuest, EBSCO, or other vendors that ship a stacked "
+                     "multi-DB .xls. The tool will extract usage for the focus "
+                     "database and combine periods."
             )
             if pq_files:
                 pq_metric_default = ['Total']
                 pq_metric_choice = st.multiselect(
                     "Metrics to sum:", pq_metric_default + ['Full Text', 'Full Text  PDF', 'Page View'],
                     default=pq_metric_default, key="wfe_pq_metrics",
-                    help="Defaults to ProQuest's precomputed 'Total'. Add "
+                    help="Defaults to the vendor's precomputed 'Total' when present. Add "
                          "Full Text / PDF for a stricter measure."
                 )
                 # Try to auto-detect a section that matches the focus_db
@@ -8630,7 +8872,7 @@ def page_workflow_e():
                         if k:
                             usage_map[k] = usage_map.get(k, 0) + use_total
                     usage_source_desc = (
-                        f"ProQuest Extract — {len(pq_files)} file(s), "
+                        f"Multi-database extract — {len(pq_files)} file(s), "
                         f"{matched_sections} matching section(s) for '{focus_db}', "
                         f"{len(usage_map):,} distinct titles."
                     )
@@ -8642,7 +8884,7 @@ def page_workflow_e():
                     st.warning(
                         f"No sections matching '{focus_db}' in the uploaded files. "
                         f"Check that the focus database name aligns with a "
-                        f"ProQuest section name."
+                        f"section name in the file."
                     )
 
     # Attach usage to long_df
@@ -8879,6 +9121,11 @@ def page_workflow_e():
         {'Field': 'T/L/R protection mode', 'Value': tlr_summary},
         {'Field': 'T/L/R justification', 'Value': tlr_note or '—'},
         {'Field': 'Coverage file', 'Value': coverage_file.name},
+        {'Field': 'Coverage as-of date',
+         'Value': coverage_as_of.strftime('%b %-d, %Y') +
+                  (' (today)' if coverage_as_of >= _wfe_date.today() else '')},
+        {'Field': 'Excluded (already-cancelled) databases',
+         'Value': ', '.join(excluded_dbs) if excluded_dbs else '(none)'},
         {'Field': 'Usage source', 'Value': usage_source_desc or '(none — uniqueness only)'},
         {'Field': 'Materiality threshold (yrs)', 'Value': str(min_years)},
         {'Field': 'Low-use threshold', 'Value': str(low_use_threshold) if has_usage else '—'},
@@ -9413,7 +9660,7 @@ def page_workflow_c():
     """Workflow C — Annual Ebook Collection Snapshot (per major vendor).
 
     One vendor at a time. Steps: setup → data-type classification (A/B/C
-    branch from the guide) → usage upload (with optional inline ProQuest
+    branch from the guide) → usage upload (with optional inline multi-database
     extraction) → optional Zero-Use reconciliation → branch-appropriate
     analysis → vendor-level ebook usage profile export for the July meeting.
 
@@ -9426,7 +9673,7 @@ def page_workflow_c():
     st.markdown(
         "**Per-vendor ebook analysis for the July meeting.** Set up the "
         "vendor, classify by data type (branch A / B / C — same taxonomy as "
-        "Workflow E), attach usage (with optional inline ProQuest extraction), "
+        "Workflow E), attach usage (with optional inline multi-database extraction), "
         "and export a vendor-level ebook usage profile."
     )
     with st.expander("ℹ️ How this workflow works", expanded=False):
@@ -9440,8 +9687,8 @@ def page_workflow_c():
             "(C) COUNTER only → COUNTER triage. Pick the branch based on "
             "what the vendor provides.\n"
             "3. **Prepare & profile** — upload the vendor's usage file "
-            "(optional: extract inline from a ProQuest DB Titles Usage "
-            "Report). Optional Zero-Use reconciliation against the full "
+            "(optional: extract inline from a multi-database titles usage "
+            "report). Optional Zero-Use reconciliation against the full "
             "title list. Then run branch-appropriate analysis.\n"
             "4. **Act** — the exported profile feeds firm ebook purchases "
             "(Wishlist F), package restructuring (Workflow E), or migration "
@@ -9509,8 +9756,10 @@ def page_workflow_c():
     usage_source = st.radio(
         "Usage source:",
         ["Upload usage file directly",
-         "Extract from ProQuest DB Titles Usage Report"],
-        key="wfc_usage_source", horizontal=False
+         "Extract from multi-database titles usage report"],
+        key="wfc_usage_source", horizontal=False,
+        help="The 'Extract' option works with ProQuest, EBSCO, and other "
+             "vendors that pack many databases into one stacked `.xls`."
     )
 
     usage_df = None
@@ -9538,17 +9787,17 @@ def page_workflow_c():
             except Exception as e:
                 st.error(f"❌ Couldn't read the file: {e}")
 
-    else:  # ProQuest extraction path
+    else:  # Multi-database extraction path
         if not XLS_AVAILABLE:
-            st.error("Reading ProQuest .xls needs the `xlrd` package.")
+            st.error("Reading legacy `.xls` files needs the `xlrd` package.")
         else:
             st.caption(
-                "Upload one or more ProQuest DB Titles Usage Reports. The "
-                "tool extracts titles from sections matching your vendor "
-                "name and combines periods."
+                "Upload one or more multi-database titles usage reports "
+                "(ProQuest, EBSCO, or similar format). The tool extracts titles "
+                "from sections matching your vendor name and combines periods."
             )
             pq_files = st.file_uploader(
-                "ProQuest DB Titles Usage Report .xls file(s):",
+                "Multi-database titles usage report .xls file(s):",
                 type=['xls'], accept_multiple_files=True, key="wfc_pq_files"
             )
             if pq_files:
@@ -9588,7 +9837,7 @@ def page_workflow_c():
                         FullTextPDF=('Full Text PDF', 'sum'),
                     )
                     usage_source_desc = (
-                        f"ProQuest Extract — {len(pq_files)} file(s), "
+                        f"Multi-database extract — {len(pq_files)} file(s), "
                         f"{matched_sections} section(s) matching '{vendor_name}'"
                     )
                     st.success(
@@ -9598,10 +9847,10 @@ def page_workflow_c():
                 elif vendor_name:
                     st.warning(
                         f"No sections matching '{vendor_name}' in the files. "
-                        f"Check the vendor name against the ProQuest section labels."
+                        f"Check the vendor name against the section labels in the file."
                     )
                 else:
-                    st.info("Enter a vendor name above to enable ProQuest matching.")
+                    st.info("Enter a vendor name above to enable section matching.")
 
     if usage_df is None or usage_df.empty:
         st.info("Attach usage data above to continue.")
@@ -9899,7 +10148,7 @@ def page_home():
             <p>Everything for one subscription's renewal on one page. Uniqueness
             (Step 1), usage triage (Step 2), and the guide's decision matrix
             (renew / negotiate / cancel) — no tool-hopping. Optional inline
-            ProQuest extraction.</p>
+            multi-database extraction.</p>
             <hr>
             <p><strong>Status:</strong> Ready. Coverage upload + optional usage
             + focus DB → renewal brief.</p>
@@ -10084,7 +10333,7 @@ def main():
                 ["— none selected —",
                  "🗺️ Collection Profiler",
                  "📈 Use Analysis",
-                 "🧾 ProQuest Extractor",
+                 "🧾 Multi-Database Usage Extractor",
                  "🔍 Zero-Use Identifier",
                  "🧩 Overlap & Uniqueness"],
                 key="nav_tool",
@@ -10109,7 +10358,7 @@ def main():
             page_collection_profiler()
         elif "Use Analysis" in page_name:
             page_use_analysis()
-        elif "ProQuest Extractor" in page_name:
+        elif "Multi-Database Usage Extractor" in page_name:
             page_proquest_extractor()
         elif "Zero-Use Identifier" in page_name:
             page_zero_use_identifier()
