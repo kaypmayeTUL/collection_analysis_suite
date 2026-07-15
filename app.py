@@ -3744,9 +3744,12 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                 grouped[f'Baseline avg ({len(baseline_cols)}y)'] = bl_df.mean(axis=1)
                 grouped['Δ'] = (grouped[f'Recent ({recent_year})']
                                 - grouped[f'Baseline avg ({len(baseline_cols)}y)'])
-                # Guard against divide-by-zero
-                _denom = grouped[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, pd.NA)
-                grouped['Δ %'] = (grouped['Δ'] / _denom * 100).astype(float)
+                # Guard against divide-by-zero. Use np.nan (not pd.NA) so the
+                # resulting series stays float-typed — pd.NA is a nullable-dtype
+                # marker that mixes with floats into object dtype, and newer
+                # pandas rejects object → float astype when pd.NA is present.
+                _denom = grouped[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, np.nan)
+                grouped['Δ %'] = grouped['Δ'] / _denom * 100
                 grouped['|Δ|'] = grouped['Δ'].abs()
                 grouped = grouped.sort_values('|Δ|', ascending=False).reset_index()
 
