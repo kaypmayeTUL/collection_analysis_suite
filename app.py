@@ -6756,6 +6756,7 @@ def page_proquest_extractor():
 
 
 
+def page_zero_use_identifier():
     """Tool 4: Zero-Use Identifier — compare a holdings list to a usage list."""
     st.header("🔍 Zero-Use Identifier")
     st.markdown(
