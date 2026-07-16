@@ -33,6 +33,27 @@ A unified Streamlit application bundling four collection decision-support tools:
      database as sole source, unique coverage, or redundant, using day-resolution
      interval math so date coverage (not just title name) drives the picture.
 
+v2.21 (slim) — Zero-Use tool prefers fiscal-year columns:
+       Alma exports often carry both `Loan Year` (calendar) and
+       `Loan Fiscal Year` — the tool used to pick whichever appeared first in
+       the DataFrame. Now the fiscal column always wins:
+       (1) DATE_COL_ALIASES lists `Loan Fiscal Year` (and variants) before any
+           calendar-year alias, so exact alias-matching prefers fiscal.
+       (2) The numeric-year fallback in _detect_print_date_column runs a
+           two-pass search — first pass matches columns whose name contains
+           both "year" AND "fiscal" (so `Fiscal_Year_of_Loan` beats
+           `Loan Year` even without a direct alias hit), second pass accepts
+           any plausible year column as before.
+       (3) When the detected column IS a fiscal-year column (numeric + "fiscal"
+           in the name), the tool now skips the calendar-to-fiscal bucketing
+           checkbox entirely, labels output columns as `Use FYyyyy` (not the
+           calendar-year `Use yyyy`), and formats the year-filter multiselect
+           as `FYyyyy`. Bucketing an already-fiscal value would have corrupted
+           it — this was a latent bug.
+       (4) When the source is a calendar-only numeric column (`Loan Year` with
+           no `Loan Fiscal Year` present), the tool now warns and suggests
+           re-uploading with the fiscal column so the framing stays consistent
+           across the pipeline.
 v2.20 (slim) — Workflow A fiscal-year framing + user-picked baseline:
        (1) Every year label now explicitly reads as "FY{year}" so the fiscal-
            year framing is unambiguous. Column headers in the LC breakdown +
@@ -5779,6 +5800,12 @@ def _detect_counter_date_range(month_cols):
 
 
 DATE_COL_ALIASES = [
+    # Fiscal-year columns come first — Alma exports often carry BOTH
+    # "Loan Fiscal Year" and "Loan Year" (calendar). Tulane's review runs on
+    # fiscal years, so we always prefer the fiscal column when present.
+    'Loan Fiscal Year', 'Loan_Fiscal_Year', 'loan_fiscal_year',
+    'Loan FY', 'Fiscal Year', 'fiscal_year', 'FY',
+    # Then the rest (calendar-year or explicit-date columns).
     'Use Year', 'Last Use Year', 'Use_Year', 'Usage Year',
     'Checkout Date', 'checkout_date', 'Loan Date', 'loan_date',
     'Transaction Date', 'transaction_date', 'Last Charge Date', 'last_charge_date',
@@ -5802,19 +5829,30 @@ def _detect_print_date_column(df):
             if alias.lower() == col.lower():
                 return col
 
-    # Year-only columns: numeric, named with 'year', values in plausible year range
+    # Year-only columns: numeric, named with 'year', values in plausible year
+    # range. Iterate twice — first pass prefers columns whose name mentions
+    # "fiscal" (so a "Fiscal_Year_of_Loan" column beats a plain "Loan Year"
+    # even without a direct alias match). Second pass accepts any year column.
+    def _plausible_year_col(col):
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            return False
+        try:
+            vals = pd.to_numeric(df[col], errors='coerce').dropna()
+            if len(vals) == 0:
+                return False
+            in_range = ((vals >= 1500) & (vals <= 2100)).sum()
+            return in_range / max(1, len(vals)) > 0.9
+        except Exception:
+            return False
+
     for col in df.columns:
-        lc = col.lower()
-        if 'year' in lc and pd.api.types.is_numeric_dtype(df[col]):
-            try:
-                vals = pd.to_numeric(df[col], errors='coerce').dropna()
-                if len(vals) > 0:
-                    # Plausible years: between 1500 and the current year + 2
-                    in_range = ((vals >= 1500) & (vals <= 2100)).sum()
-                    if in_range / max(1, len(vals)) > 0.9:
-                        return col
-            except Exception:
-                continue
+        lc = str(col).lower()
+        if 'year' in lc and 'fiscal' in lc and _plausible_year_col(col):
+            return col
+    for col in df.columns:
+        lc = str(col).lower()
+        if 'year' in lc and _plausible_year_col(col):
+            return col
 
     # Partial match — must contain date-related keyword AND parse as dates
     date_keywords = ['date', 'checkout', 'loan', 'charge']
@@ -6958,9 +6996,14 @@ def page_zero_use_identifier():
         # ---- Use-year derivation + fiscal-year filter (#1, #2) ----
         # Derive a use year from the detected use-date column. Optionally bucket
         # into the July–June fiscal year, and let the user scope which years count.
+        # If the source column is ALREADY a fiscal-year column (e.g. Alma's
+        # "Loan Fiscal Year"), the bucketing checkbox is hidden and the values
+        # pass through as-is with a "Use FY" prefix — bucketing an already-
+        # fiscal value would corrupt it.
         usage_year_arg = None
         if u_date and u_date in usage_df.columns:
             _src = usage_df[u_date]
+            src_is_fiscal_col = 'fiscal' in str(u_date).lower()
             if pd.api.types.is_numeric_dtype(_src):
                 _yr = pd.to_numeric(_src, errors='coerce')
                 _month = None
@@ -6968,12 +7011,33 @@ def page_zero_use_identifier():
                 _dt = pd.to_datetime(_src, errors='coerce')
                 _yr = _dt.dt.year
                 _month = _dt.dt.month
-            fiscal = st.checkbox(
-                "Bucket use dates by fiscal year (Jul–Jun)", value=True,
-                key="zu_fiscal",
-                help="FY2023 = Jul 2022–Jun 2023 (Tulane's July baseline / June "
-                     "retrospective). Uncheck for calendar year.")
-            if fiscal and _month is not None:
+            if src_is_fiscal_col:
+                st.info(f"📅 Source column **`{u_date}`** is already a "
+                        f"fiscal-year column — values pass through with a "
+                        f"**Use FY** prefix; no bucketing needed.")
+                fiscal = True
+            elif _month is not None:
+                fiscal = st.checkbox(
+                    "Bucket use dates by fiscal year (Jul–Jun)", value=True,
+                    key="zu_fiscal",
+                    help="FY2023 = Jul 2022–Jun 2023 (Tulane's July baseline / June "
+                         "retrospective). Uncheck for calendar year.")
+            else:
+                # Numeric column with no fiscal in the name — likely a plain
+                # "Loan Year" (calendar). Warn but don't presume; the user can
+                # convert externally if they want fiscal framing.
+                st.warning(
+                    f"📅 Source column **`{u_date}`** is numeric year values "
+                    f"(no 'fiscal' in the name) — treated as **calendar years**. "
+                    f"If you have a `Loan Fiscal Year` column, upload the file "
+                    f"again — the tool prefers it automatically."
+                )
+                fiscal = False
+            if src_is_fiscal_col:
+                # Pass-through: value IS the fiscal year, labeled "Use FY"
+                usage_df['_use_year'] = pd.to_numeric(_yr, errors='coerce').astype('Int64')
+                year_prefix = "Use FY"
+            elif fiscal and _month is not None:
                 # FY label = ending calendar year; July onward rolls into next FY
                 usage_df['_use_year'] = (
                     _yr + (_month >= 7).astype('Int64')).astype('Int64')
@@ -6984,9 +7048,13 @@ def page_zero_use_identifier():
 
             yrs_present = sorted(int(y) for y in usage_df['_use_year'].dropna().unique())
             if yrs_present:
-                ylabel = "fiscal years" if (fiscal and _month is not None) else "years"
+                is_fiscal_output = (src_is_fiscal_col or
+                                    (fiscal and _month is not None))
+                ylabel = "fiscal years" if is_fiscal_output else "years"
+                fmt_year = (lambda y: f"FY{y}") if is_fiscal_output else str
                 picked = st.multiselect(
                     f"Include {ylabel}", yrs_present, default=yrs_present,
+                    format_func=fmt_year,
                     key="zu_year_filter",
                     help="Limits the usage that counts toward totals and the "
                          "zero-use test. Pick a single year for that year's picture.")
@@ -9299,22 +9367,25 @@ def _wfa_infer_recent_and_baseline(all_years):
 
 
 def _wfa_lc_hierarchy_tables(df, peryear_map, recent_year, baseline_years):
-    """Build three recent-vs-baseline tables at increasing granularity so the
+    """Build two recent-vs-baseline tables at increasing granularity so the
     LC breakdown reads from broad → narrow.
 
-    Returns a dict with three DataFrames:
+    Returns a dict with two DataFrames:
       - 'top'      : one row per top-level LC letter (H, Q, P, ...) with the
                      class name (from LC_CLASSES) attached — good for the
                      "which subject area moved" first-look
       - 'subclass' : one row per two-letter subclass (HB, HG, QA, ...) with
-                     its name from LC_SUBCLASSES — the middle-depth view
-      - 'range'    : one row per curated/bucketed numbered range (HB1-500,
-                     HG4001-4285, ...) — the deepest existing breakdown, same
-                     data as _wfa_lc_shift_table
+                     its name from LC_SUBCLASSES — the deepest breakdown
 
-    Each table has Recent (year) / Baseline avg (Ny) / Δ / Δ% / Titles.
-    All levels sort by |Δ| descending so biggest movers surface first.
-    Returns an empty dict if _lc_sub isn't present in the df.
+    Each table has Recent (FYyyyy) / Baseline avg (Ny) / Δ / Δ% / Titles.
+    Both levels sort by |Δ| descending so biggest movers surface first.
+    Returns an empty dict if _lc_sub isn't present in the df (workflow_a
+    populates it via _extract_lc_vectorized on the call number).
+
+    Numbered-range analysis was dropped in v2.22 — the LC_RANGES catalog
+    only covered curated ranges, so range-level breakdowns were uneven
+    across subject areas. Class + subclass are both derived directly from
+    the call number and give a complete, consistent picture.
     """
     if '_lc_sub' not in df.columns:
         return {}
@@ -9324,9 +9395,7 @@ def _wfa_lc_hierarchy_tables(df, peryear_map, recent_year, baseline_years):
         return {}
 
     # Assemble a work df with the year columns we need + LC keys.
-    keep = ['_lc_sub'] + [recent_col] + baseline_cols
-    if '_lc_range' in df.columns:
-        keep.insert(1, '_lc_range')
+    keep = ['_lc_sub', recent_col] + baseline_cols
     work = df[[c for c in keep if c in df.columns]].copy()
     work = work[work['_lc_sub'].notna()
                 & (work['_lc_sub'].astype(str).str.len() > 0)]
@@ -9354,13 +9423,13 @@ def _wfa_lc_hierarchy_tables(df, peryear_map, recent_year, baseline_years):
         g = g.sort_values('|Δ|', ascending=False).reset_index()
         return g.drop(columns=['|Δ|'], errors='ignore')
 
-    # Top-level
+    # Top-level (21 classes)
     top_df = _aggregate('_lc_top')
     top_df.insert(1, 'Class name',
                   top_df['_lc_top'].map(lambda x: LC_CLASSES.get(x, '')))
     top_df = top_df.rename(columns={'_lc_top': 'LC class'})
 
-    # Subclass
+    # Subclass (two-letter)
     sub_df = _aggregate('_lc_sub')
     def _subclass_name(code):
         if not isinstance(code, str) or not code:
@@ -9371,33 +9440,7 @@ def _wfa_lc_hierarchy_tables(df, peryear_map, recent_year, baseline_years):
                   sub_df['_lc_sub'].map(_subclass_name))
     sub_df = sub_df.rename(columns={'_lc_sub': 'LC subclass'})
 
-    # Numbered range (only if column exists)
-    range_df = pd.DataFrame()
-    if '_lc_range' in work.columns:
-        range_work = work[work['_lc_range'].notna()
-                          & (work['_lc_range'].astype(str).str.len() > 0)]
-        if not range_work.empty:
-            # Re-run aggregate against this filtered subset
-            bl_sums_r = {bc: range_work.groupby('_lc_range')[bc].sum()
-                         for bc in baseline_cols}
-            bl_df_r = pd.DataFrame(bl_sums_r)
-            range_df = pd.DataFrame({
-                f'Recent (FY{recent_year})':
-                    range_work.groupby('_lc_range')[recent_col].sum(),
-                f'Baseline avg ({len(baseline_cols)}y)': bl_df_r.mean(axis=1),
-                'Titles': range_work.groupby('_lc_range').size(),
-            })
-            range_df['Δ'] = (range_df[f'Recent (FY{recent_year})']
-                             - range_df[f'Baseline avg ({len(baseline_cols)}y)'])
-            _denom = range_df[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, np.nan)
-            range_df['Δ %'] = range_df['Δ'] / _denom * 100
-            range_df['|Δ|'] = range_df['Δ'].abs()
-            range_df = (range_df.sort_values('|Δ|', ascending=False)
-                        .reset_index()
-                        .drop(columns=['|Δ|'], errors='ignore')
-                        .rename(columns={'_lc_range': 'LC range'}))
-
-    return {'top': top_df, 'subclass': sub_df, 'range': range_df}
+    return {'top': top_df, 'subclass': sub_df}
 
 
 def _wfa_most_used_titles(df, peryear_map, recent_year, baseline_years, top_n=25):
@@ -9694,11 +9737,17 @@ def page_workflow_a():
     df_recent = _recompute_weight_from_years(df, peryear_map, [recent_year], aggregate="sum")
     df_baseline = _recompute_weight_from_years(df, peryear_map, baseline_years, aggregate="mean")
 
-    # Ensure _lc_range exists for LC-shift table
+    # Parse LC data from the call number column. Populates _lc_main (single
+    # letter), _lc_sub (1–3 letters), and _lc_number (numeric portion) via the
+    # shared vectorized parser so downstream views can group at any level.
+    # The old naive split('.')[0] path was replaced — it wasn't an LC parse,
+    # just a truncation, and it left _lc_sub / _lc_main empty (so the LC
+    # breakdown section came up empty on any file that hadn't already been
+    # through the Zero-Use pipeline).
     lc_col = find_column(df, LC_ALIASES)
-    if lc_col and '_lc_range' not in df.columns:
-        df['_lc_range'] = df[lc_col].astype(str).apply(
-            lambda x: x.split('.')[0] if pd.notna(x) and x != 'nan' else None)
+    if lc_col:
+        if '_lc_sub' not in df.columns or '_lc_main' not in df.columns:
+            df['_lc_main'], df['_lc_sub'], df['_lc_number'] = _extract_lc_vectorized(df[lc_col])
 
     # =============================================================
     # 4. SNAPSHOT SUMMARY
