@@ -33,6 +33,36 @@ A unified Streamlit application bundling four collection decision-support tools:
      database as sole source, unique coverage, or redundant, using day-resolution
      interval math so date coverage (not just title name) drives the picture.
 
+v2.20 (slim) — Workflow A fiscal-year framing + user-picked baseline:
+       (1) Every year label now explicitly reads as "FY{year}" so the fiscal-
+           year framing is unambiguous. Column headers in the LC breakdown +
+           most-used tables read "Recent (FY2026)" (not "Recent (2026)").
+           Chart x-axes read "FY2023, FY2024..." (not "2023, 2024..."). Setup
+           metadata + Yearly totals sheet in the brief use "Fiscal year" and
+           "FY2026" throughout. Compare-mode caption in Use Analysis /
+           Workflow A + brief metadata all switched to FY prefix.
+       (2) Baseline default changed from "three preceding fiscal years" to
+           "all prior fiscal years detected in the file". User picks any
+           number of baseline FYs freely — the multiselect is unchanged in
+           mechanics, just no longer capped at 3 by default. Section 3
+           reworded so nothing suggests three years is required.
+v2.19 (slim) — Workflow A: two new sections between yearly trends and
+       weeding candidates:
+       (1) Hierarchical LC breakdown — same recent-vs-baseline math at three
+           levels of granularity (top-level letter class, two-letter subclass,
+           numbered range) displayed in tabs. Each level sorts by |Δ| so
+           biggest movers surface first. Top-level uses LC_CLASSES for names,
+           subclass uses LC_SUBCLASSES, range uses the curated LC_RANGES
+           catalog (falling back to hundreds-bucketing).
+       (2) Most-used titles — the opposite signal from weeding candidates.
+           Top-N (10-100, default 25) titles by recent-FY usage with baseline
+           comparison and Δ. Sorted by recent-year uses; ties break by
+           absolute delta so climbers surface above steady heavy-hitters.
+           Shows a "these N titles account for X% of recent-FY circulations"
+           caption to signal whether use is concentrated or dispersed.
+       Sections renumbered: weeding is now 8, ILL context is now 9.
+       Meeting brief export gains four new sheets: LC classes, LC
+       subclasses, LC ranges (replaces old "LC shifts"), Most-used titles.
 v2.18 (slim) — Workflow E decision-matrix updates:
        (1) "Renew" is now "Renew or find equivalent subscription" — reminder to
            check whether the same content is available cheaper elsewhere before
@@ -3554,8 +3584,8 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
         sel = list(selected_years)
         if compare_mode:
             st.caption(
-                f"**Compare mode:** Recent FY = **{recent_year}** · "
-                f"Baseline = **{', '.join(str(y) for y in sorted(baseline_years))}**. "
+                f"**Compare mode:** Recent FY = **FY{recent_year}** · "
+                f"Baseline = **{', '.join('FY' + str(y) for y in sorted(baseline_years))}**. "
                 f"Downstream views (Coverage-vs-Use, top titles, etc.) reflect the "
                 f"period you chose in the sidebar."
             )
@@ -3599,7 +3629,7 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
         delta_pct = (delta / baseline_avg * 100) if baseline_avg else 0.0
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric(f"Recent FY ({recent_year})", f"{int(recent_total):,}")
+        k1.metric(f"Recent FY (FY{recent_year})", f"{int(recent_total):,}")
         k2.metric(f"Baseline avg ({len(baseline_rows)}y)",
                   f"{int(baseline_avg):,}" if baseline_avg else "—")
         k3.metric("Δ vs baseline", f"{int(delta):+,}")
@@ -3631,7 +3661,7 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                 )
     else:
         fig.add_bar(
-            x=ydf['Year'].astype(str), y=ydf[total_col],
+            x='FY' + ydf['Year'].astype(str), y=ydf[total_col],
             marker_color='#285C4D',
             text=ydf[total_col].apply(lambda v: f"{int(v):,}"),
             textposition='outside',
@@ -3641,7 +3671,7 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
     # Trend line overlay (dotted, muted)
     if len(ydf) > 1:
         fig.add_scatter(
-            x=ydf['Year'].astype(str), y=ydf[total_col],
+            x='FY' + ydf['Year'].astype(str), y=ydf[total_col],
             mode='lines+markers', name='Trend',
             line=dict(color='#B45309', width=2, dash='dot'),
             marker=dict(size=8, color='#B45309'),
@@ -3662,7 +3692,7 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                 )
     fig.update_layout(
         title=f"{weight_col} by year",
-        xaxis=dict(type='category', title='Year'),
+        xaxis=dict(type='category', title='Fiscal year'),
         yaxis=dict(title=f'Total {weight_col}'),
         barmode='group',
         legend=dict(orientation='h', y=-0.2),
@@ -3682,14 +3712,14 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                 lambda v: 'Up' if v > 0 else 'Down' if v < 0 else 'Flat'
             )
             fig_delta = px.bar(
-                ydf_delta, x=ydf_delta['Year'].astype(str), y='YoY Δ',
+                ydf_delta, x='FY' + ydf_delta['Year'].astype(str), y='YoY Δ',
                 color='Direction',
                 color_discrete_map={'Up': '#047857', 'Down': '#B45309', 'Flat': '#9CA3AF'},
                 title="Year-over-year change in usage",
                 hover_data={'YoY %': ':.1f', 'Year': False, 'Direction': False},
             )
             fig_delta.update_layout(
-                showlegend=False, xaxis=dict(type='category', title='Year'),
+                showlegend=False, xaxis=dict(type='category', title='Fiscal year'),
                 yaxis=dict(title=f'Δ {weight_col} vs prior year'),
             )
             st.plotly_chart(fig_delta, use_container_width=True)
@@ -3702,8 +3732,8 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                    if compare_mode else 'Yearly trends (per-year usage)')
     _meta = {'Tool': 'Use Analysis', 'View': _view_label, 'Metric': weight_col}
     if compare_mode:
-        _meta['Recent FY'] = str(recent_year)
-        _meta['Baseline years'] = ', '.join(str(y) for y in sorted(baseline_years))
+        _meta['Recent FY'] = f"FY{recent_year}"
+        _meta['Baseline years'] = ', '.join('FY' + str(y) for y in sorted(baseline_years))
     _yb = _annotate_csv(display_df, notes, extra_meta=_meta)
     st.download_button("📥 Yearly totals (CSV)", _yb,
                        "yearly_usage_totals.csv", "text/csv",
@@ -3732,7 +3762,7 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                     work[bc] = pd.to_numeric(work[bc], errors='coerce').fillna(0)
                 # Sum recent per LC range; average of baseline totals per LC range
                 grouped = work.groupby('_lc_range').agg(
-                    **{f'Recent ({recent_year})': (recent_col, 'sum')},
+                    **{f'Recent (FY{recent_year})': (recent_col, 'sum')},
                     **{f'Baseline avg ({len(baseline_cols)}y)':
                         (baseline_cols[0], lambda _s, _g=None: None)}  # placeholder
                 )
@@ -3742,7 +3772,7 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                     bl_sums[bc] = work.groupby('_lc_range')[bc].sum()
                 bl_df = pd.DataFrame(bl_sums)
                 grouped[f'Baseline avg ({len(baseline_cols)}y)'] = bl_df.mean(axis=1)
-                grouped['Δ'] = (grouped[f'Recent ({recent_year})']
+                grouped['Δ'] = (grouped[f'Recent (FY{recent_year})']
                                 - grouped[f'Baseline avg ({len(baseline_cols)}y)'])
                 # Guard against divide-by-zero. Use np.nan (not pd.NA) so the
                 # resulting series stays float-typed — pd.NA is a nullable-dtype
@@ -3774,7 +3804,7 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                 st.plotly_chart(fig_shift, use_container_width=True)
 
                 shift_display = grouped[[
-                    '_lc_range', f'Recent ({recent_year})',
+                    '_lc_range', f'Recent (FY{recent_year})',
                     f'Baseline avg ({len(baseline_cols)}y)', 'Δ', 'Δ %'
                 ]].rename(columns={'_lc_range': 'LC range'})
                 st.dataframe(
@@ -3788,8 +3818,8 @@ def _render_peryear_trends(df_view, peryear_map, weight_col, notes,
                     extra_meta={'Tool': 'Use Analysis',
                                 'View': 'LC-level shifts (recent vs baseline)',
                                 'Metric': weight_col,
-                                'Recent FY': str(recent_year),
-                                'Baseline years': ', '.join(str(y) for y in sorted(baseline_present))}
+                                'Recent FY': f"FY{recent_year}",
+                                'Baseline years': ', '.join('FY' + str(y) for y in sorted(baseline_present))}
                 )
                 st.download_button(
                     "📥 LC-level shifts (CSV)", _sb,
@@ -9252,16 +9282,169 @@ def page_workflow_e():
 def _wfa_infer_recent_and_baseline(all_years):
     """Given detected years, pick sensible defaults for recent FY + baseline.
 
-    Recent FY = most recent year present. Baseline = up to three years
-    preceding it. Handles both fiscal and calendar year naming — the caller
-    just gets integers back.
+    Recent FY = most recent detected year. Baseline defaults to **all** prior
+    years so the user starts with the fullest possible historical picture and
+    can trim in the multiselect if a narrower window makes more sense for the
+    meeting (a single-year comparison, dropping an anomalous weeding-heavy
+    year, etc.). The prior version defaulted to just the three preceding
+    years — that turned out to be too prescriptive when Alma exports carried
+    four or five years of usable history.
     """
     if not all_years:
         return None, []
     sorted_years = sorted(all_years)
     recent = sorted_years[-1]
-    baseline = [y for y in sorted_years if y != recent][-3:]
+    baseline = [y for y in sorted_years if y != recent]
     return recent, baseline
+
+
+def _wfa_lc_hierarchy_tables(df, peryear_map, recent_year, baseline_years):
+    """Build three recent-vs-baseline tables at increasing granularity so the
+    LC breakdown reads from broad → narrow.
+
+    Returns a dict with three DataFrames:
+      - 'top'      : one row per top-level LC letter (H, Q, P, ...) with the
+                     class name (from LC_CLASSES) attached — good for the
+                     "which subject area moved" first-look
+      - 'subclass' : one row per two-letter subclass (HB, HG, QA, ...) with
+                     its name from LC_SUBCLASSES — the middle-depth view
+      - 'range'    : one row per curated/bucketed numbered range (HB1-500,
+                     HG4001-4285, ...) — the deepest existing breakdown, same
+                     data as _wfa_lc_shift_table
+
+    Each table has Recent (year) / Baseline avg (Ny) / Δ / Δ% / Titles.
+    All levels sort by |Δ| descending so biggest movers surface first.
+    Returns an empty dict if _lc_sub isn't present in the df.
+    """
+    if '_lc_sub' not in df.columns:
+        return {}
+    recent_col = next((c for c, y in peryear_map.items() if y == recent_year), None)
+    baseline_cols = [c for c, y in peryear_map.items() if y in baseline_years]
+    if not (recent_col and baseline_cols):
+        return {}
+
+    # Assemble a work df with the year columns we need + LC keys.
+    keep = ['_lc_sub'] + [recent_col] + baseline_cols
+    if '_lc_range' in df.columns:
+        keep.insert(1, '_lc_range')
+    work = df[[c for c in keep if c in df.columns]].copy()
+    work = work[work['_lc_sub'].notna()
+                & (work['_lc_sub'].astype(str).str.len() > 0)]
+    if work.empty:
+        return {}
+    work[recent_col] = pd.to_numeric(work[recent_col], errors='coerce').fillna(0)
+    for bc in baseline_cols:
+        work[bc] = pd.to_numeric(work[bc], errors='coerce').fillna(0)
+    # Derive the top-level LC letter from the subclass code (H from 'HB', etc.).
+    work['_lc_top'] = work['_lc_sub'].astype(str).str[0].str.upper()
+
+    def _aggregate(key_col):
+        bl_sums = {bc: work.groupby(key_col)[bc].sum() for bc in baseline_cols}
+        bl_df = pd.DataFrame(bl_sums)
+        g = pd.DataFrame({
+            f'Recent (FY{recent_year})': work.groupby(key_col)[recent_col].sum(),
+            f'Baseline avg ({len(baseline_cols)}y)': bl_df.mean(axis=1),
+            'Titles': work.groupby(key_col).size(),
+        })
+        g['Δ'] = (g[f'Recent (FY{recent_year})']
+                  - g[f'Baseline avg ({len(baseline_cols)}y)'])
+        _denom = g[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, np.nan)
+        g['Δ %'] = g['Δ'] / _denom * 100
+        g['|Δ|'] = g['Δ'].abs()
+        g = g.sort_values('|Δ|', ascending=False).reset_index()
+        return g.drop(columns=['|Δ|'], errors='ignore')
+
+    # Top-level
+    top_df = _aggregate('_lc_top')
+    top_df.insert(1, 'Class name',
+                  top_df['_lc_top'].map(lambda x: LC_CLASSES.get(x, '')))
+    top_df = top_df.rename(columns={'_lc_top': 'LC class'})
+
+    # Subclass
+    sub_df = _aggregate('_lc_sub')
+    def _subclass_name(code):
+        if not isinstance(code, str) or not code:
+            return ''
+        top = code[0].upper()
+        return LC_SUBCLASSES.get(top, {}).get(code.upper(), '')
+    sub_df.insert(1, 'Subclass name',
+                  sub_df['_lc_sub'].map(_subclass_name))
+    sub_df = sub_df.rename(columns={'_lc_sub': 'LC subclass'})
+
+    # Numbered range (only if column exists)
+    range_df = pd.DataFrame()
+    if '_lc_range' in work.columns:
+        range_work = work[work['_lc_range'].notna()
+                          & (work['_lc_range'].astype(str).str.len() > 0)]
+        if not range_work.empty:
+            # Re-run aggregate against this filtered subset
+            bl_sums_r = {bc: range_work.groupby('_lc_range')[bc].sum()
+                         for bc in baseline_cols}
+            bl_df_r = pd.DataFrame(bl_sums_r)
+            range_df = pd.DataFrame({
+                f'Recent (FY{recent_year})':
+                    range_work.groupby('_lc_range')[recent_col].sum(),
+                f'Baseline avg ({len(baseline_cols)}y)': bl_df_r.mean(axis=1),
+                'Titles': range_work.groupby('_lc_range').size(),
+            })
+            range_df['Δ'] = (range_df[f'Recent (FY{recent_year})']
+                             - range_df[f'Baseline avg ({len(baseline_cols)}y)'])
+            _denom = range_df[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, np.nan)
+            range_df['Δ %'] = range_df['Δ'] / _denom * 100
+            range_df['|Δ|'] = range_df['Δ'].abs()
+            range_df = (range_df.sort_values('|Δ|', ascending=False)
+                        .reset_index()
+                        .drop(columns=['|Δ|'], errors='ignore')
+                        .rename(columns={'_lc_range': 'LC range'}))
+
+    return {'top': top_df, 'subclass': sub_df, 'range': range_df}
+
+
+def _wfa_most_used_titles(df, peryear_map, recent_year, baseline_years, top_n=25):
+    """Return the top-N titles by recent-FY usage with baseline comparison.
+
+    Columns returned: Title, LC range (if present), Recent (recent_year),
+    Baseline avg (Ny), Δ. Sorted by recent-year uses descending. Ties break
+    by absolute delta descending so climbers surface above steady heavy
+    performers when the tally is identical.
+    """
+    recent_col = next((c for c, y in peryear_map.items() if y == recent_year), None)
+    baseline_cols = [c for c, y in peryear_map.items() if y in baseline_years]
+    if not recent_col:
+        return pd.DataFrame()
+    title_col = find_column(df, TITLE_ALIASES) or df.columns[0]
+    keep = [title_col, recent_col] + baseline_cols
+    if '_lc_range' in df.columns:
+        keep.insert(1, '_lc_range')
+    work = df[[c for c in keep if c in df.columns]].copy()
+    work[recent_col] = pd.to_numeric(work[recent_col], errors='coerce').fillna(0)
+    for bc in baseline_cols:
+        work[bc] = pd.to_numeric(work[bc], errors='coerce').fillna(0)
+    if baseline_cols:
+        work['_baseline_avg'] = work[baseline_cols].mean(axis=1)
+    else:
+        work['_baseline_avg'] = 0.0
+    work['_delta'] = work[recent_col] - work['_baseline_avg']
+    # Filter to titles that saw any recent-year use; no point ranking zeros.
+    work = work[work[recent_col] > 0]
+    if work.empty:
+        return pd.DataFrame()
+    work['_abs_delta'] = work['_delta'].abs()
+    top = work.sort_values([recent_col, '_abs_delta'],
+                           ascending=[False, False]).head(top_n).copy()
+    # Select using ORIGINAL column names, then rename at the end. Selecting
+    # by renamed names doesn't work — the rename hasn't happened yet.
+    orig_cols = [title_col]
+    if '_lc_range' in top.columns:
+        orig_cols.append('_lc_range')
+    orig_cols += [recent_col, '_baseline_avg', '_delta']
+    orig_cols = [c for c in orig_cols if c in top.columns]
+    rename = {title_col: 'Title',
+              '_lc_range': 'LC range',
+              recent_col: f'Recent (FY{recent_year})',
+              '_baseline_avg': f'Baseline avg ({len(baseline_cols)}y)',
+              '_delta': 'Δ'}
+    return top[orig_cols].rename(columns=rename)
 
 
 def _wfa_lc_shift_table(df, peryear_map, recent_year, baseline_years,
@@ -9289,13 +9472,13 @@ def _wfa_lc_shift_table(df, peryear_map, recent_year, baseline_years,
     bl_sums = {bc: work.groupby('_lc_range')[bc].sum() for bc in baseline_cols}
     bl_df = pd.DataFrame(bl_sums)
     grouped = pd.DataFrame({
-        f'Recent ({recent_year})': work.groupby('_lc_range')[recent_col].sum(),
+        f'Recent (FY{recent_year})': work.groupby('_lc_range')[recent_col].sum(),
         f'Baseline avg ({len(baseline_cols)}y)': bl_df.mean(axis=1),
     })
-    grouped['Δ'] = (grouped[f'Recent ({recent_year})']
+    grouped['Δ'] = (grouped[f'Recent (FY{recent_year})']
                     - grouped[f'Baseline avg ({len(baseline_cols)}y)'])
-    _denom = grouped[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, pd.NA)
-    grouped['Δ %'] = (grouped['Δ'] / _denom * 100).astype(float)
+    _denom = grouped[f'Baseline avg ({len(baseline_cols)}y)'].replace(0, np.nan)
+    grouped['Δ %'] = grouped['Δ'] / _denom * 100
     grouped['|Δ|'] = grouped['Δ'].abs()
     return (grouped.sort_values('|Δ|', ascending=False)
             .reset_index()
@@ -9469,13 +9652,17 @@ def page_workflow_a():
     st.markdown("---")
     st.subheader("3️⃣ Year mapping")
     st.caption(
-        "Detected per-year usage columns are listed below. Confirm which "
-        "represents the recent FY and which form the baseline. Defaults are "
-        "recent = most-recent detected year, baseline = three preceding years."
+        "Detected per-year usage columns are listed below. Pick which fiscal "
+        "year is the **recent FY** for the review, and which prior fiscal "
+        "years form the baseline. Default is recent = most-recent detected "
+        "year; baseline = all prior years available. Trim the baseline to fit "
+        "the story you want to tell — a single-year comparison, three-year "
+        "rolling window, or something else."
     )
 
     all_years = sorted(set(peryear_map.values()))
-    st.caption(f"**Detected years:** {', '.join(str(y) for y in all_years)}")
+    st.caption(f"**Detected fiscal years:** "
+               f"{', '.join('FY' + str(y) for y in all_years)}")
 
     default_recent, default_baseline = _wfa_infer_recent_and_baseline(all_years)
     yc1, yc2 = st.columns(2)
@@ -9484,19 +9671,23 @@ def page_workflow_a():
             "Recent FY:",
             all_years,
             index=all_years.index(default_recent) if default_recent in all_years else len(all_years) - 1,
+            format_func=lambda y: f"FY{y}",
             key="wfa_year_recent"
         )
     with yc2:
         baseline_years = st.multiselect(
-            "Baseline years:",
+            "Baseline FYs:",
             [y for y in all_years if y != recent_year],
             default=[y for y in default_baseline if y != recent_year],
+            format_func=lambda y: f"FY{y}",
             key="wfa_year_baseline",
-            help="Workflow A: the three fiscal years before the recent FY."
+            help="Pick any number of prior fiscal years to average against "
+                 "the recent FY. Multi-select — the average is computed "
+                 "across whichever years you keep in the list."
         )
 
     if not baseline_years:
-        st.warning("Pick at least one baseline year.")
+        st.warning("Pick at least one baseline FY.")
         return
 
     # Recompute _weight from recent FY (drives the KPIs and any downstream views)
@@ -9585,10 +9776,89 @@ def page_workflow_a():
     )
 
     # =============================================================
-    # 6. WEEDING CANDIDATES
+    # 6. LC BREAKDOWN — hierarchical (class → subclass → numbered range)
     # =============================================================
     st.markdown("---")
-    st.subheader("6️⃣ Weeding candidates")
+    st.subheader("6️⃣ LC breakdown — class → subclass → numbered range")
+    st.caption(
+        "Recent-vs-baseline at three levels of granularity. **Top-level classes** "
+        "gives the 21-letter map of your subject area's movement; **subclasses** "
+        "shows two-letter breakdowns (HB, HG, QA, etc.); **numbered ranges** "
+        "goes to the deepest published LC schedule. Same |Δ|-sorted logic at "
+        "every level — biggest movers surface first."
+    )
+    lc_hierarchy = _wfa_lc_hierarchy_tables(df, peryear_map, recent_year, baseline_years)
+    if lc_hierarchy and not lc_hierarchy['top'].empty:
+        tab_top, tab_sub, tab_range = st.tabs([
+            f"Top-level classes ({len(lc_hierarchy['top']):,})",
+            f"Subclasses ({len(lc_hierarchy['subclass']):,})",
+            f"Numbered ranges ({len(lc_hierarchy['range']):,})",
+        ])
+        with tab_top:
+            st.dataframe(lc_hierarchy['top'], use_container_width=True,
+                         hide_index=True)
+            st.caption("21 top-level LC classes. Use this view to spot which "
+                       "major subject area moved most.")
+        with tab_sub:
+            st.dataframe(lc_hierarchy['subclass'], use_container_width=True,
+                         hide_index=True)
+            st.caption("Two-letter subclasses (e.g., HB = Economic theory, "
+                       "HG = Finance). Use this view to narrow the top-level "
+                       "movement to a specific discipline.")
+        with tab_range:
+            if lc_hierarchy['range'].empty:
+                st.info("Numbered-range detail isn't available — the LC schedule "
+                        "catalog only covers certain subclasses. Subclasses tab "
+                        "is the finest breakdown for this dataset.")
+            else:
+                st.dataframe(lc_hierarchy['range'], use_container_width=True,
+                             hide_index=True)
+                st.caption("Deepest granularity — LC-schedule ranges when curated, "
+                           "hundreds-buckets otherwise. Use this view for weeding "
+                           "and approval-plan conversations that need specific "
+                           "range signals.")
+    else:
+        st.info("LC breakdown needs the `_lc_sub` column derived from Alma call "
+                "numbers. Check the upload — if call numbers are present, this "
+                "should populate automatically.")
+
+    # =============================================================
+    # 7. MOST-USED TITLES
+    # =============================================================
+    st.markdown("---")
+    st.subheader("7️⃣ Most-used titles")
+    st.caption(
+        "The opposite signal from weeding candidates — titles pulling their "
+        "weight (and then some) in the recent FY. Compares each to its "
+        "baseline average so climbers and steady heavy-hitters both show."
+    )
+    top_n_used = st.slider(
+        "Show top N titles by recent-FY usage:",
+        min_value=10, max_value=100, value=25, step=5,
+        key="wfa_top_n_used",
+        help="Ranked by recent-year uses; ties break by absolute delta so "
+             "titles climbing fast rank above steady performers with the "
+             "same count."
+    )
+    most_used = _wfa_most_used_titles(
+        df, peryear_map, recent_year, baseline_years, top_n=top_n_used)
+    if not most_used.empty:
+        st.dataframe(most_used, use_container_width=True, hide_index=True)
+        # Two quick stats for context
+        n_active_recent_here = int((most_used[f'Recent (FY{recent_year})'] > 0).sum())
+        top_share = most_used[f'Recent (FY{recent_year})'].sum() / max(recent_total, 1) * 100
+        st.caption(f"These {n_active_recent_here} titles account for "
+                   f"**{top_share:.1f}% of all recent-FY circulations** — "
+                   f"a quick check on whether use is concentrated or dispersed.")
+    else:
+        st.info("No titles with recorded recent-FY use — either no recent-year "
+                "data attached, or all recent-year values are zero.")
+
+    # =============================================================
+    # 8. WEEDING CANDIDATES
+    # =============================================================
+    st.markdown("---")
+    st.subheader("8️⃣ Weeding candidates")
     st.caption(
         "Titles with **zero use across all four years** are the strongest "
         "weeding signal. The list below sorts them so you can filter by LC "
@@ -9622,7 +9892,7 @@ def page_workflow_a():
     # 7. OPTIONAL: ILL CONTEXT (Workflow B)
     # =============================================================
     st.markdown("---")
-    st.subheader("7️⃣ ILL context (Workflow B, optional)")
+    st.subheader("9️⃣ ILL context (Workflow B, optional)")
     st.caption(
         "Upload the 12-month ILL summary to share at the same meeting. "
         "This is Workflow B — the analyst shares this alongside the print "
@@ -9662,7 +9932,7 @@ def page_workflow_a():
         {'Field': 'Holdings file', 'Value': holdings_file.name if holdings_file else '(not used)'},
         {'Field': 'ILL file', 'Value': ill_file.name if ill_file else '(not attached)'},
         {'Field': 'Titles in analysis', 'Value': f"{n_titles:,}"},
-        {'Field': f'Recent FY ({recent_year}) total uses', 'Value': f"{recent_total:,}"},
+        {'Field': f'Recent FY (FY{recent_year}) total uses', 'Value': f"{recent_total:,}"},
         {'Field': f'Baseline average uses', 'Value': f"{baseline_avg:,}"},
         {'Field': 'Δ vs baseline', 'Value': f"{delta:+,} ({delta_pct:+.1f}%)" if baseline_avg else "—"},
         {'Field': f'Active in recent FY', 'Value': f"{active_recent:,}"},
@@ -9670,27 +9940,51 @@ def page_workflow_a():
         {'Field': f'Zero-use titles (all periods)', 'Value': f"{n_weeding:,}"},
     ])
 
-    # LC shift table for the brief
+    # LC shift table for the brief (deepest granularity)
     lc_shifts = _wfa_lc_shift_table(df, peryear_map, recent_year, baseline_years, "Uses")
+    # Hierarchical LC breakdown for the brief
+    lc_hierarchy_brief = _wfa_lc_hierarchy_tables(
+        df, peryear_map, recent_year, baseline_years)
+    # Most-used titles for the brief (cap at 100 rows for the sheet)
+    most_used_brief = _wfa_most_used_titles(
+        df, peryear_map, recent_year, baseline_years, top_n=100)
 
     if XLSX_AVAILABLE:
         xbuf = BytesIO()
         with pd.ExcelWriter(xbuf, engine='openpyxl') as writer:
             setup_meta.to_excel(writer, sheet_name='Setup', index=False)
-            # Yearly totals
+            # Yearly totals — FY prefix so this reads unambiguously in Excel
             year_totals = pd.DataFrame([
-                {'Year': recent_year, 'Total uses': recent_total, 'Period': 'Recent'},
+                {'Fiscal year': f"FY{recent_year}", 'Total uses': recent_total,
+                 'Period': 'Recent'},
             ] + [
-                {'Year': y, 'Total uses': int(pd.to_numeric(df[c], errors='coerce').fillna(0).sum()),
+                {'Fiscal year': f"FY{y}",
+                 'Total uses': int(pd.to_numeric(df[c], errors='coerce').fillna(0).sum()),
                  'Period': 'Baseline'}
                 for y, c in [(y, next(k for k, yy in peryear_map.items() if yy == y))
                              for y in baseline_years]
             ])
             year_totals.to_excel(writer, sheet_name='Yearly totals', index=False)
-            if not lc_shifts.empty:
-                lc_shifts[['LC range', f'Recent ({recent_year})',
+            # Hierarchical LC breakdown — three sheets in class → subclass → range order
+            if lc_hierarchy_brief:
+                if not lc_hierarchy_brief['top'].empty:
+                    lc_hierarchy_brief['top'].to_excel(
+                        writer, sheet_name='LC classes', index=False)
+                if not lc_hierarchy_brief['subclass'].empty:
+                    lc_hierarchy_brief['subclass'].to_excel(
+                        writer, sheet_name='LC subclasses', index=False)
+                if not lc_hierarchy_brief['range'].empty:
+                    lc_hierarchy_brief['range'].to_excel(
+                        writer, sheet_name='LC ranges', index=False)
+            elif not lc_shifts.empty:
+                # Fallback if hierarchy build failed but flat shifts worked
+                lc_shifts[['LC range', f'Recent (FY{recent_year})',
                            f'Baseline avg ({len(baseline_cols)}y)', 'Δ', 'Δ %'
-                           ]].to_excel(writer, sheet_name='LC shifts', index=False)
+                           ]].to_excel(writer, sheet_name='LC ranges', index=False)
+            # Most-used titles
+            if not most_used_brief.empty:
+                most_used_brief.to_excel(
+                    writer, sheet_name='Most-used titles', index=False)
             if n_weeding > 0:
                 weeding_display.to_excel(writer, sheet_name='Weeding candidates', index=False)
             if ill_df is not None:
